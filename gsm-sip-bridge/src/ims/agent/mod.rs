@@ -1466,7 +1466,11 @@ fn handle_message(
     if let Some(decoded) = &decoded {
         sender = decoded.sender.clone();
         body = match decoded.part {
-            Some(part) => format!("[{}/{}] {}", part.sequence, part.total, decoded.text),
+            Some(part) => crate::volte::sms::InboundMessage::part_body(
+                part.sequence,
+                part.total,
+                &decoded.text,
+            ),
             None => decoded.text.clone(),
         };
     }
@@ -1510,6 +1514,7 @@ fn handle_message(
         route,
         sender: sender.clone(),
         body: body.clone(),
+        scts: decoded.as_ref().map(|sms| sms.scts),
         modem_index: None,
     };
     let key = inbound.dedupe_key();
@@ -1586,7 +1591,7 @@ fn handle_message(
             .reassembly
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .admit_part(&sender, &part, &text);
+            .admit_part(&sender, &part, &text, &key);
         match outcome {
             crate::volte::sms::PartOutcome::Pending => {
                 // Still missing at least one part. FR-012: acknowledge this
@@ -1650,13 +1655,25 @@ fn handle_message(
     };
 
     if relayed {
-        // Durably delivered now, not merely claimed — the modem sweep may be
-        // waiting on exactly this distinction before it trusts this claim
-        // enough to discard its own backup copy (specs/038 review follow-up).
-        p.dedupe
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .confirm(&key);
+        // The relay carried every buffered part. Settle all of their claims
+        // before discarding the assembly, so the modem sweep can clear each
+        // backup copy instead of waiting forever on the earlier arrivals.
+        let completed_keys = completed_part
+            .as_ref()
+            .map(|part| {
+                p.reassembly
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .completed_dedupe_keys(&sender, part)
+            })
+            .unwrap_or_default();
+        {
+            let mut dedupe = p.dedupe.lock().unwrap_or_else(|e| e.into_inner());
+            dedupe.confirm(&key);
+            for part_key in completed_keys {
+                dedupe.confirm(&part_key);
+            }
+        }
         if let Some(part) = completed_part {
             // Only now — mirrors `Dedupe::confirm` immediately above, and
             // for the identical reason: nothing may treat this multi-part
@@ -1722,23 +1739,17 @@ fn handle_message(
 /// finding, 2026-08-28: see [`crate::volte::sms::PartOutcome::Pending`]'s
 /// docs). No `Dedupe` action on failure — the claim stays exactly as it
 /// was, since this attempt changed nothing durable; the next retry decides
-/// its fate, not this one. The label is reconstructed identically to how
-/// it was first computed, so the dedupe key matches.
-fn deliver_flushed_part(
-    p: &DispatchParams,
-    sender: &str,
-    sequence: u8,
-    total: u8,
-    text: &str,
-) -> bool {
-    let body = format!("[{sequence}/{total}] {text}");
-    let key = crate::volte::sms::InboundMessage {
-        route: crate::volte::sms::MessageRoute::OverRegistration,
-        sender: sender.to_string(),
-        body: body.clone(),
-        modem_index: None,
-    }
-    .dedupe_key();
+/// its fate, not this one. The original key includes this part's own TP-SCTS.
+fn deliver_flushed_part(p: &DispatchParams, part: &crate::volte::sms::QueuedFlush) -> bool {
+    let crate::volte::sms::QueuedFlush {
+        sender,
+        sequence,
+        total,
+        text,
+        dedupe_key,
+        ..
+    } = part;
+    let body = crate::volte::sms::InboundMessage::part_body(*sequence, *total, text);
     let msg = ControlMessage::SmsReceived {
         sender: sender.to_string(),
         body,
@@ -1750,7 +1761,7 @@ fn deliver_flushed_part(
                 p.dedupe
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .confirm(&key);
+                    .confirm(dedupe_key);
                 tracing::info!(
                     sender = %sender,
                     sequence,
@@ -1805,12 +1816,12 @@ fn flush_expired_reassembly(p: &DispatchParams) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .ready_for_delivery();
-    for (id, sender, sequence, total, text) in ready {
-        if deliver_flushed_part(p, &sender, sequence, total, &text) {
+    for part in ready {
+        if deliver_flushed_part(p, &part) {
             p.reassembly
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .mark_flush_delivered(id);
+                .mark_flush_delivered(part.id);
         }
     }
 }
@@ -4443,6 +4454,9 @@ impl LoopState {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod sms_tests;
 
 #[cfg(test)]
 mod tests {

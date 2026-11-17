@@ -47,6 +47,9 @@ pub struct ConcatPart {
 pub struct DecodedSms {
     pub sender: String,
     pub text: String,
+    /// Original TP-SCTS octets, retained without interpreting the timestamp
+    /// or converting its timezone, for identifying deliveries across routes.
+    pub scts: [u8; 7],
     /// `Some(...)` if the UDH marked this as one part of a concatenated
     /// message.
     pub part: Option<ConcatPart>,
@@ -189,6 +192,7 @@ pub fn decode_sms_deliver_tpdu(tpdu: &[u8]) -> Result<DecodedSms, String> {
     Ok(DecodedSms {
         sender: parsed.originating_address,
         text: parsed.text,
+        scts: parsed.scts,
         part: parsed.part,
         rp_mr: 0,
         is_type_zero: parsed.is_type_zero,
@@ -328,6 +332,7 @@ fn skip_length_prefixed(buf: &[u8], pos: usize, field: &str) -> Result<usize, St
 struct SmsDeliverTpdu {
     originating_address: String,
     text: String,
+    scts: [u8; 7],
     part: Option<ConcatPart>,
     is_type_zero: bool,
 }
@@ -369,8 +374,13 @@ impl SmsDeliverTpdu {
         pos += 1;
         let dcs = *buf.get(pos).ok_or("TPDU truncated before TP-DCS")?;
         pos += 1;
-        // TP-SCTS (7 octets, semi-octet BCD timestamp): informational only,
-        // not needed to render the text.
+        // TP-SCTS (7 octets, semi-octet BCD timestamp): retain the original
+        // wire representation so both delivery routes use the same identity.
+        let scts = buf
+            .get(pos..pos + 7)
+            .ok_or("TPDU truncated at TP-SCTS")?
+            .try_into()
+            .map_err(|_| "TPDU truncated at TP-SCTS")?;
         pos += 7;
 
         let udl = *buf.get(pos).ok_or("TPDU truncated before TP-UDL")? as usize;
@@ -383,6 +393,7 @@ impl SmsDeliverTpdu {
         Ok(Self {
             originating_address,
             text,
+            scts,
             part,
             is_type_zero: is_type_zero_pid(pid),
         })
@@ -801,8 +812,8 @@ mod tests {
     /// CS-02 (specs/041 conformance review): the IMS `MESSAGE` route
     /// (`decode_vnd_3gpp_sms`, RP-DATA-wrapped) and the modem-storage route
     /// (`decode_sms_deliver_tpdu`, bare TPDU — `sms::reader`) must decode the
-    /// *same* TPDU to the *same* sender and text. `volte::sms::Dedupe`'s key
-    /// is exactly `sender + body`; if the two routes ever disagreed on either
+    /// *same* TPDU to the *same* sender, text, and original TP-SCTS. If the
+    /// two routes ever disagreed on those identifying fields
     /// (as text mode used to, for anything outside plain GSM7), the same
     /// real-world message delivered over both bearers would fail to collapse
     /// and the operator would see it twice.
@@ -835,6 +846,50 @@ mod tests {
 
         assert_eq!(over_registration.sender, through_modem.sender);
         assert_eq!(over_registration.text, through_modem.text);
+        assert_eq!(over_registration.scts, through_modem.scts);
+    }
+
+    #[test]
+    fn service_centre_timestamp_octets_are_preserved_without_normalization() {
+        for scts in [
+            [0x62, 0x11, 0x51, 0x51, 0x65, 0x82, 0x00],
+            [0x62, 0x11, 0x51, 0x51, 0x65, 0x82, 0x80],
+            // Preservation does not depend on accepting the timestamp as a
+            // valid calendar value or normalizing its BCD representation.
+            [0xff, 0x00, 0x12, 0x34, 0x56, 0x78, 0x9a],
+        ] {
+            let mut tpdu = vec![0x00, 0x00, 0x81, 0x00, 0x04];
+            tpdu.extend_from_slice(&scts);
+            tpdu.extend_from_slice(&[2, b'H', b'i']);
+
+            let through_modem = decode_sms_deliver_tpdu(&tpdu).unwrap();
+            let DecodedRp::Message(over_registration) =
+                decode_vnd_3gpp_sms(&rp_data(0x17, &tpdu)).unwrap()
+            else {
+                panic!("RP-DATA must decode to DecodedRp::Message");
+            };
+            assert_eq!(through_modem.scts, scts);
+            assert_eq!(over_registration.scts, scts);
+            assert_eq!(through_modem.text, "Hi");
+            assert_eq!(over_registration.text, "Hi");
+        }
+    }
+
+    #[test]
+    fn a_truncated_service_centre_timestamp_is_rejected_on_both_routes() {
+        let scts = [0x62, 0x11, 0x51, 0x51, 0x65, 0x82, 0x00];
+        for length in 0..scts.len() {
+            let mut tpdu = vec![0x00, 0x00, 0x81, 0x00, 0x04];
+            tpdu.extend_from_slice(&scts[..length]);
+            assert_eq!(
+                decode_sms_deliver_tpdu(&tpdu).unwrap_err(),
+                "TPDU truncated at TP-SCTS"
+            );
+            assert_eq!(
+                decode_vnd_3gpp_sms(&rp_data(0x17, &tpdu)).unwrap(),
+                DecodedRp::Undecodable { rp_mr: 0x17 }
+            );
+        }
     }
 
     /// TS 23.040 §9.2.3.9 vs the Replace Short Message group next to it. Only

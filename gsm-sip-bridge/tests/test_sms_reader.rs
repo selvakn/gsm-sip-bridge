@@ -1,5 +1,6 @@
 use gsm_sip_bridge::modules::at_commander::AtCommander;
 use gsm_sip_bridge::sms::reader::{delete_sms, read_sms};
+use gsm_sip_bridge::volte::sms::{InboundMessage, MessageRoute};
 use std::io::{Read, Write};
 use std::time::Duration;
 
@@ -21,6 +22,14 @@ fn mock_at() -> Option<(std::os::unix::net::UnixStream, AtCommander)> {
 /// `ims::sms_pdu::Alphabet::Octet` is exercised by its own unit tests
 /// already, so nothing here needs to also cover GSM7 packing.
 fn build_test_pdu(international_sender_digits: &str, text: &str) -> String {
+    build_test_pdu_with_scts(international_sender_digits, text, [0; 7])
+}
+
+fn build_test_pdu_with_scts(
+    international_sender_digits: &str,
+    text: &str,
+    scts: [u8; 7],
+) -> String {
     let digits: Vec<u8> = international_sender_digits
         .bytes()
         .map(|b| b - b'0')
@@ -38,7 +47,7 @@ fn build_test_pdu(international_sender_digits: &str, text: &str) -> String {
     tpdu.extend_from_slice(&oa_bytes);
     tpdu.push(0x00); // TP-PID
     tpdu.push(0x04); // TP-DCS: general group, 8-bit/octet data
-    tpdu.extend_from_slice(&[0u8; 7]); // TP-SCTS, not asserted on
+    tpdu.extend_from_slice(&scts);
     tpdu.push(text.len() as u8); // TP-UDL: byte count for octet alphabet
     tpdu.extend_from_slice(text.as_bytes());
 
@@ -66,7 +75,45 @@ fn test_read_sms_parses_cmgr() {
     let sms = read_sms(&mut at, 1).unwrap();
     assert_eq!(sms.sender, "+15551234567");
     assert_eq!(sms.body, "Hello world");
+    assert_eq!(sms.scts, [0; 7]);
     assert_eq!(sms.index, 1);
+}
+
+#[test]
+fn test_read_sms_preserves_distinct_timestamps_for_identical_text() {
+    let timestamps = [
+        [0x62, 0x11, 0x51, 0x51, 0x65, 0x82, 0x00],
+        [0x62, 0x11, 0x51, 0x61, 0x00, 0x00, 0x00],
+    ];
+    let mut keys = Vec::new();
+    for scts in timestamps {
+        let (mut server, mut at) = mock_at().expect("Unix stream fixture must be available");
+        let pdu = build_test_pdu_with_scts("15551234567", "same text", scts);
+        let tpdu_len = pdu.len() / 2 - 1;
+        let response = format!("+CMGR: 1,,{tpdu_len}\r\n{pdu}\r\nOK\r\n");
+        let worker = std::thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            assert!(server.read(&mut buf).unwrap() > 0);
+            server.write_all(response.as_bytes()).unwrap();
+        });
+
+        let sms = read_sms(&mut at, 1).unwrap();
+        worker.join().unwrap();
+        assert_eq!(sms.sender, "+15551234567");
+        assert_eq!(sms.body, "same text");
+        assert_eq!(sms.scts, scts);
+        keys.push(
+            InboundMessage {
+                route: MessageRoute::ThroughModem,
+                sender: sms.sender,
+                body: sms.body,
+                scts: Some(sms.scts),
+                modem_index: Some(sms.index),
+            }
+            .dedupe_key(),
+        );
+    }
+    assert_ne!(keys[0], keys[1]);
 }
 
 #[test]
@@ -132,7 +179,8 @@ fn test_read_sms_decodes_a_concatenated_part() {
     tpdu.extend_from_slice(&[0x51, 0x55, 0x21, 0x43, 0x65, 0xF7]); // +15551234567
     tpdu.push(0x00); // TP-PID
     tpdu.push(0x04); // TP-DCS: octet
-    tpdu.extend_from_slice(&[0u8; 7]);
+    let scts = [0x62, 0x11, 0x51, 0x51, 0x65, 0x82, 0x00];
+    tpdu.extend_from_slice(&scts);
     tpdu.push(tp_ud.len() as u8); // TP-UDL: byte count, octet alphabet
     tpdu.extend_from_slice(&tp_ud);
 
@@ -150,4 +198,22 @@ fn test_read_sms_decodes_a_concatenated_part() {
     let sms = read_sms(&mut at, 2).unwrap();
     assert_eq!(sms.sender, "+15551234567");
     assert_eq!(sms.body, "[1/2] part1");
+    assert_eq!(sms.scts, scts);
+    // Compare the actual modem result with the fixture's expected IMS-side
+    // identity. Parser unit tests separately cover RP-DATA/bare TPDU equality.
+    let from_ims = InboundMessage {
+        route: MessageRoute::OverRegistration,
+        sender: "+15551234567".into(),
+        body: "[1/2] part1".into(),
+        scts: Some(scts),
+        modem_index: None,
+    };
+    let from_modem = InboundMessage {
+        route: MessageRoute::ThroughModem,
+        sender: sms.sender,
+        body: sms.body,
+        scts: Some(sms.scts),
+        modem_index: Some(sms.index),
+    };
+    assert_eq!(from_ims.dedupe_key(), from_modem.dedupe_key());
 }
