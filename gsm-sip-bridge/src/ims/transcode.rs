@@ -611,18 +611,28 @@ fn relay_direction(
             };
 
             if Some(pkt.payload_type) == src_codec.dtmf_payload_type {
+                let new_keypress = dtmf_event_source_ts != Some(pkt.timestamp);
+                dtmf_event_source_ts = Some(pkt.timestamp);
                 let Some(dtmf_sender) = dtmf_sender.as_mut() else {
-                    // Nothing this leg's own answer negotiated to forward it on.
+                    // Nothing this leg's own SDP negotiated to forward it on.
+                    // Said once per keypress: dropped silently, a lost digit
+                    // looked exactly like one never pressed.
+                    if new_keypress {
+                        tracing::warn!(
+                            direction,
+                            event = pkt.payload.first().copied(),
+                            "dropping a DTMF keypress: the destination leg negotiated no telephone-event"
+                        );
+                    }
                     continue;
                 };
-                if dtmf_event_source_ts != Some(pkt.timestamp) {
+                if new_keypress {
                     // A new keypress: give it a fresh timestamp on our own
                     // independent DTMF stream, clearly advanced from whatever the
                     // previous event used.
                     dtmf_sender.timestamp = dtmf_sender.timestamp.wrapping_add(
                         dst_codec.codec.sample_rate() / DTMF_EVENT_TIMESTAMP_GAP_DIVISOR,
                     );
-                    dtmf_event_source_ts = Some(pkt.timestamp);
                     // Once per keypress, not per retransmitted packet — a DTMF
                     // digit that never reached the far leg used to be silently
                     // indistinguishable from one that was never pressed at all
