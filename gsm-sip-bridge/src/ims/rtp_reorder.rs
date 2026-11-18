@@ -17,6 +17,15 @@ const RESTART_CONFIRMATION_WINDOW: Duration = Duration::from_secs(1);
 /// Remember one full sequence cycle of deliveries, including distinct media
 /// that reused a sequence after a restart. Bound memory even on long calls.
 const DELIVERED_PACKET_HISTORY: usize = u16::MAX as usize + 1;
+/// How long the active source must have been silent before a retired source
+/// that is sending again in sequence takes the stream back. A carrier hold
+/// does exactly this: T2 replaced the far party's SSRC with the hold stream's
+/// and, on the resume, went back to the far party's original SSRC (2026-11-21).
+/// A late packet of a retired source arrives while the active source is still
+/// sending, so it never sees this much silence. Longer than the 160 ms between
+/// AMR SID frames (3GPP TS 26.093, TS 26.193), so an active source in DTX still counts as
+/// sending.
+const RETIRED_SOURCE_RETURN_SILENCE: Duration = Duration::from_millis(200);
 
 struct RestartCandidate {
     seq: u16,
@@ -24,11 +33,19 @@ struct RestartCandidate {
     since: Instant,
 }
 
+/// A retired source sending again: the last sequence number seen from it.
+struct ReturningSource {
+    ssrc: u32,
+    seq: u16,
+}
+
 pub(super) struct RtpReorderBuffer {
     max_wait: Duration,
     ssrc: Option<u32>,
     // Remember every superseded source for this call: expiring or evicting
     // one would let a late packet reset the active source's decoder input.
+    // One comes back only once it is sending again in sequence and the
+    // active source has stopped (`source_returns`).
     retired_ssrcs: HashSet<u32>,
     // Count occurrences so delivering a reused identity after sequence wrap
     // refreshes its history even when an older occurrence is then evicted.
@@ -38,6 +55,9 @@ pub(super) struct RtpReorderBuffer {
     pending: BTreeMap<u16, Vec<u8>>,
     deadline: Option<Instant>,
     restart_candidate: Option<RestartCandidate>,
+    /// When the active source last sent a packet, delivered or not.
+    active_heard_at: Option<Instant>,
+    returning: Option<ReturningSource>,
 }
 
 impl RtpReorderBuffer {
@@ -52,6 +72,8 @@ impl RtpReorderBuffer {
             pending: BTreeMap::new(),
             deadline: None,
             restart_candidate: None,
+            active_heard_at: None,
+            returning: None,
         }
     }
 
@@ -66,26 +88,14 @@ impl RtpReorderBuffer {
         let (seq, ssrc) = (parsed.seq, parsed.ssrc);
 
         if self.ssrc != Some(ssrc) {
-            if self.retired_ssrcs.contains(&ssrc) {
+            if self.retired_ssrcs.contains(&ssrc) && !self.source_returns(ssrc, seq, now) {
                 // A straggler must not change the active sequence, pending
                 // speech or restart probation. Still honor its deadlines.
                 return self.flush_expired(now);
             }
-            if let Some(previous) = self.ssrc {
-                self.retired_ssrcs.insert(previous);
-            }
-            // A new source owns a new sequence space. Old-source packets
-            // must not enter its decoder after the reset.
-            self.pending.clear();
-            self.deadline = None;
-            self.restart_candidate = None;
-            self.delivered.clear();
-            self.delivery_order.clear();
-            self.ssrc = Some(ssrc);
-            self.expected = seq.wrapping_add(1);
-            self.remember_delivery(&packet);
-            return vec![packet];
+            return self.adopt(ssrc, seq, packet, now);
         }
+        self.active_heard_at = Some(now);
 
         // Apply the deadline before the new arrival: a packet that arrives
         // at or after expiry cannot fill a hole already skipped by the batch.
@@ -169,6 +179,50 @@ impl RtpReorderBuffer {
     /// Auxiliary payloads can fill gaps only in this source's sequence space.
     pub(super) fn source_ssrc(&self) -> Option<u32> {
         self.ssrc
+    }
+
+    /// Whether a packet from the retired source `ssrc` shows that source
+    /// sending again rather than arriving late: it follows the source's
+    /// previous packet in sequence, and the active source has been silent for
+    /// [`RETIRED_SOURCE_RETURN_SILENCE`].
+    fn source_returns(&mut self, ssrc: u32, seq: u16, now: Instant) -> bool {
+        let in_sequence = self
+            .returning
+            .as_ref()
+            .is_some_and(|r| r.ssrc == ssrc && seq == r.seq.wrapping_add(1));
+        self.returning = Some(ReturningSource { ssrc, seq });
+        let active_silent = self.active_heard_at.is_none_or(|heard| {
+            now.saturating_duration_since(heard) >= RETIRED_SOURCE_RETURN_SILENCE
+        });
+        in_sequence && active_silent
+    }
+
+    /// Makes `ssrc` the active source from `packet`, retiring the one it
+    /// replaces. Its sequence space is new to the buffer: packets queued from
+    /// the old source must not enter the decoder after the switch.
+    fn adopt(&mut self, ssrc: u32, seq: u16, packet: Vec<u8>, now: Instant) -> Vec<Vec<u8>> {
+        if let Some(previous) = self.ssrc {
+            self.retired_ssrcs.insert(previous);
+        }
+        if self.retired_ssrcs.remove(&ssrc) {
+            tracing::info!(
+                ssrc,
+                replaced_ssrc = ?self.ssrc,
+                "carrier RTP: a retired source is sending again and the active one stopped; \
+                 following it again"
+            );
+        }
+        self.pending.clear();
+        self.deadline = None;
+        self.restart_candidate = None;
+        self.returning = None;
+        self.delivered.clear();
+        self.delivery_order.clear();
+        self.ssrc = Some(ssrc);
+        self.active_heard_at = Some(now);
+        self.expected = seq.wrapping_add(1);
+        self.remember_delivery(&packet);
+        vec![packet]
     }
 
     fn media_identity(parsed: &rtp::ParsedPacket<'_>) -> u64 {
@@ -763,6 +817,82 @@ mod tests {
         assert_eq!(buffer.push(new_source(10), now), [new_source(10)]);
         assert!(buffer.push(packet(2), now).is_empty());
         assert_eq!(buffer.push(new_source(11), now), [new_source(11)]);
+    }
+
+    /// The live T2 hold and resume (2026-11-21): the far party's SSRC gave way
+    /// to the hold stream's, and the resume went back to the far party's
+    /// original SSRC, in sequence. It used to stay retired, so nothing from
+    /// the far party was decoded for the rest of the call.
+    #[test]
+    fn the_original_source_returning_after_a_hold_is_followed_again() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let far_party = |seq: u16| rtp::build_packet(seq, u32::from(seq) * 320, 0xA, 96, &[]);
+        let hold = |seq: u16| rtp::build_packet(seq, u32::from(seq) * 320, 0xB, 102, &[]);
+        let mut buffer = RtpReorderBuffer::new(WAIT);
+        assert_eq!(seqs(buffer.push(far_party(1000), at(0))), [1000]);
+        assert_eq!(seqs(buffer.push(far_party(1001), at(20))), [1001]);
+        // The hold stream takes over.
+        for (i, seq) in (50..=60).enumerate() {
+            let t = 40 + 20 * i as u64;
+            assert_eq!(seqs(buffer.push(hold(seq), at(t))), [seq]);
+        }
+        let hold_stopped = 240;
+        // The far party is back in sequence; the hold stream has stopped.
+        let mut delivered = Vec::new();
+        for (i, seq) in (1100..1115).enumerate() {
+            let t = hold_stopped + 20 * (i as u64 + 1);
+            let out = seqs(buffer.push(far_party(seq), at(t)));
+            if t - hold_stopped < RETIRED_SOURCE_RETURN_SILENCE.as_millis() as u64 {
+                assert!(
+                    out.is_empty(),
+                    "{seq} at +{t} ms: the hold may still be sending"
+                );
+            }
+            delivered.extend(out);
+        }
+        assert_eq!(delivered, (1109..1115).collect::<Vec<_>>());
+        assert_eq!(buffer.source_ssrc(), Some(0xA));
+        // The hold stream is now the retired one.
+        assert!(buffer.push(hold(61), at(600)).is_empty());
+        assert_eq!(seqs(buffer.push(far_party(1115), at(600))), [1115]);
+    }
+
+    /// A retired source's late packets, even a long in-sequence run of them,
+    /// never take over while the active source is still sending.
+    #[test]
+    fn a_retired_source_never_takes_over_while_the_active_one_sends() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let old = |seq: u16| rtp::build_packet(seq, u32::from(seq) * 160, 0xA, 96, &[]);
+        let active = |seq: u16| rtp::build_packet(seq, u32::from(seq) * 160, 0xB, 96, &[]);
+        let mut buffer = RtpReorderBuffer::new(WAIT);
+        buffer.push(old(1), at(0));
+        assert_eq!(seqs(buffer.push(active(500), at(10))), [500]);
+        for i in 0..100u16 {
+            let t = 20 + 20 * u64::from(i);
+            assert_eq!(seqs(buffer.push(active(501 + i), at(t))), [501 + i]);
+            assert!(buffer.push(old(2 + i), at(t + 5)).is_empty());
+        }
+        assert_eq!(buffer.source_ssrc(), Some(0xB));
+    }
+
+    /// After the active source stops, a retired one still needs two packets
+    /// in sequence: one late packet is not a stream.
+    #[test]
+    fn one_packet_from_a_retired_source_after_silence_is_not_a_return() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let old = |seq: u16| rtp::build_packet(seq, u32::from(seq) * 160, 0xA, 96, &[]);
+        let active = |seq: u16| rtp::build_packet(seq, u32::from(seq) * 160, 0xB, 96, &[]);
+        let mut buffer = RtpReorderBuffer::new(WAIT);
+        buffer.push(old(1), at(0));
+        buffer.push(active(500), at(20));
+        assert!(buffer.push(old(2), at(1000)).is_empty());
+        assert!(buffer.push(old(4), at(1020)).is_empty(), "not in sequence");
+        assert_eq!(buffer.source_ssrc(), Some(0xB));
+        assert_eq!(seqs(buffer.push(old(5), at(1040))), [5]);
+        assert_eq!(buffer.source_ssrc(), Some(0xA));
     }
 
     #[test]

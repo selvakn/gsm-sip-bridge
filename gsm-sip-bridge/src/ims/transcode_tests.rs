@@ -30,6 +30,7 @@ struct Relay {
     carrier: UdpSocket,
     pbx: UdpSocket,
     stop: Arc<AtomicBool>,
+    leg: Arc<CarrierLeg>,
 }
 
 impl Relay {
@@ -42,7 +43,7 @@ impl Relay {
                 .unwrap();
         }
         let stop = Arc::new(AtomicBool::new(false));
-        spawn_transcoding_relay(
+        let leg = spawn_transcoding_relay(
             ims,
             veth,
             carrier_codec,
@@ -53,7 +54,12 @@ impl Relay {
             wait,
         )
         .unwrap();
-        Self { carrier, pbx, stop }
+        Self {
+            carrier,
+            pbx,
+            stop,
+            leg,
+        }
     }
 
     fn downlink(&self, packet: &[u8]) {
@@ -718,4 +724,86 @@ fn uplink_keeps_its_generated_timeline_and_does_not_wait_for_source_sequence_gap
     assert!(received
         .iter()
         .all(|packet| { amr_rtp::payload_to_frame(&packet.payload, AmrKind::Nb, true).is_some() }));
+}
+
+/// The live hold and resume (T2, 2026-11-18) moved AMR-WB from payload type
+/// 96 octet-aligned to 102 bandwidth-efficient. Once the carrier leg is
+/// relabelled, the uplink is framed bandwidth-efficient under 102, the
+/// downlink reads 102 that way, and a straggler still under 96 is read
+/// octet-aligned, as it was framed.
+#[test]
+fn amr_wb_follows_a_relabel_to_bandwidth_efficient_framing_both_ways() {
+    let relay = Relay::start(
+        codec(NegotiatedCodec::AmrWb, 96),
+        codec(NegotiatedCodec::L16, 103),
+        REORDER_WAIT,
+    );
+    assert!(relay.leg.set(super::super::carrier_leg::CarrierLegState {
+        labels: CarrierLabels {
+            payload_type: 102,
+            octet_aligned: false,
+            dtmf_payload_type: None,
+            dtmf_clock_rate: None,
+        },
+        sending: true,
+        previous_audio: Some((96, true)),
+    }));
+
+    let tone: Vec<u8> = (0..amr_safe::FRAME_SAMPLES)
+        .flat_map(|i| (((i as f64 * 0.2).sin() * 8_000.0) as i16).to_be_bytes())
+        .collect();
+    relay
+        .pbx
+        .send(&rtp::build_packet(1, 0, 0xb0b0, 103, &tone))
+        .unwrap();
+    let up = receive(&relay.carrier);
+    assert_eq!(up.payload_type, 102);
+    let frame = amr_rtp::payload_to_frame(&up.payload, AmrKind::Wb, false)
+        .expect("bandwidth-efficient AMR-WB");
+    assert_eq!(
+        (frame[0] >> 3) & 0x0f,
+        2,
+        "12.65 kbit/s, read in this framing"
+    );
+
+    let bandwidth_efficient = speech_payloads(AmrKind::Wb, false, 1);
+    relay.downlink(&source_packet(10, 3_200, 102, &bandwidth_efficient[0]));
+    let down = receive(&relay.pbx);
+    assert_eq!((down.payload_type, down.payload.len()), (103, 640));
+
+    let octet_aligned = speech_payloads(AmrKind::Wb, true, 2);
+    relay.downlink(&source_packet(11, 3_520, 96, &octet_aligned[1]));
+    let down = receive(&relay.pbx);
+    assert_eq!((down.payload_type, down.payload.len()), (103, 640));
+}
+
+/// Once the agent has retired the old number (the carrier's offer gave it
+/// another meaning, as T2's hold did with 96 on 2026-11-21), a packet still
+/// under it is not decoded as the old audio: only the new number is.
+#[test]
+fn a_retired_payload_type_is_no_longer_read_as_audio() {
+    let relay = Relay::start(
+        codec(NegotiatedCodec::AmrWb, 96),
+        codec(NegotiatedCodec::L16, 103),
+        REORDER_WAIT,
+    );
+    assert!(relay.leg.set(super::super::carrier_leg::CarrierLegState {
+        labels: CarrierLabels {
+            payload_type: 102,
+            octet_aligned: false,
+            dtmf_payload_type: None,
+            dtmf_clock_rate: None,
+        },
+        sending: true,
+        previous_audio: None,
+    }));
+
+    let octet_aligned = speech_payloads(AmrKind::Wb, true, 1);
+    relay.downlink(&source_packet(10, 3_200, 96, &octet_aligned[0]));
+    assert_no_packet(&relay.pbx, Duration::from_millis(300));
+
+    let bandwidth_efficient = speech_payloads(AmrKind::Wb, false, 2);
+    relay.downlink(&source_packet(11, 3_520, 102, &bandwidth_efficient[1]));
+    let down = receive(&relay.pbx);
+    assert_eq!((down.payload_type, down.payload.len()), (103, 640));
 }

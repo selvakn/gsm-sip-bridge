@@ -15,6 +15,7 @@ use super::session_refresh;
 use super::veth::{spawn_relay, spawn_veth_uas_listener, VethUasResult, VETH_INVITE_TIMEOUT};
 use crate::error::BridgeResult;
 use crate::ims::body;
+use crate::ims::carrier_leg::CarrierLeg;
 use crate::ims::lifecycle::{BridgedCall, CallStage};
 use crate::ims::sdp;
 use crate::ims::sip_client::{random_hex, SipResponse};
@@ -177,11 +178,14 @@ pub(super) struct PendingOrigination {
     /// and reusing a relay built for the wrong one would silently corrupt
     /// or drop audio rather than error. On a mismatch, the real `200 OK`
     /// handling stops this relay and rebuilds one from `early_veth_socket`
-    /// instead of trusting it.
+    /// instead of trusting it. The last element is the relay's handle on the
+    /// carrier leg, which the call keeps if it reuses the relay
+    /// (`agent::reinvite`).
     early_relay: Option<(
         Arc<AtomicBool>,
         crate::ims::media_stats::MediaMeter,
         sdp::ChosenCodec,
+        Arc<CarrierLeg>,
     )>,
     /// A second handle to the veth-side RTP socket and its codec, kept only
     /// while `early_relay` is `Some` — the relay thread owns the other
@@ -520,7 +524,7 @@ impl PendingOrigination {
     /// takes ownership of `early_relay` via its consuming destructure, so it
     /// needs no separate stop call.
     fn stop_early_relay(&mut self) {
-        if let Some((stop, _meter, _chosen)) = self.early_relay.take() {
+        if let Some((stop, _meter, _chosen, _leg)) = self.early_relay.take() {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.early_veth_socket = None;
@@ -1253,26 +1257,25 @@ pub(super) fn tick_pending_origination(
                                             None,
                                             p.rtp_reorder_wait,
                                         )
-                                        .is_ok()
+                                        .ok()
                                     } else {
-                                        spawn_relay(
+                                        Some(spawn_relay(
                                             carrier_sock,
                                             veth_sock_clone,
                                             stop.clone(),
                                             &meter,
-                                            chosen.telephone_event(),
+                                            chosen,
                                             veth_result.codec.telephone_event(),
                                             // Originated calls are out of
                                             // scope for RTCP reporting
                                             // (specs/046-rtcp-reporting
                                             // FR-023).
                                             None,
-                                        );
-                                        true
+                                        ))
                                     };
-                                    if started {
+                                    if let Some(carrier_leg) = started {
                                         tracing::info!(call_id = %p.call_id, transcoding, "outbound: early media relay started");
-                                        p.early_relay = Some((stop, meter, chosen));
+                                        p.early_relay = Some((stop, meter, chosen, carrier_leg));
                                         p.early_veth_socket =
                                             Some((veth_result.rtp_socket, veth_result.codec));
                                     } else {
@@ -1485,8 +1488,11 @@ fn finish_origination(
     // the relay was started from a clone of it — dropped harmlessly at the
     // end of this function, the clone the relay thread owns keeps the
     // underlying socket alive.
-    let (stop, meter, carrier_codec_name, transcoding) = match (veth_result, early_relay) {
-        (None, Some((stop, meter, early_chosen))) => {
+    let (stop, meter, carrier_codec_name, transcoding, carrier_leg) = match (
+        veth_result,
+        early_relay,
+    ) {
+        (None, Some((stop, meter, early_chosen, early_leg))) => {
             match sdp::offered_chosen_codec(answer_codec, answer_dtmf_payload_type) {
                 Some(final_chosen) if final_chosen == early_chosen => {
                     // The real 200 OK agrees with what the relay was already
@@ -1495,7 +1501,13 @@ fn finish_origination(
                     let transcoding = early_veth_socket
                         .as_ref()
                         .is_some_and(|(_, vc)| early_chosen.codec != vc.codec);
-                    (stop, meter, early_chosen.codec.name(), transcoding)
+                    (
+                        stop,
+                        meter,
+                        early_chosen.codec.name(),
+                        transcoding,
+                        early_leg,
+                    )
                 }
                 Some(final_chosen) => {
                     // Real 200 OK selected a *different* codec (or DTMF payload
@@ -1542,30 +1554,32 @@ fn finish_origination(
                             rtp_reorder_wait,
                         )
                     } else {
-                        spawn_relay(
+                        Ok(spawn_relay(
                             rtp_socket,
                             veth_sock,
                             new_stop.clone(),
                             &new_meter,
-                            final_chosen.telephone_event(),
+                            final_chosen,
                             veth_codec.telephone_event(),
                             // Originated calls are out of scope for RTCP
                             // reporting (specs/046-rtcp-reporting FR-023).
                             None,
-                        );
-                        Ok(())
+                        ))
                     };
-                    if let Err(e) = relay_result {
-                        tracing::error!(call_id, error = %e, "outbound: failed to rebuild the media relay for the real answer's codec");
-                        hangup_answered_carrier_leg(
-                            session,
-                            &mut control,
-                            &dialog,
-                            &call_id,
-                            reason::TRANSPORT_ERROR,
-                        );
-                        return None;
-                    }
+                    let new_leg = match relay_result {
+                        Ok(leg) => leg,
+                        Err(e) => {
+                            tracing::error!(call_id, error = %e, "outbound: failed to rebuild the media relay for the real answer's codec");
+                            hangup_answered_carrier_leg(
+                                session,
+                                &mut control,
+                                &dialog,
+                                &call_id,
+                                reason::TRANSPORT_ERROR,
+                            );
+                            return None;
+                        }
+                    };
                     tracing::info!(
                         call_id,
                         old_codec = early_chosen.codec.name(),
@@ -1574,7 +1588,13 @@ fn finish_origination(
                         new_dtmf_payload_type = ?final_chosen.dtmf_payload_type,
                         "outbound: real 200 OK selected a different codec or DTMF payload type than early media; rebuilt the relay"
                     );
-                    (new_stop, new_meter, final_chosen.codec.name(), transcoding)
+                    (
+                        new_stop,
+                        new_meter,
+                        final_chosen.codec.name(),
+                        transcoding,
+                        new_leg,
+                    )
                 }
                 None => {
                     stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1673,31 +1693,33 @@ fn finish_origination(
                     rtp_reorder_wait,
                 )
             } else {
-                spawn_relay(
+                Ok(spawn_relay(
                     rtp_socket,
                     veth.rtp_socket,
                     stop.clone(),
                     &meter,
-                    chosen.telephone_event(),
+                    chosen,
                     veth.codec.telephone_event(),
                     // Originated calls are out of scope for RTCP reporting
                     // (specs/046-rtcp-reporting FR-023).
                     None,
-                );
-                Ok(())
+                ))
             };
-            if let Err(e) = relay_result {
-                tracing::error!(call_id, error = %e, "outbound: failed to start media relay");
-                hangup_answered_carrier_leg(
-                    session,
-                    &mut control,
-                    &dialog,
-                    &call_id,
-                    reason::TRANSPORT_ERROR,
-                );
-                return None;
-            }
-            (stop, meter, chosen.codec.name(), transcoding)
+            let carrier_leg = match relay_result {
+                Ok(leg) => leg,
+                Err(e) => {
+                    tracing::error!(call_id, error = %e, "outbound: failed to start media relay");
+                    hangup_answered_carrier_leg(
+                        session,
+                        &mut control,
+                        &dialog,
+                        &call_id,
+                        reason::TRANSPORT_ERROR,
+                    );
+                    return None;
+                }
+            };
+            (stop, meter, chosen.codec.name(), transcoding, carrier_leg)
         }
     };
 
@@ -1741,7 +1763,9 @@ fn finish_origination(
         // answered (terminating) calls carries an RTCP endpoint.
         rtcp: None,
         session_refresh,
-        established_media,
+        // A hold or resume re-INVITE is followed through the relay just
+        // started or reused (`agent::reinvite`).
+        established_media: established_media.map(|media| media.with_carrier_leg(carrier_leg)),
     })
 }
 
@@ -2446,7 +2470,7 @@ mod tests {
         let mut pending = Some(p);
         assert!(tick_pending_origination(&mut pending, &mut session).is_none());
         let mut p = pending.expect("still pending after starting the early relay");
-        let (early_stop, _early_meter, early_chosen) = p
+        let (early_stop, _early_meter, early_chosen, _early_leg) = p
             .early_relay
             .clone()
             .expect("the early relay should have started");

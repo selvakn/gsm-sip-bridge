@@ -668,12 +668,11 @@ pub enum RelayRtcpRole {
     /// leaves on that stream (FR-002b).
     Sender(crate::ims::media_stats::SendAccounting),
     /// This direction receives from the carrier: measure receive quality
-    /// (FR-011) and publish the carrier's current SSRC, needed for the
+    /// (FR-011) per carrier SSRC, which also names the source of the
     /// receiver block this bridge includes in its own outgoing SR/RR
     /// (contract C-2.6).
     Receiver {
         tracker: Arc<Mutex<crate::ims::media_stats::ReceiveTracker>>,
-        ssrc: Arc<Mutex<Option<u32>>>,
     },
 }
 
@@ -689,15 +688,9 @@ pub(crate) fn note_rtcp(
     clock_rate: u32,
 ) {
     match role {
-        Some(RelayRtcpRole::Receiver {
-            tracker,
-            ssrc: last_ssrc,
-        }) => {
+        Some(RelayRtcpRole::Receiver { tracker }) => {
             if let Ok(mut t) = tracker.lock() {
-                t.on_packet(pkt.seq, pkt.timestamp, elapsed, clock_rate);
-            }
-            if let Ok(mut s) = last_ssrc.lock() {
-                *s = Some(pkt.ssrc);
+                t.on_packet(pkt.ssrc, pkt.seq, pkt.timestamp, elapsed, clock_rate);
             }
         }
         Some(RelayRtcpRole::Sender(acc)) => {
@@ -714,7 +707,6 @@ pub(crate) fn note_rtcp(
 pub struct CarrierRtcpBundle {
     pub send: crate::ims::media_stats::SendAccounting,
     pub receive: Arc<Mutex<crate::ims::media_stats::ReceiveTracker>>,
-    pub receive_ssrc: Arc<Mutex<Option<u32>>>,
     pub far_end: Arc<Mutex<FarEndQuality>>,
 }
 
@@ -730,7 +722,6 @@ impl CarrierRtcpBundle {
     pub fn receiver_role(&self) -> RelayRtcpRole {
         RelayRtcpRole::Receiver {
             tracker: self.receive.clone(),
-            ssrc: self.receive_ssrc.clone(),
         }
     }
 }
@@ -882,19 +873,15 @@ fn handle_inbound_item(item: &RtcpItem, bundle: &CarrierRtcpBundle, clock_rate: 
 /// report RFC 3550 §6.4.1 strictly defines — an honest approximation
 /// documented here rather than a fabricated precise figure.
 fn build_report(bundle: &CarrierRtcpBundle, clock_rate: u32, cname: &str) -> Vec<u8> {
+    // About the latest carrier source alone, in its own sequence space
+    // (RFC 3550 §6.4.1): a hold stream's SSRC, or the far party's after it,
+    // is another source.
     let receive_block = bundle
-        .receive_ssrc
+        .receive
         .lock()
         .ok()
-        .and_then(|g| *g)
-        .zip(
-            bundle
-                .receive
-                .lock()
-                .ok()
-                .map(|t| (t.stats(clock_rate), t.highest_extended_seq().unwrap_or(0))),
-        )
-        .map(|(ssrc, (stats, highest_seq))| ReportBlock {
+        .and_then(|t| t.latest_report(clock_rate))
+        .map(|(ssrc, stats, highest_seq)| ReportBlock {
             ssrc,
             // RFC 3550 §6.4.1: "equivalent to taking the integer part after
             // multiplying the loss fraction by 256" — 256, not 255 (code
@@ -1245,12 +1232,11 @@ mod tests {
     #[test]
     fn build_report_sends_a_receiver_report_when_only_receiving_ever_happened() {
         let bundle = CarrierRtcpBundle::new();
-        *bundle.receive_ssrc.lock().unwrap() = Some(0xBEEF);
         bundle
             .receive
             .lock()
             .unwrap()
-            .on_packet(1, 0, Duration::ZERO, 8000);
+            .on_packet(0xBEEF, 1, 0, Duration::ZERO, 8000);
         let pkt = build_report(&bundle, 8000, "cname");
         let items = parse_compound(&pkt);
         assert!(

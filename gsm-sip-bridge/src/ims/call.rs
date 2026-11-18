@@ -501,7 +501,13 @@ fn run_rtp_session(
                     stats_recv
                         .lock()
                         .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner())
-                        .on_packet(pkt.seq, pkt.timestamp, media_start.elapsed(), clock_rate);
+                        .on_packet(
+                            pkt.ssrc,
+                            pkt.seq,
+                            pkt.timestamp,
+                            media_start.elapsed(),
+                            clock_rate,
+                        );
                     if let Some(buf) = &echo_buffer_recv {
                         buf.push(&samples);
                     }

@@ -26,6 +26,9 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Default)]
 pub struct MediaMeter {
     /// Packets received *from the carrier* — the caller's audio (downlink).
+    /// The transcoding relay counts only the packets its RTP reorder buffer
+    /// lets through, so a stream it drops (a source it no longer follows)
+    /// reads as silence here, not as audio that flowed.
     carrier_rx: Arc<AtomicU64>,
     /// Packets received *from the telephone leg* — the callee's audio, relayed
     /// onward to the carrier (uplink).
@@ -262,13 +265,146 @@ impl ReceiveStats {
     }
 }
 
-/// Tracks sequence continuity and arrival timing across a call.
+/// Tracks sequence continuity and arrival timing across a call, per RTP
+/// source.
+///
+/// RFC 3550 §6.4.1 keeps loss, the highest sequence number and jitter for
+/// each SSRC, because each source has its own sequence space and clock. A
+/// carrier hold replaces the far party's SSRC with the hold stream's and the
+/// resume goes back to it (T2, 2026-11-21); counted as one stream, the jump
+/// between the two sequence spaces read as thousands of lost and reordered
+/// packets, and that loss went to the carrier in this bridge's own RTCP. A
+/// source that comes back continues its own count.
 ///
 /// Sequence numbers are 16-bit and wrap; this extends them internally so a
 /// call lasting past 65535 packets (about 22 minutes at 20ms) does not read as
 /// catastrophic loss the moment it wraps.
 #[derive(Debug, Default)]
 pub struct ReceiveTracker {
+    sources: Vec<TrackedSource>,
+    /// The SSRC of the most recent packet: the source this bridge's RTCP
+    /// receiver block describes.
+    latest: Option<u32>,
+    /// Sources dropped past [`MAX_RECEIVE_SOURCES`], still counted in the
+    /// call's totals.
+    evicted: ReceiveStats,
+    tick: u64,
+}
+
+/// How many RTP sources one call's receive tracker keeps apart. A call sees
+/// the far party, a hold stream, perhaps an independent `telephone-event`
+/// source; this only bounds memory against a peer that keeps changing SSRC.
+const MAX_RECEIVE_SOURCES: usize = 16;
+
+#[derive(Debug)]
+struct TrackedSource {
+    ssrc: u32,
+    last_seen: u64,
+    sequence: SourceSequence,
+}
+
+impl ReceiveTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records one received packet from the source `ssrc`.
+    ///
+    /// `arrival` is time since an arbitrary but fixed origin, and
+    /// `rtp_timestamp`/`clock_rate` are the packet's own timing — the pair is
+    /// what makes jitter measurable rather than guessed.
+    pub fn on_packet(
+        &mut self,
+        ssrc: u32,
+        seq: u16,
+        rtp_timestamp: u32,
+        arrival: Duration,
+        clock_rate: u32,
+    ) {
+        self.tick += 1;
+        let tick = self.tick;
+        self.latest = Some(ssrc);
+        let index = match self.sources.iter().position(|s| s.ssrc == ssrc) {
+            Some(index) => index,
+            None => {
+                if self.sources.len() >= MAX_RECEIVE_SOURCES {
+                    self.evict_least_recent();
+                }
+                self.sources.push(TrackedSource {
+                    ssrc,
+                    last_seen: tick,
+                    sequence: SourceSequence::default(),
+                });
+                self.sources.len() - 1
+            }
+        };
+        let source = &mut self.sources[index];
+        source.last_seen = tick;
+        source
+            .sequence
+            .on_packet(seq, rtp_timestamp, arrival, clock_rate);
+    }
+
+    fn evict_least_recent(&mut self) {
+        let Some(index) = self
+            .sources
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| s.last_seen)
+            .map(|(index, _)| index)
+        else {
+            return;
+        };
+        // The jitter is the latest source's, so it is not carried over.
+        let gone = self.sources.swap_remove(index).sequence.stats(0);
+        self.evicted.received_packets += gone.received_packets;
+        self.evicted.lost_packets += gone.lost_packets;
+        self.evicted.reordered_packets += gone.reordered_packets;
+    }
+
+    fn latest_source(&self) -> Option<&SourceSequence> {
+        let latest = self.latest?;
+        self.sources
+            .iter()
+            .find(|s| s.ssrc == latest)
+            .map(|s| &s.sequence)
+    }
+
+    /// Snapshot of the whole call so far: packets, loss and reordering
+    /// summed over every source, each counted in its own sequence space, and
+    /// the jitter of the latest source.
+    pub fn stats(&self, clock_rate: u32) -> ReceiveStats {
+        let mut total = self.evicted;
+        for source in &self.sources {
+            let s = source.sequence.stats(clock_rate);
+            total.received_packets += s.received_packets;
+            total.lost_packets += s.lost_packets;
+            total.reordered_packets += s.reordered_packets;
+        }
+        total.jitter = self
+            .latest_source()
+            .map(|s| s.stats(clock_rate).jitter)
+            .unwrap_or_default();
+        total
+    }
+
+    /// The latest source's SSRC and its own figures, for the RTCP receiver
+    /// block about it (RFC 3550 §6.4.1): its statistics and its extended
+    /// highest sequence number. `None` before the first packet.
+    pub fn latest_report(&self, clock_rate: u32) -> Option<(u32, ReceiveStats, u32)> {
+        let ssrc = self.latest?;
+        let source = self.latest_source()?;
+        Some((
+            ssrc,
+            source.stats(clock_rate),
+            source.highest_extended_seq().unwrap_or(0),
+        ))
+    }
+}
+
+/// One source's sequence space and timing.
+#[derive(Debug, Default)]
+struct SourceSequence {
     base_extended: Option<u64>,
     highest_extended: u64,
     cycles: u64,
@@ -280,17 +416,13 @@ pub struct ReceiveTracker {
     last_transit: Option<i64>,
 }
 
-impl ReceiveTracker {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
+impl SourceSequence {
     /// Records one received packet.
     ///
     /// `arrival` is time since an arbitrary but fixed origin, and
     /// `rtp_timestamp`/`clock_rate` are the packet's own timing — the pair is
     /// what makes jitter measurable rather than guessed.
-    pub fn on_packet(&mut self, seq: u16, rtp_timestamp: u32, arrival: Duration, clock_rate: u32) {
+    fn on_packet(&mut self, seq: u16, rtp_timestamp: u32, arrival: Duration, clock_rate: u32) {
         let extended = match self.base_extended {
             None => {
                 self.base_extended = Some(seq as u64);
@@ -330,7 +462,7 @@ impl ReceiveTracker {
     }
 
     /// Snapshot of what has been observed so far.
-    pub fn stats(&self, clock_rate: u32) -> ReceiveStats {
+    fn stats(&self, clock_rate: u32) -> ReceiveStats {
         let expected = match self.base_extended {
             None => 0,
             Some(base) => self.highest_extended.saturating_sub(base) + 1,
@@ -353,7 +485,7 @@ impl ReceiveTracker {
     /// extended counter already is. `None` before the first packet
     /// (specs/046-rtcp-reporting: needed for the receiver block this
     /// bridge includes in its own outgoing RTCP).
-    pub fn highest_extended_seq(&self) -> Option<u32> {
+    fn highest_extended_seq(&self) -> Option<u32> {
         self.base_extended.map(|_| self.highest_extended as u32)
     }
 }
@@ -361,6 +493,8 @@ impl ReceiveTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SSRC: u32 = 0x1234;
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
@@ -520,7 +654,7 @@ mod tests {
     fn a_clean_stream_reports_no_loss() {
         let mut t = ReceiveTracker::new();
         for i in 0..100u16 {
-            t.on_packet(i, i as u32 * 320, ms(i as u64 * 20), 16000);
+            t.on_packet(SSRC, i, i as u32 * 320, ms(i as u64 * 20), 16000);
         }
 
         let s = t.stats(16000);
@@ -535,7 +669,7 @@ mod tests {
     fn a_sequence_gap_is_counted_as_loss() {
         let mut t = ReceiveTracker::new();
         for i in [0u16, 1, 2, 5, 6] {
-            t.on_packet(i, i as u32 * 320, ms(i as u64 * 20), 16000);
+            t.on_packet(SSRC, i, i as u32 * 320, ms(i as u64 * 20), 16000);
         }
 
         let s = t.stats(16000);
@@ -550,7 +684,7 @@ mod tests {
         // Treating reordering as loss overstates how bad the path is.
         let mut t = ReceiveTracker::new();
         for i in [0u16, 1, 3, 2, 4] {
-            t.on_packet(i, i as u32 * 320, ms(i as u64 * 20), 16000);
+            t.on_packet(SSRC, i, i as u32 * 320, ms(i as u64 * 20), 16000);
         }
 
         let s = t.stats(16000);
@@ -566,7 +700,7 @@ mod tests {
         // catastrophic loss the moment the counter wraps.
         let mut t = ReceiveTracker::new();
         for seq in [65533u16, 65534, 65535, 0, 1, 2] {
-            t.on_packet(seq, 0, ms(0), 0);
+            t.on_packet(SSRC, seq, 0, ms(0), 0);
         }
 
         let s = t.stats(0);
@@ -579,7 +713,7 @@ mod tests {
     fn loss_percent_is_relative_to_what_should_have_arrived() {
         let mut t = ReceiveTracker::new();
         for i in [0u16, 1, 2, 3, 4, 5, 6, 7, 8, 19] {
-            t.on_packet(i, 0, ms(0), 0);
+            t.on_packet(SSRC, i, 0, ms(0), 0);
         }
 
         let s = t.stats(0);
@@ -596,7 +730,7 @@ mod tests {
         let mut t = ReceiveTracker::new();
         // 20ms packets at 16kHz = 320 samples per packet, arriving exactly on time.
         for i in 0..50u16 {
-            t.on_packet(i, i as u32 * 320, ms(i as u64 * 20), 16000);
+            t.on_packet(SSRC, i, i as u32 * 320, ms(i as u64 * 20), 16000);
         }
 
         assert_eq!(t.stats(16000).jitter, Duration::ZERO);
@@ -608,7 +742,7 @@ mod tests {
         // Same packets, arriving with a wobble.
         let arrivals = [0u64, 25, 38, 65, 78, 105];
         for (i, &a) in arrivals.iter().enumerate() {
-            t.on_packet(i as u16, i as u32 * 320, ms(a), 16000);
+            t.on_packet(SSRC, i as u16, i as u32 * 320, ms(a), 16000);
         }
 
         assert!(
@@ -628,10 +762,76 @@ mod tests {
     #[test]
     fn highest_extended_seq_is_none_before_any_packet_then_tracks_the_highest_seen() {
         let mut t = ReceiveTracker::new();
-        assert_eq!(t.highest_extended_seq(), None);
+        assert_eq!(t.latest_report(0), None);
         for i in [0u16, 1, 2, 5, 4] {
-            t.on_packet(i, 0, ms(0), 0);
+            t.on_packet(SSRC, i, 0, ms(0), 0);
         }
-        assert_eq!(t.highest_extended_seq(), Some(5));
+        assert_eq!(t.latest_report(0).map(|(_, _, highest)| highest), Some(5));
+    }
+
+    /// The live T2 hold and resume (2026-11-21): the far party's stream, the
+    /// hold stream under another SSRC in another sequence space, then the
+    /// far party again, continuing its own sequence. Counted as one stream
+    /// this read as thousands of lost and reordered packets.
+    #[test]
+    fn a_hold_stream_and_the_far_partys_return_are_not_loss() {
+        const FAR_PARTY: u32 = 0xA;
+        const HOLD: u32 = 0xB;
+        let mut t = ReceiveTracker::new();
+        let mut at = 0u64;
+        let mut feed = |t: &mut ReceiveTracker, ssrc, seqs: std::ops::Range<u16>| {
+            for seq in seqs {
+                t.on_packet(ssrc, seq, u32::from(seq) * 320, ms(at), 16000);
+                at += 20;
+            }
+        };
+        feed(&mut t, FAR_PARTY, 30_000..31_000);
+        feed(&mut t, HOLD, 5_000..5_850);
+        feed(&mut t, FAR_PARTY, 31_000..38_000);
+
+        let s = t.stats(16000);
+        assert_eq!(s.received_packets, 8_850);
+        assert_eq!(s.lost_packets, 0);
+        assert_eq!(s.reordered_packets, 0);
+
+        let (ssrc, own, highest) = t.latest_report(16000).unwrap();
+        assert_eq!(ssrc, FAR_PARTY);
+        assert_eq!(own.received_packets, 8_000);
+        assert_eq!(own.lost_packets, 0);
+        assert_eq!(highest, 37_999);
+    }
+
+    /// Loss within each source still counts, and the receiver block
+    /// describes only the latest source's.
+    #[test]
+    fn loss_is_counted_within_each_source() {
+        let mut t = ReceiveTracker::new();
+        for seq in [0u16, 1, 3] {
+            t.on_packet(1, seq, 0, ms(0), 0);
+        }
+        for seq in [100u16, 101, 102, 106] {
+            t.on_packet(2, seq, 0, ms(0), 0);
+        }
+        let s = t.stats(0);
+        assert_eq!((s.received_packets, s.lost_packets), (7, 4));
+        let (ssrc, own, highest) = t.latest_report(0).unwrap();
+        assert_eq!((ssrc, own.lost_packets, highest), (2, 3, 106));
+    }
+
+    /// A peer that keeps changing SSRC cannot grow the tracker without bound,
+    /// and what the dropped sources received still counts.
+    #[test]
+    fn sources_past_the_limit_are_folded_into_the_totals() {
+        let mut t = ReceiveTracker::new();
+        let sources = MAX_RECEIVE_SOURCES as u32 * 3;
+        for ssrc in 0..sources {
+            for seq in [0u16, 2] {
+                t.on_packet(ssrc, seq, 0, ms(0), 0);
+            }
+        }
+        assert_eq!(t.sources.len(), MAX_RECEIVE_SOURCES);
+        let s = t.stats(0);
+        assert_eq!(s.received_packets, u64::from(sources) * 2);
+        assert_eq!(s.lost_packets, u64::from(sources));
     }
 }
