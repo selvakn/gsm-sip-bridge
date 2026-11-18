@@ -501,6 +501,9 @@ section! {
         pub tunnel_address_family: String,
         pub vpcd_host: String,
         pub vpcd_port: u16,
+        /// `"auto"` (default), `"managed"` or `"external"`. See
+        /// `VowifiConfig::pcscd`.
+        pub pcscd: String,
         pub max_lines: u32,
         /// `[[vowifi.line]]`. Named `line`, not `lines`, so the field name
         /// *is* the TOML key — a `#[serde(rename)]` would be invisible to the
@@ -546,6 +549,7 @@ impl Default for RawVowifi {
             tunnel_address_family: "dual".to_string(),
             vpcd_host: "127.0.0.1".to_string(),
             vpcd_port: 15963,
+            pcscd: "auto".to_string(),
             max_lines: 8,
             line: Vec::new(),
         }

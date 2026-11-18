@@ -320,6 +320,18 @@ pub trait CommandRunner: Send + Sync {
     /// genuinely working deployment as unhealthy.
     fn tcp_connect_ok_in_netns(&self, netns: &str, host: &str, port: u16) -> bool;
 
+    /// Best-effort connect probe on a Unix stream socket — `true` iff a
+    /// connection was established. Used for pcscd's control socket: a
+    /// systemd socket unit accepts the connect itself (and activates its
+    /// service), a pcscd accepts it once it is serving, and a stale socket
+    /// file nothing listens on refuses it.
+    fn unix_connect_ok(&self, path: &Path) -> bool;
+
+    /// `(device, inode)` of whatever is at `path`, or `None` if nothing is.
+    /// Tells a socket file a freshly spawned daemon created apart from one
+    /// that was already there before it started.
+    fn path_identity(&self, path: &Path) -> Option<(u64, u64)>;
+
     /// Fetch a URL over plain HTTP/1.0.
     ///
     /// Exists so the container healthcheck can read the daemon's own
@@ -657,6 +669,17 @@ impl CommandRunner for RealCommandRunner {
         self.run_in_netns(netns, &[&exe.to_string_lossy(), "tcp-probe", host, &port])
             .map(|out| out.status.success())
             .unwrap_or(false)
+    }
+
+    fn unix_connect_ok(&self, path: &Path) -> bool {
+        std::os::unix::net::UnixStream::connect(path).is_ok()
+    }
+
+    fn path_identity(&self, path: &Path) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|m| (m.dev(), m.ino()))
     }
 
     fn resolve_host(&self, host: &str) -> io::Result<Vec<std::net::Ipv4Addr>> {
@@ -1047,6 +1070,10 @@ mod mock {
     /// constitution names. The decision logic under test (what command runs
     /// next, what state transition follows) is real production code; only
     /// the process/filesystem boundary is faked.
+    /// Successive `path_identity` answers for one path (see
+    /// `MockCommandRunner::path_identities`).
+    pub type PathIdentityQueue = std::collections::VecDeque<Option<(u64, u64)>>;
+
     #[derive(Default)]
     pub struct MockCommandRunner {
         pub run_calls: Mutex<Vec<Vec<String>>>,
@@ -1081,6 +1108,15 @@ mod mock {
         /// lets a test assert that something did *not* connect anywhere
         /// (specs/094: the HEALTHCHECK never probes the P-CSCF).
         pub tcp_connect_attempts: Mutex<Vec<(Option<String>, String, u16)>>,
+        /// Overrides `unix_connect_ok`'s return value per socket path;
+        /// unseeded paths refuse (no pcscd in tests).
+        pub unix_connect_results: Mutex<Map<String, bool>>,
+        /// Every `unix_connect_ok` call's path, in call order.
+        pub unix_connect_attempts: Mutex<Vec<String>>,
+        /// Successive `path_identity` answers per path: each call takes the
+        /// front entry while more than one is queued, then keeps returning
+        /// the last. Unseeded paths have no identity (nothing there).
+        pub path_identities: Mutex<Map<String, PathIdentityQueue>>,
         /// Overrides `resolve_host`'s return value for a given host;
         /// unseeded hosts resolve to an empty address list (no real DNS in
         /// tests).
@@ -1220,6 +1256,23 @@ mod mock {
                 .lock()
                 .unwrap()
                 .insert(format!("{host}:{port}"), ok);
+        }
+
+        /// Seeds `unix_connect_ok(path)`'s return value.
+        pub fn set_unix_connect_ok(&self, path: &str, ok: bool) {
+            self.unix_connect_results
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), ok);
+        }
+
+        /// Seeds the successive `path_identity(path)` answers (see
+        /// `path_identities`).
+        pub fn set_path_identities(&self, path: &str, ids: Vec<Option<(u64, u64)>>) {
+            self.path_identities
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), ids.into());
         }
 
         /// Seeds the addresses `resolve_host(host)` returns.
@@ -1555,6 +1608,28 @@ mod mock {
                 .get(&format!("netns:{netns}:{host}:{port}"))
                 .copied()
                 .unwrap_or(false)
+        }
+
+        fn unix_connect_ok(&self, path: &Path) -> bool {
+            let key = path.to_string_lossy().into_owned();
+            self.unix_connect_attempts.lock().unwrap().push(key.clone());
+            self.unix_connect_results
+                .lock()
+                .unwrap()
+                .get(&key)
+                .copied()
+                .unwrap_or(false)
+        }
+
+        fn path_identity(&self, path: &Path) -> Option<(u64, u64)> {
+            let key = path.to_string_lossy().into_owned();
+            let mut ids = self.path_identities.lock().unwrap();
+            let queue = ids.get_mut(&key)?;
+            if queue.len() > 1 {
+                queue.pop_front().flatten()
+            } else {
+                queue.front().copied().flatten()
+            }
         }
 
         fn resolve_host(&self, host: &str) -> io::Result<Vec<std::net::Ipv4Addr>> {

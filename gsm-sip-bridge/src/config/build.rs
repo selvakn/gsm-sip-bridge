@@ -902,6 +902,40 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
         }
     }
 
+    let pcscd = raw
+        .pcscd
+        .parse::<PcscdMode>()
+        .map_err(|e| BridgeError::Config(format!("vowifi.pcscd {e}")))?;
+    // A pcscd the host provides has no vpcd reader, so it can serve only
+    // card-reader lines; a modem-backed line (an unpinned, discovered one
+    // included) reaches its SIM through the vpcd reader `supervise`
+    // configures in its own pcscd. `supervise` checks the resolved line
+    // table again before starting anything; this catches it at load time.
+    if pcscd == PcscdMode::External && raw.enabled {
+        if raw.tunnel_engine != "strongswan" {
+            return Err(BridgeError::Config(
+                "vowifi.pcscd = \"external\" requires tunnel_engine = \"strongswan\" \
+                 (the swu engine does not use pcscd)"
+                    .to_string(),
+            ));
+        }
+        if line_overrides.is_empty() {
+            return Err(BridgeError::Config(
+                "vowifi.pcscd = \"external\" needs every line to be a [[vowifi.line]] \
+                 with pcsc_reader = true; with no [[vowifi.line]] entries the lines are \
+                 discovered modems, which need the bridge's own pcscd"
+                    .to_string(),
+            ));
+        }
+        if let Some(i) = line_overrides.iter().position(|o| !o.pcsc_reader) {
+            return Err(BridgeError::Config(format!(
+                "vowifi.pcscd = \"external\" cannot serve vowifi.line[{i}]: it is \
+                 modem-backed, and its SIM reaches pcscd only through the vpcd reader \
+                 the bridge's own pcscd provides; use \"managed\" or \"auto\""
+            )));
+        }
+    }
+
     // Derived fields keep their placeholder defaults here and are overwritten
     // per line by `vowifi::discovery::resolve_one_line`. They are not TOML
     // keys — see `raw::RawVowifi`.
@@ -1002,6 +1036,7 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
         tunnel_address_family,
         vpcd_host: raw.vpcd_host,
         vpcd_port: in_range(raw.vpcd_port, "vowifi.vpcd_port", 1..=65535)?,
+        pcscd,
         max_lines: in_range(raw.max_lines, "vowifi.max_lines", 1..=64)?,
         line_overrides,
         ..d

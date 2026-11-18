@@ -34,13 +34,13 @@
 //! before this is fully trusted in production.
 
 use super::engines::SharedCharon;
+use super::epdg_iface;
 use super::orchestrate::{
     establish_line_tunnel, prepare_vowifi_line, LineStartup, PCSCF_PLUGIN_CONF, SHARED_CHARON_LOG,
     SHARED_STRONGSWAN_CONF, SHARED_SWANCTL_CONF, SHARED_SWANCTL_CONF_DIR, SHARED_VICI_SOCKET,
 };
 use super::runner::CommandRunner;
 use super::shutdown::{self, StartedState, TeardownBudget};
-use super::{epdg_iface, vpcd};
 use crate::config::AppConfig;
 use crate::vowifi::discovery::LineResolutionEntry;
 use std::collections::BTreeSet;
@@ -440,25 +440,19 @@ fn prime_lines(
     // every priming line's own `vpcd_port` — derived from its pass-local
     // index (research.md R4) — falls within that range by construction.
     let needs_vpcd = targets.iter().any(|t| !t.line.pcsc_reader);
-    if needs_vpcd {
-        vpcd::write_vpcd_reader_conf(runner.as_ref(), config.vowifi.vpcd_port);
-    }
-    let pcscd_handle = match vpcd::start_pcscd_with_retries(
-        runner.as_ref(),
-        needs_vpcd,
-        &config.vowifi.vpcd_host,
-        config.vowifi.vpcd_port,
-    ) {
-        Ok(h) => Arc::new(h),
-        Err(e) => {
-            let msg = format!("priming: pcscd/vpcd did not become ready: {e:?}");
-            return targets
-                .iter()
-                .map(|t| (t.line.card_id.clone(), Err(msg.clone())))
-                .collect();
-        }
-    };
-    started.lock().unwrap().pcscd = Some(pcscd_handle);
+    let pcscd_handle =
+        match super::orchestrate::start_pass_pcscd(runner.as_ref(), config, needs_vpcd) {
+            Ok(h) => h,
+            Err(e) => {
+                let msg = format!("priming: pcscd did not become ready: {e}");
+                return targets
+                    .iter()
+                    .map(|t| (t.line.card_id.clone(), Err(msg.clone())))
+                    .collect();
+            }
+        };
+    // `None` is the host's own pcscd: nothing for this pass's teardown to stop.
+    started.lock().unwrap().pcscd = pcscd_handle;
 
     render_shared_charon_assets(runner.as_ref(), targets);
     let shared_charon = Arc::new(SharedCharon::new(
@@ -811,6 +805,10 @@ mod tests {
         let runner: Arc<dyn CommandRunner> = mock.clone();
         let config = test_config();
         mock.set_tcp_connect_ok(&config.vowifi.vpcd_host, config.vowifi.vpcd_port, true);
+        mock.set_unix_connect_ok(
+            &crate::supervise::vpcd::pcscd_socket_path().to_string_lossy(),
+            true,
+        );
         let mut failing = priming_line(1, "card-failing", 24, 35964);
         failing.modem_port = "/dev/ttyUSB-nonexistent-for-this-test".to_string();
         let mut other = priming_line(0, "card-other", 23, 35963);
@@ -945,6 +943,10 @@ mod tests {
         // pass would return before `tear_down` is even called, and this
         // test would pass for the wrong reason.
         mock.set_tcp_connect_ok(&config.vowifi.vpcd_host, config.vowifi.vpcd_port, true);
+        mock.set_unix_connect_ok(
+            &crate::supervise::vpcd::pcscd_socket_path().to_string_lossy(),
+            true,
+        );
         let line = priming_line(0, "card0", 23, 35963);
         let cache_path =
             crate::volte::pcscf::per_line_cache_path(&config.volte.pcscf_source_path, "card0");
