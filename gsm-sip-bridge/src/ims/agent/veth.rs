@@ -134,8 +134,8 @@ pub(super) fn spawn_relay(
     veth: UdpSocket,
     stop: Arc<AtomicBool>,
     meter: &crate::ims::media_stats::MediaMeter,
-    carrier_dtmf_pt: Option<u8>,
-    veth_dtmf_pt: Option<u8>,
+    carrier_dtmf: Option<(u8, u32)>,
+    veth_dtmf: Option<(u8, u32)>,
     rtcp: Option<crate::ims::rtcp::CarrierRtcpBundle>,
 ) {
     let carrier_rx = meter.carrier_rx_counter();
@@ -147,8 +147,8 @@ pub(super) fn spawn_relay(
             stop,
             carrier_rx,
             pbx_rx,
-            carrier_dtmf_pt,
-            veth_dtmf_pt,
+            carrier_dtmf,
+            veth_dtmf,
             rtcp,
         )
     });
@@ -164,9 +164,11 @@ pub(super) fn spawn_relay(
 /// already correct for the other side without modification.
 ///
 /// The one exception is DTMF (specs/044 RTP-03): each leg's own SDP answer
-/// picks its `telephone-event` payload type independently, so "both legs
-/// agree" never held for it the way it does for the audio codec — see
-/// `forward`'s own relabeling.
+/// picks its `telephone-event` independently, so "both legs agree" never
+/// held for it the way it does for the audio codec — see `forward`'s own
+/// relabeling and duration rescaling. `carrier_dtmf` and `veth_dtmf` are
+/// each leg's `(payload type, clock rate)`, from
+/// [`ChosenCodec::telephone_event`](crate::ims::sdp::ChosenCodec::telephone_event).
 #[allow(clippy::too_many_arguments)]
 pub fn relay_rtp(
     carrier: UdpSocket,
@@ -174,8 +176,8 @@ pub fn relay_rtp(
     stop: Arc<AtomicBool>,
     carrier_rx: Arc<std::sync::atomic::AtomicU64>,
     pbx_rx: Arc<std::sync::atomic::AtomicU64>,
-    carrier_dtmf_pt: Option<u8>,
-    veth_dtmf_pt: Option<u8>,
+    carrier_dtmf: Option<(u8, u32)>,
+    veth_dtmf: Option<(u8, u32)>,
     rtcp: Option<crate::ims::rtcp::CarrierRtcpBundle>,
 ) {
     let (carrier2, veth2, stop2) = match (carrier.try_clone(), veth.try_clone()) {
@@ -205,8 +207,8 @@ pub fn relay_rtp(
             veth2,
             stop,
             carrier_rx,
-            carrier_dtmf_pt,
-            veth_dtmf_pt,
+            carrier_dtmf,
+            veth_dtmf,
             "carrier->veth",
             receiver_role,
         )
@@ -217,8 +219,8 @@ pub fn relay_rtp(
             carrier2,
             stop2,
             pbx_rx,
-            veth_dtmf_pt,
-            carrier_dtmf_pt,
+            veth_dtmf,
+            carrier_dtmf,
             "veth->carrier",
             sender_role,
         )
@@ -232,8 +234,9 @@ pub fn relay_rtp(
 /// `telephone-event` (specs/044 RTP-03) — the receiving leg would
 /// otherwise get a payload type it never agreed DTMF would use. Only the
 /// payload-type byte (offset 1, low 7 bits — the marker bit in the high
-/// bit is preserved) changes; the RFC 4733 event payload itself is
-/// identical regardless of which leg's codec is in use, so no
+/// bit is preserved) changes here; the RFC 4733 event payload is the same
+/// for either leg's codec, apart from its duration when the legs' events
+/// count in different clocks, which `forward` rescales separately. No
 /// re-origination (fresh SSRC/timestamp run) is needed the way the
 /// transcoding relay's DTMF path needs one.
 fn relabel_dtmf_payload_type(buf: &mut [u8], dst_dtmf_pt: u8) {
@@ -248,8 +251,8 @@ fn forward(
     dst: UdpSocket,
     stop: Arc<AtomicBool>,
     counter: Arc<std::sync::atomic::AtomicU64>,
-    src_dtmf_pt: Option<u8>,
-    dst_dtmf_pt: Option<u8>,
+    src_dtmf: Option<(u8, u32)>,
+    dst_dtmf: Option<(u8, u32)>,
     direction: &'static str,
     rtcp: Option<crate::ims::rtcp::RelayRtcpRole>,
 ) {
@@ -282,11 +285,18 @@ fn forward(
                         );
                     }
                     crate::ims::rtcp::note_rtcp(&rtcp, &pkt, media_start.elapsed(), clock_rate);
-                    if Some(payload_type) == src_dtmf_pt {
-                        if let Some(dst_pt) = dst_dtmf_pt {
-                            if Some(dst_pt) != src_dtmf_pt {
+                    if let (Some((src_pt, src_clock)), Some((dst_pt, dst_clock))) =
+                        (src_dtmf, dst_dtmf)
+                    {
+                        if payload_type == src_pt {
+                            if dst_pt != src_pt {
                                 relabel_dtmf_payload_type(&mut buf[..n], dst_pt);
                             }
+                            crate::ims::rtp::rescale_packet_event_duration(
+                                &mut buf[..n],
+                                src_clock,
+                                dst_clock,
+                            );
                         }
                     }
                 }
@@ -381,8 +391,8 @@ mod tests {
     }
 
     fn run_forward_once(
-        src_dtmf_pt: Option<u8>,
-        dst_dtmf_pt: Option<u8>,
+        src_dtmf: Option<(u8, u32)>,
+        dst_dtmf: Option<(u8, u32)>,
         packet: &[u8],
     ) -> Vec<u8> {
         let (src_recv, src_send) = connected_pair();
@@ -399,14 +409,7 @@ mod tests {
         let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let handle = std::thread::spawn(move || {
             forward(
-                src_recv,
-                dst_send,
-                stop_clone,
-                counter,
-                src_dtmf_pt,
-                dst_dtmf_pt,
-                "test",
-                None,
+                src_recv, dst_send, stop_clone, counter, src_dtmf, dst_dtmf, "test", None,
             )
         });
         src_send.send(packet).unwrap();
@@ -427,7 +430,7 @@ mod tests {
     #[test]
     fn a_dtmf_packet_is_relabeled_to_the_destination_legs_own_payload_type() {
         let packet = crate::ims::rtp::build_packet(1, 8000, 0xAAAA, 101, &[9, 0, 0, 160]);
-        let forwarded = run_forward_once(Some(101), Some(96), &packet);
+        let forwarded = run_forward_once(Some((101, 8000)), Some((96, 8000)), &packet);
         assert_eq!(
             forwarded[1] & 0x7f,
             96,
@@ -450,8 +453,19 @@ mod tests {
     #[test]
     fn a_dtmf_packet_is_unchanged_when_both_legs_agree_on_the_payload_type() {
         let packet = crate::ims::rtp::build_packet(1, 8000, 0xAAAA, 101, &[9, 0, 0, 160]);
-        let forwarded = run_forward_once(Some(101), Some(101), &packet);
+        let forwarded = run_forward_once(Some((101, 8000)), Some((101, 8000)), &packet);
         assert_eq!(forwarded, packet);
+    }
+
+    /// When the legs' events count in different clocks, the duration is
+    /// re-counted in the destination's, so the keypress keeps its length:
+    /// 160 at 8 kHz is 20 ms, which is 320 at 16 kHz.
+    #[test]
+    fn a_dtmf_packets_duration_is_rescaled_to_the_destination_legs_event_clock() {
+        let packet = crate::ims::rtp::build_packet(1, 8000, 0xAAAA, 101, &[9, 0, 0, 160]);
+        let forwarded = run_forward_once(Some((101, 8000)), Some((96, 16000)), &packet);
+        assert_eq!(forwarded[1] & 0x7f, 96);
+        assert_eq!(&forwarded[12..], &[9, 0, 1, 64], "320 at 16 kHz");
     }
 
     /// An ordinary audio packet must never be relabeled, regardless of what
@@ -459,7 +473,7 @@ mod tests {
     #[test]
     fn an_audio_packet_is_never_relabeled() {
         let packet = crate::ims::rtp::build_packet(1, 8000, 0xAAAA, 0, &[0u8; 160]);
-        let forwarded = run_forward_once(Some(101), Some(96), &packet);
+        let forwarded = run_forward_once(Some((101, 8000)), Some((96, 16000)), &packet);
         assert_eq!(forwarded, packet);
     }
 

@@ -106,6 +106,22 @@ pub struct ChosenCodec {
     /// `telephone-event` at all — nowhere a DTMF relay can put an event even
     /// if the far leg sends one.
     pub dtmf_payload_type: Option<u8>,
+    /// The clock rate of that `telephone-event`, from the same `a=rtpmap`.
+    /// RFC 4733 counts an event's duration in it, and it need not match
+    /// either the audio codec or the other leg: an answer falls back to
+    /// another rate's event when there is none at the codec's, and a
+    /// wideband veth leg can face a narrowband carrier. A relay between legs
+    /// whose event clocks differ rescales each event's duration. `Some`
+    /// exactly when `dtmf_payload_type` is.
+    pub dtmf_clock_rate: Option<u32>,
+}
+
+impl ChosenCodec {
+    /// This leg's `telephone-event` as `(payload type, clock rate)`, or
+    /// `None` when it negotiated none.
+    pub fn telephone_event(&self) -> Option<(u8, u32)> {
+        self.dtmf_payload_type.zip(self.dtmf_clock_rate)
+    }
 }
 
 fn ip_addrtype(ip: IpAddr) -> &'static str {
@@ -394,11 +410,15 @@ pub(crate) fn offered_chosen_codec(
         NegotiatedCodec::AmrWb => (AMR_WB_PAYLOAD_TYPE, true),
         _ => return None,
     };
+    // The answer must use the offer's numbering (RFC 3264 §6.1), so the
+    // clock is the one `build_offer` gave that number.
+    let dtmf = dtmf_payload_type.and_then(|pt| Some((pt, offered_dtmf_rate(pt)?)));
     Some(ChosenCodec {
         codec,
         payload_type,
         octet_aligned,
-        dtmf_payload_type,
+        dtmf_payload_type: dtmf.map(|(pt, _)| pt),
+        dtmf_clock_rate: dtmf.map(|(_, rate)| rate),
     })
 }
 
@@ -455,11 +475,20 @@ impl SdpOffer {
             .offered
             .iter()
             .find(|o| o.payload_type == chosen.payload_type)?;
+        // The forwarder relabels events between the legs but never touches
+        // their durations, and the client leg's event is always at the
+        // codec's rate (`vowifi::forward`). A carrier event at another rate
+        // is left out, so a client with DTMF declines forwarding
+        // (`Reason::Dtmf`) and the call is transcoded, which rescales them.
+        let dtmf_payload_type = chosen
+            .telephone_event()
+            .filter(|&(_, clock)| clock == chosen.codec.sample_rate())
+            .map(|(pt, _)| pt);
         AmrLegParams::from_sdp(&SdpLeg {
             flavour,
             fmtp: &offered.fmtp,
             payload_type: chosen.payload_type,
-            dtmf_payload_type: chosen.dtmf_payload_type,
+            dtmf_payload_type,
             // The offer states no `ptime` of its own that we keep: the answer
             // asks for 20 ms, which is what the carrier then sends.
             ptime_ms: None,
@@ -1491,6 +1520,7 @@ fn build_answer_for(
             payload_type: pt,
             octet_aligned: chosen.is_octet_aligned(),
             dtmf_payload_type: dtmf_pick.map(|(dpt, _)| *dpt),
+            dtmf_clock_rate: dtmf_pick.map(|(_, drate)| *drate),
         },
     )
 }
@@ -1692,6 +1722,32 @@ mod tests {
         assert!(!leg.crc && !leg.robust_sorting && !leg.interleaving && !leg.redundancy);
     }
 
+    /// The forwarder cannot rescale an event's duration, so a carrier event
+    /// at another rate than the AMR codec's is not handed to it: the leg
+    /// reads as having none, and a client with DTMF declines forwarding.
+    #[test]
+    fn amr_leg_params_leaves_out_a_carrier_event_at_another_clock() {
+        let offer = parse_offer(JIO_MT_OFFER).unwrap();
+        let (_, chosen) = build_answer(
+            "192.0.2.1".parse().unwrap(),
+            40000,
+            1,
+            &offer,
+            true,
+            true,
+            AnswerPreference::Cellular,
+            None,
+        )
+        .unwrap();
+        let at_8k = ChosenCodec {
+            dtmf_payload_type: Some(100),
+            dtmf_clock_rate: Some(8000),
+            ..chosen
+        };
+        let leg = offer.amr_leg_params(&at_8k).expect("AMR-WB was chosen");
+        assert_eq!(leg.dtmf_payload_type, None);
+    }
+
     #[test]
     fn amr_leg_params_is_none_for_pcmu() {
         let offer = offer_of(&[(0, "PCMU/8000")]);
@@ -1700,6 +1756,7 @@ mod tests {
             payload_type: 0,
             octet_aligned: false,
             dtmf_payload_type: None,
+            dtmf_clock_rate: None,
         };
         assert!(offer.amr_leg_params(&pcmu).is_none());
     }
@@ -2051,6 +2108,39 @@ mod tests {
         }
     }
 
+    /// The relay rescales each event's duration between the legs' event
+    /// clocks, so the carrier leg's must be the clock `build_offer` gave the
+    /// number the answer accepted, whatever the audio codec.
+    #[test]
+    fn offered_chosen_codec_carries_the_accepted_events_clock() {
+        for (codec, dtmf, clock) in [
+            (NegotiatedCodec::AmrWb, DTMF_WB_PAYLOAD_TYPE, 16000),
+            (NegotiatedCodec::AmrWb, DTMF_NB_PAYLOAD_TYPE, 8000),
+            (NegotiatedCodec::Pcmu, DTMF_NB_PAYLOAD_TYPE, 8000),
+        ] {
+            let chosen = offered_chosen_codec(codec, Some(dtmf)).unwrap();
+            assert_eq!(
+                chosen.telephone_event(),
+                Some((dtmf, clock)),
+                "{codec:?} {dtmf}"
+            );
+        }
+        let without = offered_chosen_codec(NegotiatedCodec::AmrWb, None).unwrap();
+        assert_eq!(
+            (without.dtmf_payload_type, without.dtmf_clock_rate),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn offered_chosen_codec_ignores_an_event_number_build_offer_never_offered() {
+        let chosen = offered_chosen_codec(NegotiatedCodec::AmrWb, Some(101)).unwrap();
+        assert_eq!(
+            (chosen.dtmf_payload_type, chosen.dtmf_clock_rate),
+            (None, None)
+        );
+    }
+
     #[test]
     fn offered_chosen_codec_rejects_a_codec_build_offer_never_offers() {
         assert_eq!(
@@ -2374,6 +2464,7 @@ mod tests {
         );
         assert!(sdp.contains("a=rtpmap:105 telephone-event/16000\r\n"));
         assert!(!sdp.contains("telephone-event/8000"), "wrong clock rate");
+        assert_eq!(chosen.telephone_event(), Some((105, 16000)));
     }
 
     #[test]
@@ -2864,6 +2955,22 @@ mod tests {
         assert_eq!(wide.codec, NegotiatedCodec::L16);
         let narrow = select_veth_codec(&offer, false).expect("a narrowband pick");
         assert_eq!(narrow.codec, NegotiatedCodec::Pcmu);
+    }
+
+    /// An offer whose only `telephone-event` is at 8 kHz still gets one on a
+    /// wideband L16 answer, and the answer's codec says it counts in 8 kHz:
+    /// the 16 kHz carrier leg's relay has to rescale every duration.
+    #[test]
+    fn a_wideband_veth_answer_falling_back_to_an_8khz_event_reports_that_clock() {
+        let offer = parse_offer(PJSIP_VETH_OFFER_WITH_AMR_OPUS).unwrap();
+        let (sdp, codec) =
+            build_veth_answer("10.99.0.1".parse().unwrap(), 40000, 1, &offer, true).unwrap();
+        assert_eq!(codec.codec, NegotiatedCodec::L16);
+        assert!(
+            sdp.contains("a=rtpmap:120 telephone-event/8000\r\n"),
+            "{sdp}"
+        );
+        assert_eq!(codec.telephone_event(), Some((120, 8000)));
     }
 
     /// The audio stream's port and address must come from the audio section,

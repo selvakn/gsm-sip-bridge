@@ -713,8 +713,8 @@ pub(super) fn handle_invite(
                         veth.rtp_socket,
                         stop.clone(),
                         &meter,
-                        chosen.dtmf_payload_type,
-                        veth.codec.dtmf_payload_type,
+                        chosen.telephone_event(),
+                        veth.codec.telephone_event(),
                         rtcp_bundle.clone(),
                     );
                 }
@@ -1177,8 +1177,8 @@ fn handle_offerless_invite(
             veth.rtp_socket,
             stop.clone(),
             &meter,
-            chosen.dtmf_payload_type,
-            veth.codec.dtmf_payload_type,
+            chosen.telephone_event(),
+            veth.codec.telephone_event(),
             None,
         );
     }

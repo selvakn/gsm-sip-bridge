@@ -458,8 +458,8 @@ pub fn spawn_transcoding_relay(
     Ok(())
 }
 
-/// How far apart (in the *destination* leg's own samples) two separate DTMF
-/// events' re-originated timestamps are placed. Real keypresses are spaced
+/// How far apart (in the *destination* leg's own event clock) two separate
+/// DTMF events' re-originated timestamps are placed. Real keypresses are spaced
 /// well beyond this, and the exact value doesn't matter — it only has to be
 /// nonzero so consecutive digits don't share a timestamp — so a fixed
 /// quarter-second is simpler than deriving one from RFC 4733's duration
@@ -481,7 +481,8 @@ const DTMF_EVENT_TIMESTAMP_GAP_DIVISOR: u32 = 4;
 /// now switches on `pkt.payload_type` first: `src_codec.payload_type` goes to
 /// the decoder as before; `src_codec.dtmf_payload_type` is forwarded to
 /// whatever event payload type `dst_codec` negotiated (the two legs need not
-/// agree on the number); anything else is dropped.
+/// agree on the number), its duration rescaled when the two legs' events
+/// count in different clocks; anything else is dropped.
 #[allow(clippy::too_many_arguments)]
 fn relay_direction(
     src: UdpSocket,
@@ -508,6 +509,17 @@ fn relay_direction(
     // `telephone-event`, in which case there is nowhere to put an event even
     // if the far leg sends one.
     let mut dtmf_sender = dst_codec.dtmf_payload_type.map(RtpSender::new);
+    // The clocks each leg's events count their duration in (RFC 4733 §2.3).
+    // They differ whenever one leg's `telephone-event` is at another rate
+    // than the other's — a 16 kHz veth leg facing an 8 kHz carrier, or an
+    // answer that fell back to the other rate — and a duration forwarded
+    // unscaled then halves or doubles the keypress.
+    let event_clock = |codec: &ChosenCodec| {
+        codec
+            .dtmf_clock_rate
+            .unwrap_or_else(|| codec.codec.sample_rate())
+    };
+    let (src_event_clock, dst_event_clock) = (event_clock(&src_codec), event_clock(&dst_codec));
     // The *source's* RTP timestamp of the DTMF event currently in progress,
     // so repeated packets for the same keypress (which RFC 4733 sends with a
     // fixed timestamp) reuse our own re-originated timestamp too, and only a
@@ -630,9 +642,9 @@ fn relay_direction(
                     // A new keypress: give it a fresh timestamp on our own
                     // independent DTMF stream, clearly advanced from whatever the
                     // previous event used.
-                    dtmf_sender.timestamp = dtmf_sender.timestamp.wrapping_add(
-                        dst_codec.codec.sample_rate() / DTMF_EVENT_TIMESTAMP_GAP_DIVISOR,
-                    );
+                    dtmf_sender.timestamp = dtmf_sender
+                        .timestamp
+                        .wrapping_add(dst_event_clock / DTMF_EVENT_TIMESTAMP_GAP_DIVISOR);
                     // Once per keypress, not per retransmitted packet — a DTMF
                     // digit that never reached the far leg used to be silently
                     // indistinguishable from one that was never pressed at all
@@ -640,12 +652,16 @@ fn relay_direction(
                     tracing::info!(
                         direction,
                         event = pkt.payload.first().copied(),
+                        src_event_clock,
+                        dst_event_clock,
                         "forwarding a DTMF keypress"
                     );
                 }
+                let mut event = pkt.payload.to_vec();
+                rtp::rescale_event_duration(&mut event, src_event_clock, dst_event_clock);
                 // 0 samples: repeated packets for one event share a timestamp: it
                 // is only bumped, above, when a new event starts.
-                if let Err(e) = dtmf_sender.send(&dst, pkt.payload, 0) {
+                if let Err(e) = dtmf_sender.send(&dst, &event, 0) {
                     tracing::warn!(error = %e, direction, "transcoding relay: DTMF forward failed");
                     return;
                 }
@@ -765,6 +781,7 @@ mod tests {
         codec_with_dtmf(codec, payload_type, None)
     }
 
+    /// A leg whose `telephone-event`, if any, is at its audio codec's rate.
     fn codec_with_dtmf(
         codec: NegotiatedCodec,
         payload_type: u8,
@@ -775,6 +792,7 @@ mod tests {
             payload_type,
             octet_aligned: true,
             dtmf_payload_type,
+            dtmf_clock_rate: dtmf_payload_type.map(|_| codec.sample_rate()),
         }
     }
 
@@ -1124,8 +1142,10 @@ mod tests {
             "must carry the veth leg's own negotiated event PT, not the carrier's"
         );
         assert_eq!(
-            first_payload, digit_1,
-            "the event payload is forwarded verbatim"
+            first_payload,
+            [1, 10, 1, 64],
+            "the event is forwarded with its 8 kHz duration (160) re-counted \
+             in the veth leg's 16 kHz event clock (320)"
         );
 
         // A retransmission of the same event (RFC 4733 §2.5.1.1: repeated
@@ -1154,6 +1174,65 @@ mod tests {
         );
 
         stop.store(true, Ordering::Relaxed);
+    }
+
+    /// The reviewer's case: a wideband veth leg whose answer fell back to
+    /// an 8 kHz event, facing a carrier whose event counts in 16 kHz. A
+    /// 100 ms keypress (1600 at 16 kHz) must reach the veth leg as 800, and
+    /// one between legs whose events share a clock must pass unchanged.
+    #[test]
+    fn a_keypress_keeps_its_length_whichever_event_clocks_the_legs_use() {
+        for (carrier_clock, veth_clock, sent, expected) in
+            [(16000, 8000, 1600u16, 800u16), (8000, 8000, 800, 800)]
+        {
+            let (ims, carrier) = connected_pair();
+            let (veth, agent_b) = connected_pair();
+            agent_b
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let carrier_codec = ChosenCodec {
+                dtmf_clock_rate: Some(carrier_clock),
+                ..codec_with_dtmf(NegotiatedCodec::Pcmu, 0, Some(100))
+            };
+            let veth_codec = ChosenCodec {
+                dtmf_clock_rate: Some(veth_clock),
+                ..codec_with_dtmf(NegotiatedCodec::L16, 96, Some(120))
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            spawn_transcoding_relay(
+                ims,
+                veth,
+                carrier_codec,
+                veth_codec,
+                stop.clone(),
+                &crate::ims::media_stats::MediaMeter::new(),
+                None,
+                Duration::from_millis(40),
+            )
+            .unwrap();
+
+            let [hi, lo] = sent.to_be_bytes();
+            carrier
+                .send(&rtp::build_packet(
+                    1,
+                    5000,
+                    0xaaaa,
+                    100,
+                    &[5, 0x80 | 10, hi, lo],
+                ))
+                .unwrap();
+            let mut buf = [0u8; RECV_BUF];
+            let n = agent_b.recv(&mut buf).expect("the keypress is forwarded");
+            let pkt = rtp::parse_packet(&buf[..n]).unwrap();
+            assert_eq!(pkt.payload_type, 120);
+            let [hi, lo] = expected.to_be_bytes();
+            assert_eq!(
+                pkt.payload,
+                [5, 0x80 | 10, hi, lo],
+                "{carrier_clock} Hz -> {veth_clock} Hz"
+            );
+            stop.store(true, Ordering::Relaxed);
+        }
     }
 
     #[test]
@@ -1205,13 +1284,19 @@ mod tests {
                 .unwrap();
         };
         let digit = [1u8, 10, 0, 160];
+        // As forwarded: the 8 kHz duration re-counted in the 16 kHz veth
+        // event clock.
+        let forwarded_digit = vec![1u8, 10, 1, 64];
         let silence = [0xff; 160];
 
         // An independent event can arrive first, without owning audio's
         // sequence space. Unknown sources cannot claim that space either.
         send(7000, 5000, 99, 100, &digit);
         let first_event = receive();
-        assert_eq!((first_event.3, first_event.4), (101, digit.to_vec()));
+        assert_eq!(
+            (first_event.3, first_event.4),
+            (101, forwarded_digit.clone())
+        );
         send(8000, 6000, 77, 13, &[]);
         send(100, 1000, 42, 0, &silence);
         let audio = receive();
@@ -1221,7 +1306,7 @@ mod tests {
         send(102, 1320, 42, 0, &silence);
         send(7001, 5000, 99, 100, &digit);
         let event = receive();
-        assert_eq!((event.3, event.4), (101, digit.to_vec()));
+        assert_eq!((event.3, event.4), (101, forwarded_digit));
         assert_eq!(event.1, first_event.1);
         assert_eq!(event.0, first_event.0.wrapping_add(1));
         agent_b

@@ -1260,8 +1260,8 @@ pub(super) fn tick_pending_origination(
                                             veth_sock_clone,
                                             stop.clone(),
                                             &meter,
-                                            chosen.dtmf_payload_type,
-                                            veth_result.codec.dtmf_payload_type,
+                                            chosen.telephone_event(),
+                                            veth_result.codec.telephone_event(),
                                             // Originated calls are out of
                                             // scope for RTCP reporting
                                             // (specs/046-rtcp-reporting
@@ -1547,8 +1547,8 @@ fn finish_origination(
                             veth_sock,
                             new_stop.clone(),
                             &new_meter,
-                            final_chosen.dtmf_payload_type,
-                            veth_codec.dtmf_payload_type,
+                            final_chosen.telephone_event(),
+                            veth_codec.telephone_event(),
                             // Originated calls are out of scope for RTCP
                             // reporting (specs/046-rtcp-reporting FR-023).
                             None,
@@ -1678,8 +1678,8 @@ fn finish_origination(
                     veth.rtp_socket,
                     stop.clone(),
                     &meter,
-                    chosen.dtmf_payload_type,
-                    veth.codec.dtmf_payload_type,
+                    chosen.telephone_event(),
+                    veth.codec.telephone_event(),
                     // Originated calls are out of scope for RTCP reporting
                     // (specs/046-rtcp-reporting FR-023).
                     None,
@@ -2314,6 +2314,7 @@ mod tests {
                     payload_type: 0,
                     octet_aligned: false,
                     dtmf_payload_type: None,
+                    dtmf_clock_rate: None,
                 },
             }))
             .unwrap();
@@ -2436,6 +2437,7 @@ mod tests {
                     payload_type: 0,
                     octet_aligned: false,
                     dtmf_payload_type: None,
+                    dtmf_clock_rate: None,
                 },
             }))
             .unwrap();
