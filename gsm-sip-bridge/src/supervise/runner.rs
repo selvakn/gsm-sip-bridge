@@ -325,6 +325,12 @@ pub trait CommandRunner: Send + Sync {
     /// systemd socket unit accepts the connect itself (and activates its
     /// service), a pcscd accepts it once it is serving, and a stale socket
     /// file nothing listens on refuses it.
+    ///
+    /// Never blocks. A blocking `connect(2)` on a Unix stream socket waits,
+    /// with no timeout, for room in the listener's accept queue, so a pcscd
+    /// that has stopped accepting clients would hang the caller and its
+    /// poll bound would never be reached. A full queue therefore counts as
+    /// "not ready", and the caller's own poll loop tries again.
     fn unix_connect_ok(&self, path: &Path) -> bool;
 
     /// `(device, inode)` of whatever is at `path`, or `None` if nothing is.
@@ -672,7 +678,18 @@ impl CommandRunner for RealCommandRunner {
     }
 
     fn unix_connect_ok(&self, path: &Path) -> bool {
-        std::os::unix::net::UnixStream::connect(path).is_ok()
+        use socket2::{Domain, SockAddr, Socket, Type};
+        // Nonblocking, so a full accept queue fails with EAGAIN at once
+        // instead of waiting for room (see the trait's doc comment). On a
+        // Unix socket a nonblocking connect otherwise completes or fails
+        // immediately; there is no in-progress state to wait out.
+        let Ok(addr) = SockAddr::unix(path) else {
+            return false;
+        };
+        let Ok(socket) = Socket::new(Domain::UNIX, Type::STREAM, None) else {
+            return false;
+        };
+        socket.set_nonblocking(true).is_ok() && socket.connect(&addr).is_ok()
     }
 
     fn path_identity(&self, path: &Path) -> Option<(u64, u64)> {
@@ -708,6 +725,56 @@ mod real_runner_tests {
     // mock (which has no concept of PID reuse at all) could never have
     // caught.
     use super::*;
+
+    /// A listener whose accept queue is already full: `listen(0)` admits one
+    /// pending connection, which is made here and never accepted.
+    fn listener_with_a_full_queue(path: &Path) -> (socket2::Socket, socket2::Socket) {
+        use socket2::{Domain, SockAddr, Socket, Type};
+        let addr = SockAddr::unix(path).unwrap();
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        listener.bind(&addr).unwrap();
+        listener.listen(0).unwrap();
+        let queued = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        queued.connect(&addr).unwrap();
+        (listener, queued)
+    }
+
+    #[test]
+    fn a_unix_listener_that_stopped_accepting_is_not_ready_and_does_not_block() {
+        // A blocking connect would wait for room in the queue forever, and
+        // the readiness poll around it would never reach its bound.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pcscd.comm");
+        let _held = listener_with_a_full_queue(&path);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe_path = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(RealCommandRunner::new().unix_connect_ok(&probe_path));
+        });
+        let ok = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("unix_connect_ok blocked on a full accept queue");
+        assert!(!ok, "a full accept queue is not a pcscd ready for clients");
+    }
+
+    #[test]
+    fn a_unix_listener_accepting_connections_is_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pcscd.comm");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(RealCommandRunner::new().unix_connect_ok(&path));
+    }
+
+    #[test]
+    fn a_missing_or_stale_unix_socket_is_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pcscd.comm");
+        let runner = RealCommandRunner::new();
+        assert!(!runner.unix_connect_ok(&path), "nothing at the path");
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(path.exists(), "the socket file outlives its listener");
+        assert!(!runner.unix_connect_ok(&path), "a file nobody listens on");
+    }
 
     #[test]
     fn a_reaped_child_is_removed_so_a_later_signal_is_a_safe_no_op() {

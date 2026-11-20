@@ -190,8 +190,8 @@ A card-reader-only deployment (no modem-backed lines at all) needs no vpcd
 virtual reader, and `supervise` no longer provisions or waits for one — expect
 `no vpcd reader (all N line(s) are card-reader-backed)`. It does wait until
 pcscd accepts connections on its control socket, and a line whose MCC/MNC is
-read from the card retries that read for about 8 seconds (logging the
-reason each time) before the line is skipped.
+read from the card retries that read every 5 seconds for about 70 seconds
+(logging the reason each time) before the line is skipped.
 
 ## Running on a host with its own pcscd
 
