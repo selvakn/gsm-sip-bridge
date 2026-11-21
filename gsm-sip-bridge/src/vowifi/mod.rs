@@ -688,7 +688,7 @@ impl OutboundHistory {
         &self,
         module_id: &str,
         destination: &str,
-        started_at: chrono::DateTime<chrono::Utc>,
+        started_at: jiff::Timestamp,
         duration_seconds: f64,
         status: CallStatus,
     ) {
@@ -711,7 +711,7 @@ impl OutboundHistory {
         &self,
         module_id: &str,
         destination: &str,
-        started_at: chrono::DateTime<chrono::Utc>,
+        started_at: jiff::Timestamp,
         outcome: OutboundAttemptOutcome,
     ) {
         if let Some(status) = outcome.history_status() {
@@ -822,7 +822,7 @@ fn run_outbound_listener(
             report_outbound(reporter, OutboundAttemptOutcome::RefusedInvalidDestination);
             continue;
         }
-        let started_at = chrono::Utc::now();
+        let started_at = jiff::Timestamp::now();
 
         let Some(destination) = call.request_destination() else {
             tracing::warn!(
@@ -2742,8 +2742,8 @@ pub fn format_rejection_cooldown(until: Option<u64>, now: u64) -> String {
         Some(until) => {
             let at = i64::try_from(until)
                 .ok()
-                .and_then(|t| chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0))
-                .map_or_else(|| until.to_string(), |t| t.to_rfc3339());
+                .and_then(|t| jiff::Timestamp::from_second(t).ok())
+                .map_or_else(|| until.to_string(), |t| t.to_string());
             format!(
                 "until {at} (next attempt in {}s)",
                 until.saturating_sub(now)
@@ -2762,8 +2762,8 @@ pub fn format_reg_subscription(health: &str, last_failure: Option<(u64, String)>
         Some((t, msg)) => {
             let at = i64::try_from(t)
                 .ok()
-                .and_then(|t| chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0))
-                .map_or_else(|| t.to_string(), |t| t.to_rfc3339());
+                .and_then(|t| jiff::Timestamp::from_second(t).ok())
+                .map_or_else(|| t.to_string(), |t| t.to_string());
             format!("{at} {msg}")
         }
         None => "none".to_string(),
@@ -2831,8 +2831,8 @@ pub fn format_pcscf_lines(status: Option<&control::PcscfStatusReply>) -> [String
             .map(|(a, t)| {
                 let at = i64::try_from(*t)
                     .ok()
-                    .and_then(|t| chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0))
-                    .map_or_else(|| t.to_string(), |t| t.to_rfc3339());
+                    .and_then(|t| jiff::Timestamp::from_second(t).ok())
+                    .map_or_else(|| t.to_string(), |t| t.to_string());
                 format!("{a} until {at}")
             })
             .collect::<Vec<_>>()
@@ -3036,7 +3036,7 @@ mod tests {
     fn rejection_cooldown_reads_when_it_ends_and_how_long_until_then() {
         assert_eq!(
             format_rejection_cooldown(Some(1_700_001_712), 1_700_000_000),
-            "until 2023-11-14T22:41:52+00:00 (next attempt in 1712s)"
+            "until 2023-11-14T22:41:52Z (next attempt in 1712s)"
         );
         // A stale reply read just after the cooldown ended never goes negative.
         assert!(
@@ -3050,18 +3050,18 @@ mod tests {
     #[test]
     fn reg_subscription_lines_render_health_and_last_failure() {
         assert_eq!(
-            format_reg_subscription("confirmed, expires 2026-10-14T11:02:11+00:00", None),
+            format_reg_subscription("confirmed, expires 2026-10-14T11:02:11Z", None),
             [
-                "reg_subscription: confirmed, expires 2026-10-14T11:02:11+00:00".to_string(),
+                "reg_subscription: confirmed, expires 2026-10-14T11:02:11Z".to_string(),
                 "reg_subscription_last_failure: none".to_string(),
             ]
         );
         assert_eq!(
             format_reg_subscription(
-                "unconfirmed since 2023-11-14T22:13:20+00:00",
+                "unconfirmed since 2023-11-14T22:13:20Z",
                 Some((1_700_000_000, "accepted but no NOTIFY within 128s".to_string()))
             )[1],
-            "reg_subscription_last_failure: 2023-11-14T22:13:20+00:00 accepted but no NOTIFY within 128s"
+            "reg_subscription_last_failure: 2023-11-14T22:13:20Z accepted but no NOTIFY within 128s"
         );
         assert_eq!(
             format_reg_subscription("", None)[0],
@@ -3087,7 +3087,7 @@ mod tests {
             ))),
             [
                 "pcscf: 10.0.1.10 (pool: 10.0.1.10, 10.0.0.10)".to_string(),
-                "pcscf_unavailable: 10.0.0.10 until 2026-10-14T17:46:40+00:00".to_string(),
+                "pcscf_unavailable: 10.0.0.10 until 2026-10-14T17:46:40Z".to_string(),
             ]
         );
         assert_eq!(
@@ -3101,8 +3101,8 @@ mod tests {
         ];
         assert_eq!(
             format_pcscf_lines(Some(&status("10.0.0.10", &pool, &two)))[1],
-            "pcscf_unavailable: 10.0.0.10 until 2026-10-14T17:46:40+00:00, \
-             10.0.1.10 until 2026-10-14T17:47:40+00:00"
+            "pcscf_unavailable: 10.0.0.10 until 2026-10-14T17:46:40Z, \
+             10.0.1.10 until 2026-10-14T17:47:40Z"
         );
     }
     use std::io::Write;
@@ -3747,7 +3747,7 @@ mod tests {
             store_tx: tx,
             transport: crate::store::Transport::Vowifi,
         };
-        let at = chrono::Utc::now();
+        let at = jiff::Timestamp::now();
         let written = |outcome| {
             history.write_outcome("card0", "+919000000001", at, outcome);
             rx.try_recv().ok().map(|cmd| match cmd {

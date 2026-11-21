@@ -24,7 +24,7 @@ use crate::modules::restart_policy::RestartMode;
 use crate::modules::slot::usable_phone;
 use crate::store::calls::CallRecord;
 use crate::store::StoreCommand;
-use chrono::Utc;
+use jiff::Timestamp;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -32,7 +32,7 @@ pub(crate) struct CallContext {
     /// The caller for an inbound call, the dialled number for an outbound one.
     caller_id: String,
     sip_destination: String,
-    started_at: chrono::DateTime<Utc>,
+    started_at: jiff::Timestamp,
     direction: crate::store::calls::CallDirection,
 }
 
@@ -314,7 +314,7 @@ impl ModuleWorker {
                         unit_id: Some(self.module.id.clone()),
                         description: "AT command worker responsive again".to_string(),
                         phone_number: self.phone_number.clone(),
-                        at: Utc::now(),
+                        at: Timestamp::now(),
                         kind: alerts::CriticalEventKind::Recovered,
                     }));
             }
@@ -337,7 +337,7 @@ impl ModuleWorker {
                         self.at_worker_unresponsive_threshold.as_secs()
                     ),
                     phone_number: self.phone_number.clone(),
-                    at: Utc::now(),
+                    at: Timestamp::now(),
                     kind: alerts::CriticalEventKind::Failure,
                 }));
         }
@@ -600,7 +600,7 @@ impl ModuleWorker {
                 unit_id: Some(self.module.id.clone()),
                 description,
                 phone_number: self.phone_number.clone(),
-                at: Utc::now(),
+                at: Timestamp::now(),
                 kind,
             }));
     }
@@ -642,7 +642,7 @@ impl ModuleWorker {
                 self.call_ctx = Some(CallContext {
                     caller_id: caller_id.clone(),
                     sip_destination: String::new(),
-                    started_at: Utc::now(),
+                    started_at: Timestamp::now(),
                     direction: crate::store::calls::CallDirection::Inbound,
                 });
 
@@ -728,7 +728,7 @@ impl ModuleWorker {
             Ok(sms) => {
                 tracing::debug!(module = %self.module.id, index = idx, sender = %sms.sender, "SMS read");
 
-                let received_at = Utc::now().to_rfc3339();
+                let received_at = Timestamp::now().to_string();
 
                 // specs/034-alert-identity: read the number off the card that
                 // just produced this message, rather than trusting a copy
@@ -894,7 +894,7 @@ fn record_call_start_outbound(
     *call_ctx = Some(CallContext {
         caller_id: destination.to_string(),
         sip_destination: String::new(),
-        started_at: Utc::now(),
+        started_at: Timestamp::now(),
         direction: crate::store::calls::CallDirection::Outbound,
     });
     metrics::ACTIVE_CALLS
@@ -914,9 +914,7 @@ fn record_call_end(
     phone_number: Option<&str>,
 ) {
     if let Some(ctx) = call_ctx.take() {
-        let duration = Utc::now()
-            .signed_duration_since(ctx.started_at)
-            .num_seconds() as f64;
+        let duration = Timestamp::now().duration_since(ctx.started_at).as_secs() as f64;
 
         metrics::CALL_DURATION_SECONDS
             .with_label_values(&[module_id, "cs"])
@@ -932,7 +930,7 @@ fn record_call_end(
                 unit_id: Some(module_id.to_string()),
                 description: format!("call from {} was never answered", ctx.caller_id),
                 phone_number: phone_number.map(str::to_string),
-                at: Utc::now(),
+                at: Timestamp::now(),
                 kind: alerts::CriticalEventKind::Failure,
             }));
         }
@@ -940,7 +938,7 @@ fn record_call_end(
         let record = CallRecord {
             module_id: module_id.to_string(),
             caller_id: ctx.caller_id,
-            started_at: ctx.started_at.to_rfc3339(),
+            started_at: ctx.started_at.to_string(),
             duration_seconds: duration,
             status: status.to_string(),
             sip_destination: ctx.sip_destination,
@@ -1150,7 +1148,7 @@ mod tests {
         w.call_ctx = Some(CallContext {
             caller_id: "+919000000001".into(),
             sip_destination: String::new(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             direction: crate::store::calls::CallDirection::Inbound,
         });
         w.tick_liveness_probe();
@@ -1361,7 +1359,7 @@ mod tests {
         let mut call_ctx = Some(CallContext {
             caller_id: "+911234567890".to_string(),
             sip_destination: String::new(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             direction: crate::store::calls::CallDirection::Inbound,
         });
 
@@ -1388,7 +1386,7 @@ mod tests {
         let mut call_ctx = Some(CallContext {
             caller_id: "+911234567890".to_string(),
             sip_destination: String::new(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             direction: crate::store::calls::CallDirection::Inbound,
         });
 
@@ -1500,7 +1498,7 @@ mod tests {
         w.call_ctx = Some(CallContext {
             caller_id: "+919000000001".into(),
             sip_destination: String::new(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             direction: crate::store::calls::CallDirection::Inbound,
         });
     }

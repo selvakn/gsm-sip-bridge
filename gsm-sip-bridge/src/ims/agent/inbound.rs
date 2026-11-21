@@ -29,7 +29,7 @@ use crate::ims::sip_client::{
     SipSink,
 };
 use crate::vowifi::control::{reason, write_msg, ControlMessage};
-use chrono::Utc;
+use jiff::Timestamp;
 use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
@@ -244,7 +244,7 @@ pub(super) fn handle_invite(
     let obs = ctx.obs;
     let call_id = req.header("Call-ID").unwrap_or_default().to_string();
     let caller = extract_caller(req);
-    let started_at = Utc::now();
+    let started_at = Timestamp::now();
     tracing::info!(
         call_id = %call_id,
         caller = %caller,
@@ -815,7 +815,7 @@ pub(super) fn handle_invite(
                 }),
                 to_tag: to_tag.to_string(),
                 caller,
-                answered_at: Utc::now(),
+                answered_at: Timestamp::now(),
                 answered_instant: Instant::now(),
                 meter,
                 lifecycle,
@@ -881,7 +881,7 @@ fn handle_offerless_invite(
     ctx: &InviteContext,
     call_id: &str,
     caller: &str,
-    started_at: chrono::DateTime<Utc>,
+    started_at: jiff::Timestamp,
     to_tag: &str,
     ring_service: Option<&mut dyn RingService>,
 ) -> BridgeResult<Option<ActiveCall>> {
@@ -1228,7 +1228,7 @@ fn handle_offerless_invite(
         }),
         to_tag: to_tag.to_string(),
         caller: caller.to_string(),
-        answered_at: Utc::now(),
+        answered_at: Timestamp::now(),
         answered_instant: Instant::now(),
         meter,
         lifecycle,

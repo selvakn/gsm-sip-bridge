@@ -1200,7 +1200,7 @@ fn relay_modem_message(control_addr: SocketAddr, sender: &str, body: &str) -> bo
     let msg = ControlMessage::SmsReceived {
         sender: sender.to_string(),
         body: body.to_string(),
-        received_at: chrono::Utc::now().to_rfc3339(),
+        received_at: jiff::Timestamp::now().to_string(),
     };
     match TcpStream::connect_timeout(&control_addr, CONTROL_TIMEOUT) {
         Ok(mut control) => match write_msg(&mut control, &msg) {

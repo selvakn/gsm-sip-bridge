@@ -97,7 +97,7 @@ impl Rig {
         )
         .unwrap();
         let id = conn.last_insert_rowid();
-        let seen = chrono::Utc::now().timestamp() - age_secs;
+        let seen = jiff::Timestamp::now().as_second() - age_secs;
         conn.execute(
             "UPDATE sms SET forwarding_status='failed', last_error='http_400', claimed_until=NULL, \
              first_seen_at=?1 WHERE id=?2",
@@ -367,7 +367,7 @@ async fn a_row_orphaned_by_a_crash_is_picked_up_once_its_lease_expires() {
     rig.respond(204).await;
     let dead = rig.seed_failed("crashed", 300);
     let live = rig.seed_failed("in-flight", 300);
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     let conn = rig.conn();
     conn.execute(
         "UPDATE sms SET forwarding_status='pending', claimed_until=?1 WHERE id=?2",

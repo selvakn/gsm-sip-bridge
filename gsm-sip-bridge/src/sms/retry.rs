@@ -185,7 +185,7 @@ pub async fn sweep_excluding(
         return out;
     }
     let db = fwd.db_path.as_str();
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
 
     let max_age = fwd.max_age_secs;
     match with_conn(db, move |c| sms::abandon_expired(c, now, max_age)).await {
@@ -218,7 +218,7 @@ pub async fn sweep_excluding(
             continue;
         }
         let id = cand.id;
-        let now = chrono::Utc::now().timestamp();
+        let now = jiff::Timestamp::now().as_second();
         // Age is rechecked at claim time: earlier posts in a long pass may
         // have carried this row past `retry_max_age_sec` since the pass began.
         match with_conn(db, move |c| {
@@ -259,7 +259,7 @@ pub async fn sweep_excluding(
         let transport = Transport::parse(&cand.transport).unwrap_or(Transport::Cs);
         match result {
             Ok(code) => {
-                let forwarded_at = chrono::Utc::now().to_rfc3339();
+                let forwarded_at = jiff::Timestamp::now().to_string();
                 let stored = with_conn(db, move |c| {
                     sms::mark_sent(c, id, &forwarded_at, code as i32)
                 })

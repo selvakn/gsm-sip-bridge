@@ -9,6 +9,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -71,9 +72,7 @@ fn active_alerts() -> Vec<Value> {
         open.insert((category, module), None);
     }
     for raise in crate::store::events::open_raises() {
-        let since = raise
-            .since
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let since = format!("{:.0}", raise.since);
         open.insert(
             (raise.category, raise.module_id.unwrap_or_default()),
             Some(since),
@@ -189,27 +188,30 @@ pub async fn sms(State(state): State<WebuiState>, Query(params): Query<SmsParams
     }
 }
 
-/// `GET /api/calls/summary`: "today" runs from the host's local midnight.
-pub async fn calls_summary(State(state): State<WebuiState>) -> Response {
-    use chrono::{Duration, Local, TimeZone, Utc};
-    let now = Utc::now();
-    let local_midnight = Local::now()
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .and_then(|naive| Local.from_local_datetime(&naive).earliest())
-        .map_or(now - Duration::hours(24), |t| t.with_timezone(&Utc));
+#[derive(Deserialize)]
+pub struct SummaryParams {
+    /// Where "today" starts: the browser's local midnight, RFC 3339.
+    since: Option<String>,
+}
+
+/// `GET /api/calls/summary`: "today" runs from `since`, the viewer's local
+/// midnight, so the tile matches the day the browser shows. Without it, the
+/// last 24 hours.
+pub async fn calls_summary(
+    State(state): State<WebuiState>,
+    Query(p): Query<SummaryParams>,
+) -> Response {
+    let Ok(since) = parse_time(p.since.as_deref()) else {
+        return bad_request("since must be an RFC 3339 time");
+    };
+    let now = Timestamp::now();
+    let day = SignedDuration::from_hours(24);
+    // A midnight is never in the future, nor more than a day (plus a DST
+    // hour, plus clock skew) back.
+    let today_start = since.map_or(now - day, |t| t.clamp(now - day * 2, now));
     let store = state.store.clone();
-    match blocking(move || store.call_summary(local_midnight, now - Duration::days(7))).await {
-        Ok(summary) => {
-            // Say which day "today" is: it is the bridge host's, which need not
-            // be the browser's.
-            let mut body = serde_json::to_value(summary).unwrap_or_else(|_| json!({}));
-            body["today_start"] = json!(local_midnight
-                .with_timezone(&Local)
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
-            body["host_utc_offset"] = json!(Local::now().format("%:z").to_string());
-            Json(body).into_response()
-        }
+    match blocking(move || store.call_summary(today_start, now - day * 7)).await {
+        Ok(summary) => Json(summary).into_response(),
         Err(()) => store_unavailable(),
     }
 }
@@ -234,12 +236,12 @@ fn bad_request(what: &str) -> Response {
         .into_response()
 }
 
-fn parse_time(value: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>, ()> {
+/// An RFC 3339 time with an offset (`Z` or `+05:30`); a time without one is
+/// rejected rather than guessed.
+fn parse_time(value: Option<&str>) -> Result<Option<Timestamp>, ()> {
     match value.filter(|v| !v.is_empty()) {
         None => Ok(None),
-        Some(v) => chrono::DateTime::parse_from_rfc3339(v)
-            .map(|t| Some(t.with_timezone(&chrono::Utc)))
-            .map_err(|_| ()),
+        Some(v) => v.parse::<Timestamp>().map(Some).map_err(|_| ()),
     }
 }
 
@@ -293,9 +295,27 @@ pub async fn events(State(state): State<WebuiState>, Query(p): Query<EventParams
 pub async fn config(State(state): State<WebuiState>) -> Json<Value> {
     let loaded = &state.loaded;
     Json(json!({
-        "loaded_at": loaded.loaded_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "loaded_at": format!("{:.0}", loaded.loaded_at),
         "source": loaded.source_path.display().to_string(),
         "note": "As loaded at startup; later edits to the file are not shown.",
         "document": super::config_view::redacted(&loaded.snapshot),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_time_needs_an_offset() {
+        let z = parse_time(Some("2026-11-20T10:00:00Z")).unwrap().unwrap();
+        let ist = parse_time(Some("2026-11-20T15:30:00+05:30"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(z, ist);
+        assert_eq!(parse_time(Some("")).unwrap(), None);
+        assert_eq!(parse_time(None).unwrap(), None);
+        assert!(parse_time(Some("2026-11-20T10:00:00")).is_err());
+        assert!(parse_time(Some("yesterday")).is_err());
+    }
 }

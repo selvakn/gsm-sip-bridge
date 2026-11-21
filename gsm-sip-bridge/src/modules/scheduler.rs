@@ -8,6 +8,9 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use croner::parser::{CronParser, Seconds, Year};
+use croner::Cron;
+use jiff::Zoned;
 use rand::{Rng, RngExt};
 
 /// One end-to-end execution triggered by a single cron occurrence.
@@ -17,7 +20,7 @@ pub struct CycleState {
     /// of the cron tick that triggered this cycle.
     pub id: u64,
     /// The wall-clock cron tick that triggered this cycle.
-    pub cron_tick: chrono::DateTime<chrono::Local>,
+    pub cron_tick: Zoned,
     /// The actual (post-jitter) cycle-start instant.
     pub started_at: tokio::time::Instant,
     /// Which phase of the cycle we are in.
@@ -228,32 +231,44 @@ pub fn gap_with_jitter<R: Rng + ?Sized>(rng: &mut R, base: u64, jitter: u64) -> 
     Duration::from_secs(raw.max(0) as u64)
 }
 
-/// Parse a 5-field cron expression (`min hour dom month dow`) into the
-/// `cron` crate's 7-field schedule by prepending `0 ` (seconds=0) and appending
-/// ` *` (year=any).
-pub fn parse_cron_5field(expr: &str) -> Result<cron::Schedule, String> {
+/// Parse a 5-field cron expression (`min hour dom month dow`), evaluated later
+/// in system local time.
+///
+/// Standard cron numbering: day-of-week `0` and `7` are Sunday, `1` is Monday.
+/// A seconds or year field is rejected. When both day-of-month and
+/// day-of-week are restricted, a day must match both.
+pub fn parse_cron_5field(expr: &str) -> Result<Cron, String> {
     let trimmed = expr.trim();
     if trimmed.is_empty() {
         return Err("cron expression is empty".into());
     }
-    let n_fields = trimmed.split_whitespace().count();
-    if n_fields != 5 {
-        return Err(format!(
-            "cron expression must have 5 fields (minute hour day-of-month month day-of-week), got {n_fields}"
-        ));
-    }
-    let translated = format!("0 {trimmed} *");
-    translated
-        .parse::<cron::Schedule>()
+    CronParser::builder()
+        .seconds(Seconds::Disallowed)
+        .year(Year::Disallowed)
+        .dom_and_dow(true)
+        .build()
+        .parse(trimmed)
         .map_err(|e| format!("invalid cron expression {expr:?}: {e}"))
 }
 
-/// Convenience: next upcoming occurrence in system local time strictly after `after`.
-pub fn compute_next_scheduled_at(
-    schedule: &cron::Schedule,
-    after: chrono::DateTime<chrono::Local>,
-) -> Option<chrono::DateTime<chrono::Local>> {
-    schedule.after(&after).next()
+/// The next occurrence strictly after `after`, in `after`'s time zone.
+///
+/// DST (spec 010): a wall-clock time the spring-forward gap skips does not
+/// run that day. croner would run it at the first instant after the gap, which
+/// is not a time the expression names, so such a result is passed over. A
+/// fall-back hour runs once, at the first of its two instants (croner's own
+/// behaviour).
+pub fn compute_next_scheduled_at(schedule: &Cron, after: &Zoned) -> Option<Zoned> {
+    let mut from = after.clone();
+    // A gap is passed over once; the bound only guards against looping.
+    for _ in 0..3 {
+        let next = schedule.find_next_occurrence(&from, false).ok()?;
+        if schedule.is_time_matching(&next).ok()? {
+            return Some(next);
+        }
+        from = next;
+    }
+    None
 }
 
 /// The hard timeout we allow a single per-card restart to take before recording
@@ -490,7 +505,7 @@ mod tests {
         let now = fixed_instant();
         CycleState {
             id: 1,
-            cron_tick: chrono::Local::now(),
+            cron_tick: Zoned::now(),
             started_at: now,
             phase: CyclePhase::Initial,
             pending: slots.iter().copied().collect(),
@@ -574,16 +589,23 @@ mod tests {
         }
     }
 
+    /// A wall-clock time in a fixed zone, so the tests do not depend on the
+    /// host's TZ.
+    fn at(tz: &str, y: i16, mo: i8, d: i8, h: i8, mi: i8, s: i8) -> Zoned {
+        jiff::civil::date(y, mo, d)
+            .at(h, mi, s, 0)
+            .in_tz(tz)
+            .unwrap()
+    }
+
+    fn next(expr: &str, after: &Zoned) -> Zoned {
+        compute_next_scheduled_at(&parse_cron_5field(expr).unwrap(), after).unwrap()
+    }
+
     #[test]
     fn parse_cron_5field_accepts_default() {
-        let s = parse_cron_5field("0 1 * * *").expect("default cron must parse");
-        let after = chrono::Local
-            .with_ymd_and_hms(2026, 5, 26, 12, 0, 0)
-            .single()
-            .unwrap();
-        let next = s.after(&after).next().unwrap();
-        assert_eq!(next.hour(), 1);
-        assert_eq!(next.minute(), 0);
+        let n = next("0 1 * * *", &at("Asia/Kolkata", 2026, 5, 26, 12, 0, 0));
+        assert_eq!((n.day(), n.hour(), n.minute()), (27, 1, 0));
     }
 
     #[test]
@@ -593,17 +615,68 @@ mod tests {
         assert!(parse_cron_5field("").is_err());
         assert!(parse_cron_5field("0 1 * *").is_err()); // 4 fields
         assert!(parse_cron_5field("0 0 1 * * *").is_err()); // 6 fields
+        assert!(parse_cron_5field("0 0 1 * * * 2027").is_err()); // 7 fields
+    }
+
+    #[test]
+    fn day_of_week_numbers_follow_standard_cron() {
+        // 2026-05-26 is a Tuesday.
+        let tue = at("Asia/Kolkata", 2026, 5, 26, 12, 0, 0);
+        let mon = next("0 1 * * 1", &tue);
+        assert_eq!(
+            (mon.weekday(), mon.day()),
+            (jiff::civil::Weekday::Monday, 1)
+        );
+        for sunday in ["0 1 * * 0", "0 1 * * 7", "0 1 * * SUN"] {
+            let n = next(sunday, &tue);
+            assert_eq!(
+                (n.weekday(), n.day()),
+                (jiff::civil::Weekday::Sunday, 31),
+                "{sunday}"
+            );
+        }
+    }
+
+    #[test]
+    fn day_of_month_and_day_of_week_must_both_match() {
+        // Friday the 13th: the next one after 2026-05-26 is 2026-11-13.
+        let n = next("0 1 13 * 5", &at("Asia/Kolkata", 2026, 5, 26, 12, 0, 0));
+        assert_eq!((n.year(), n.month(), n.day()), (2026, 11, 13));
+    }
+
+    #[test]
+    fn fall_back_hour_fires_once() {
+        // 2026-11-01 01:30 happens twice in New York; a fixed-time job runs at
+        // the first of the two and the next run is the following day.
+        let first = next("30 1 * * *", &at("America/New_York", 2026, 11, 1, 0, 0, 0));
+        assert_eq!((first.day(), first.hour(), first.minute()), (1, 1, 30));
+        assert_eq!(first.offset(), jiff::tz::offset(-4));
+        let second =
+            compute_next_scheduled_at(&parse_cron_5field("30 1 * * *").unwrap(), &first).unwrap();
+        assert_eq!((second.day(), second.hour(), second.minute()), (2, 1, 30));
+    }
+
+    #[test]
+    fn spring_forward_gap_does_not_run_that_day() {
+        // 2026-03-08 02:00-03:00 does not exist in New York.
+        let n = next("30 2 * * *", &at("America/New_York", 2026, 3, 8, 0, 0, 0));
+        assert_eq!((n.day(), n.hour(), n.minute()), (9, 2, 30));
+        // A time outside the gap that day is unaffected.
+        let n = next("30 3 * * *", &at("America/New_York", 2026, 3, 8, 0, 0, 0));
+        assert_eq!((n.day(), n.hour(), n.minute()), (8, 3, 30));
+    }
+
+    #[test]
+    fn next_occurrence_is_strictly_after() {
+        let tick = at("Asia/Kolkata", 2026, 5, 27, 1, 0, 0);
+        let n = next("0 1 * * *", &tick);
+        assert_eq!(n.day(), 28);
     }
 
     #[test]
     fn parse_cron_5field_every_five_minutes() {
-        let s = parse_cron_5field("*/5 * * * *").unwrap();
-        let after = chrono::Local
-            .with_ymd_and_hms(2026, 5, 26, 12, 2, 30)
-            .single()
-            .unwrap();
-        let next = s.after(&after).next().unwrap();
-        assert_eq!(next.minute(), 5);
+        let n = next("*/5 * * * *", &at("Asia/Kolkata", 2026, 5, 26, 12, 2, 30));
+        assert_eq!(n.minute(), 5);
     }
 
     #[test]
@@ -847,19 +920,9 @@ mod tests {
         );
     }
 
-    // chrono::TimeZone trait needs to be in scope for the cron tests above.
-    use chrono::{Datelike, TimeZone, Timelike};
-
     #[test]
     fn parse_cron_5field_next_after_known_timestamp() {
-        let s = parse_cron_5field("0 1 * * *").unwrap();
-        let after = chrono::Local
-            .with_ymd_and_hms(2026, 5, 26, 2, 0, 0)
-            .single()
-            .unwrap();
-        let next = s.after(&after).next().unwrap();
-        assert_eq!(next.day(), 27);
-        assert_eq!(next.hour(), 1);
-        assert_eq!(next.minute(), 0);
+        let n = next("0 1 * * *", &at("Asia/Kolkata", 2026, 5, 26, 2, 0, 0));
+        assert_eq!((n.day(), n.hour(), n.minute()), (27, 1, 0));
     }
 }

@@ -36,7 +36,7 @@ impl CardPool {
         let record = crate::store::calls::CallRecord::outbound(
             module_id,
             destination,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
             0.0,
             crate::control::protocol::CallStatus::Failed.as_str(),
             crate::store::Transport::Cs,

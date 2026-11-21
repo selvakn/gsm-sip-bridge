@@ -38,7 +38,7 @@ use crate::sms::SmsHandler;
 use crate::sms::{self, SmsForwarder};
 use crate::store::events::{self, EventKind};
 use crate::store::{StoreCommand, StoreHandle};
-use chrono::Utc;
+use jiff::{Timestamp, Zoned};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -59,10 +59,10 @@ pub struct CardPool {
     /// webhook per event (`alerts::dispatch`), so this client is always
     /// constructed and never gated on any one category being enabled.
     alerts_client: Option<DiscordClient>,
-    cron_schedule: Option<cron::Schedule>,
+    cron_schedule: Option<croner::Cron>,
     cycle: Option<CycleState>,
     next_scheduled_at: Option<tokio::time::Instant>,
-    last_fired_tick: Option<chrono::DateTime<chrono::Local>>,
+    last_fired_tick: Option<Zoned>,
     /// specs/030-bad-port-isolation: persistent across rescans so a port
     /// quarantined after repeated probe timeouts stays skipped, and the
     /// operator `[discovery]` blocklist/timeout apply on every rescan. Behind a
@@ -703,7 +703,7 @@ impl CardPool {
             unit_id: Some(module_id.to_string()),
             description,
             phone_number,
-            at: Utc::now(),
+            at: Timestamp::now(),
             kind,
         };
         // On the timeline now, so a later Recovered cannot be filed ahead of

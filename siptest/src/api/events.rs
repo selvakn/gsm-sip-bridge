@@ -48,7 +48,7 @@ impl EventBus {
         let mut inner = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let seq = inner.next_seq;
         inner.next_seq += 1;
-        let at = chrono_now_rfc3339();
+        let at = now_rfc3339();
         inner.ring.push_back(Event {
             seq,
             at,
@@ -96,8 +96,8 @@ impl EventBus {
     }
 }
 
-fn chrono_now_rfc3339() -> String {
-    // No chrono dependency in this crate; a minimal RFC 3339 UTC stamp from
+fn now_rfc3339() -> String {
+    // No date-time dependency in this crate; a minimal RFC 3339 UTC stamp from
     // std alone is enough for an event log timestamp.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

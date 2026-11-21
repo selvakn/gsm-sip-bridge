@@ -418,7 +418,7 @@ fn apply_report_with(
                         Some(module_id),
                         false,
                         "condition cleared",
-                        chrono::Utc::now(),
+                        jiff::Timestamp::now(),
                     );
                 }
             }
@@ -600,7 +600,7 @@ fn apply_report_with(
                     Some(&key.1),
                     true,
                     &detail,
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                 );
             }
         }
@@ -1100,7 +1100,7 @@ fn build_alert(
         unit_id: Some(key.1.clone()),
         description,
         phone_number,
-        at: chrono::Utc::now(),
+        at: jiff::Timestamp::now(),
         kind,
     };
     Some((cfg.clone(), client.clone(), event))
@@ -2560,7 +2560,7 @@ mod tests {
                 unit_id: Some(key.1.clone()),
                 description: "late".into(),
                 phone_number: None,
-                at: chrono::Utc::now(),
+                at: jiff::Timestamp::now(),
                 kind,
             };
             crate::alerts::deliver(&client, &cfg, event).await;

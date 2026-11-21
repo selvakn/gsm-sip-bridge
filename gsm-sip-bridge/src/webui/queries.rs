@@ -7,7 +7,7 @@
 //! nothing here can write even by mistake, and a slow page cannot hold up the
 //! store's writer thread: WAL lets the reader and the writer run together.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -81,8 +81,8 @@ pub struct CallFilter {
     pub direction: Option<String>,
     pub transport: Option<String>,
     pub status: Option<String>,
-    pub from: Option<DateTime<Utc>>,
-    pub to: Option<DateTime<Utc>>,
+    pub from: Option<Timestamp>,
+    pub to: Option<Timestamp>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -165,8 +165,8 @@ pub struct CallSummary {
 /// `started_at` is stored as RFC 3339 text in UTC, with `Z` or `+00:00` and
 /// sometimes a fraction. Comparing against this fixed-width prefix is correct
 /// for every one of those forms.
-fn ts(t: DateTime<Utc>) -> String {
-    t.format("%Y-%m-%dT%H:%M:%S").to_string()
+fn ts(t: Timestamp) -> String {
+    t.strftime("%Y-%m-%dT%H:%M:%S").to_string()
 }
 
 #[derive(Debug, Default, Clone)]
@@ -286,8 +286,8 @@ impl StoreReader {
     /// `week_start`, overall, per line and per direction.
     pub fn call_summary(
         &self,
-        today_start: DateTime<Utc>,
-        week_start: DateTime<Utc>,
+        today_start: Timestamp,
+        week_start: Timestamp,
     ) -> Result<CallSummary, StoreUnavailable> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -503,7 +503,7 @@ fn calls_where(filter: &CallFilter) -> (String, Vec<String>) {
         // start of the next second, exclusive, which keeps everything up to
         // and including `to`'s own second.
         clauses.push("started_at < ?".to_string());
-        params.push(ts(to + chrono::Duration::seconds(1)));
+        params.push(ts(to + jiff::SignedDuration::from_secs(1)));
     }
     let sql = if clauses.is_empty() {
         String::new()

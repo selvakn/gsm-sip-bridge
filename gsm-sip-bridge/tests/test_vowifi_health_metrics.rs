@@ -123,7 +123,7 @@ async fn test_registration_and_tunnel_gauges_and_bridge_failure_reasons() {
         CallStatus::Missed,
         BridgeFailureReason::RingTimeout,
         "+15550001111",
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
     wait_for(
         || {

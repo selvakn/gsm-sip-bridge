@@ -75,7 +75,7 @@ async fn test_answered_and_declined_calls_produce_correct_call_metrics() {
 
     obs.report_call_answered_and_ended(
         "+15551234567",
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
         42.0,
         gsm_sip_bridge::ims::media_stats::DirectionVerdict::BothWays,
         gsm_sip_bridge::store::calls::CallDirection::Inbound,
@@ -110,7 +110,7 @@ async fn test_answered_and_declined_calls_produce_correct_call_metrics() {
         CallStatus::Failed,
         BridgeFailureReason::PbxDeclined,
         "+15559876543",
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
     wait_for(|| failed_counter.get() == 1.0, Duration::from_secs(5)).await;
     assert!(

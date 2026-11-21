@@ -204,7 +204,7 @@ impl DiscordClient {
             "embeds": [{
                 "title": title,
                 "description": description,
-                "timestamp": event.at.to_rfc3339(),
+                "timestamp": event.at.to_string(),
                 "color": color,
                 "fields": fields,
                 "footer": self.footer()

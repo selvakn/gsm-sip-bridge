@@ -143,7 +143,7 @@ pub fn record_and_forward(
                 module_id: module_id.clone(),
                 received_at: received_at.clone(),
                 forwarding_status: status_str.to_string(),
-                forwarded_at: Some(chrono::Utc::now().to_rfc3339()),
+                forwarded_at: Some(jiff::Timestamp::now().to_string()),
                 discord_status_code: discord_code,
                 last_error,
             },

@@ -18,7 +18,7 @@ use crate::ims::sip_client::{
     UpdateRequest,
 };
 use crate::vowifi::control::{read_msg, reason, write_msg, ControlMessage};
-use chrono::Utc;
+use jiff::Timestamp;
 use std::io::BufReader;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,7 +75,7 @@ pub(super) struct ActiveCall {
     /// called and when the call was answered, needed at hangup time to
     /// report `CallCompleted`/write the history row.
     pub(super) caller: String,
-    pub(super) answered_at: chrono::DateTime<Utc>,
+    pub(super) answered_at: Timestamp,
     pub(super) answered_instant: Instant,
     /// Per-direction packet counts on the carrier leg, read at teardown for the
     /// FR-017 one-way-audio verdict.
@@ -128,7 +128,7 @@ impl ActiveCall {
             } else {
                 crate::control::protocol::CallDirectionWire::Outbound
             },
-            started_at_unix: u64::try_from(self.answered_at.timestamp()).unwrap_or(0),
+            started_at_unix: u64::try_from(self.answered_at.as_second()).unwrap_or(0),
             answered: true,
             receive: self
                 .rtcp
@@ -648,7 +648,7 @@ pub(super) fn test_active_call(call_id: &str, to_tag: &str, caller_from: &str) -
             security_verify: None,
         },
         caller: "+919000000000".to_string(),
-        answered_at: Utc::now(),
+        answered_at: Timestamp::now(),
         answered_instant: Instant::now(),
         meter: crate::ims::media_stats::MediaMeter::new(),
         lifecycle: BridgedCall::new(call_id.to_string(), "+919000000000".to_string(), None),

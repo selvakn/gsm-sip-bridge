@@ -44,7 +44,7 @@ pub fn assign_slot(conn: &Connection, imei: &str, usb_serial: &str) -> BridgeRes
         )));
     }
 
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = jiff::Timestamp::now().to_string();
     conn.execute(
         "INSERT INTO card_slots(slot, imei, usb_serial, registered_at) VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![next_slot, imei, usb_serial, now],
