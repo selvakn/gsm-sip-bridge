@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="147 132 310 307" width="100%" height="100%">
+  <defs>
+    <!-- Smooth gradient from deep blue to bright cyan (handset) -->
+    <linearGradient id="logoGrad" x1="10%" y1="90%" x2="85%" y2="15%">
+      <stop offset="0%" stop-color="#0A64E8" />
+      <stop offset="48%" stop-color="#09A6F3" />
+      <stop offset="100%" stop-color="#19E6F7" />
+    </linearGradient>
+
+    <!-- Smooth gradient from deep green to bright mint (waves) -->
+    <linearGradient id="waveGrad" x1="10%" y1="90%" x2="85%" y2="15%">
+      <stop offset="0%" stop-color="#00A852" />
+      <stop offset="48%" stop-color="#00C853" />
+      <stop offset="100%" stop-color="#54F0A4" />
+    </linearGradient>
+  </defs>
+
+  <!-- Phone handset (raised slightly, earpiece & mouthpiece angled 20° inward) -->
+  <path fill="url(#logoGrad)" d="
+    M 157 285
+    C 145 262, 148 237, 166 222
+    L 184 207
+    C 199 195, 217 199, 227 215
+    L 243 241
+    C 251 255, 248 271, 234 280
+    L 225 286
+    C 217 291, 219 302, 232 316
+    C 245 330, 260 345, 274 358
+    C 288 371, 299 373, 304 365
+    L 310 356
+    C 319 342, 335 339, 349 347
+    L 375 363
+    C 391 373, 395 391, 383 406
+    L 368 424
+    C 353 442, 328 445, 305 433
+    C 244 398, 192 346, 157 285
+    Z" />
+
+  <!-- Inner wave: 70° arc (-80° to -10°), center (276, 313), R = 85 -->
+  <path d="M 290.8 229.3 A 85 85 0 0 1 359.7 298.2" fill="none" stroke="url(#waveGrad)" stroke-width="42" stroke-linecap="round" />
+
+  <!-- Outer wave: 70° arc (-80° to -10°), center (276, 313), R = 160 -->
+  <path d="M 303.8 155.4 A 160 160 0 0 1 433.6 285.2" fill="none" stroke="url(#waveGrad)" stroke-width="42" stroke-linecap="round" />
+</svg>

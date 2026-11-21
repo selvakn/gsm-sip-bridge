@@ -76,7 +76,7 @@ button, input, select {
   flex-wrap: wrap;
 }
 
-.brand { font-weight: 600; letter-spacing: .01em; color: var(--accent); margin-right: 8px; }
+.brand { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; letter-spacing: .01em; color: var(--accent); margin-right: 8px; }
 
 .nav { display: flex; gap: 4px; flex: 1; flex-wrap: wrap; }
 
@@ -120,7 +120,7 @@ h2 { font-size: .8rem; margin: 22px 0 8px; font-weight: 600; text-transform: upp
   border: 1px solid var(--line);
   border-radius: var(--radius);
 }
-.login h1 { color: var(--accent); }
+.login h1 { display: flex; align-items: center; gap: 10px; color: var(--accent); }
 .login input { width: 100%; padding: 8px 10px; margin: 6px 0 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg); }
 .login .btn { width: 100%; }
 .form-error { color: var(--bad); min-height: 1.4em; margin: 0 0 8px; font-size: .9rem; }

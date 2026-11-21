@@ -171,7 +171,9 @@
     app.appendChild(
       el("div", { class: "shell" },
         el("header", { class: "topbar" },
-          el("span", { class: "brand", text: "Bridge" }),
+          el("span", { class: "brand" },
+            el("img", { class: "brand-logo", src: "/favicon.svg", alt: "", width: 24, height: 24 }),
+            "Bridge"),
           navEl,
           el("button", { class: "btn link", type: "button", text: "Log out", onclick: logout })),
         mainEl));
@@ -194,7 +196,9 @@
     var input = el("input", { type: "password", name: "password", autocomplete: "current-password", required: true, autofocus: true });
     var button = el("button", { class: "btn primary", type: "submit", text: "Sign in" });
     var form = el("form", { class: "login" },
-      el("h1", { text: "Bridge" }),
+      el("h1", null,
+        el("img", { class: "login-logo", src: "/favicon.svg", alt: "", width: 36, height: 36 }),
+        "Bridge"),
       el("label", { class: "muted small" }, "Password", input),
       error,
       button);

@@ -226,7 +226,7 @@ pub async fn logout(State(state): State<WebuiState>, request: Request) -> Respon
 /// the login call itself.
 fn is_public(path: &str, method: &axum::http::Method) -> bool {
     match path {
-        "/login" | "/assets/app.js" | "/assets/style.css" => true,
+        "/login" | "/favicon.svg" | "/assets/app.js" | "/assets/style.css" => true,
         "/api/login" => method == axum::http::Method::POST,
         _ => false,
     }
