@@ -661,7 +661,7 @@ mod tests {
             unit_id: Some(module_id.to_string()),
             description: String::new(),
             phone_number: None,
-            at: chrono::Utc::now(),
+            at: jiff::Timestamp::now(),
             kind,
         }
     }

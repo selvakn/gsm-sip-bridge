@@ -691,7 +691,7 @@ fn spawn_discover_retry(
                             "configured VoWiFi line {id} was not found after {DISCOVER_RETRY_WINDOW:?} of retrying discovery"
                         ),
                         phone_number: configured_line_msisdn(&config, id),
-                        at: chrono::Utc::now(),
+                        at: jiff::Timestamp::now(),
                         kind: alerts::CriticalEventKind::Failure,
                     });
                 }
@@ -728,7 +728,7 @@ fn spawn_discover_retry(
                                     "configured VoWiFi line {id} was found and started after previously being reported as not found"
                                 ),
                                 phone_number: configured_line_msisdn(&config, id),
-                                at: chrono::Utc::now(),
+                                at: jiff::Timestamp::now(),
                                 kind: alerts::CriticalEventKind::Recovered,
                             });
                         }
@@ -2839,8 +2839,8 @@ fn pool_exhausted_detail(
     let ts = |secs: u64| {
         i64::try_from(secs)
             .ok()
-            .and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0))
-            .map_or_else(|| format!("unix:{secs}"), |d| d.to_rfc3339())
+            .and_then(|s| jiff::Timestamp::from_second(s).ok())
+            .map_or_else(|| format!("unix:{secs}"), |d| d.to_string())
     };
     let marks = members
         .iter()
@@ -3182,7 +3182,7 @@ fn start_line_tail(
                             unit_id: Some(line_id.clone()),
                             description: description.to_string(),
                             phone_number: line_msisdn.clone(),
-                            at: chrono::Utc::now(),
+                            at: jiff::Timestamp::now(),
                             kind,
                         });
                     }

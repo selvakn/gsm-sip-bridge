@@ -72,7 +72,7 @@ async fn test_vowifi_sms_received_and_forwarded_metrics_and_history() {
         module_id.clone(),
         "+15551234567".to_string(),
         "hello over vowifi".to_string(),
-        chrono::Utc::now().to_rfc3339(),
+        jiff::Timestamp::now().to_string(),
         Transport::Vowifi,
         Some(reporter.clone()),
         None,

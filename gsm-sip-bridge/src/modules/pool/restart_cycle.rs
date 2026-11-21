@@ -29,12 +29,12 @@ impl CardPool {
             self.next_scheduled_at = None;
             return;
         };
-        let now_local = chrono::Local::now();
+        let now_local = jiff::Zoned::now();
         // Use the last natural cron tick as the lower bound so we never re-fire
         // the same occurrence regardless of jitter direction.  On the very first
         // call `last_fired_tick` is None, so we fall back to `now_local`.
-        let after = self.last_fired_tick.unwrap_or(now_local);
-        let Some(next_tick) = schedule.after(&after).next() else {
+        let after = self.last_fired_tick.as_ref().unwrap_or(&now_local);
+        let Some(next_tick) = scheduler::compute_next_scheduled_at(schedule, after) else {
             tracing::warn!("scheduled_restart has no future cron occurrence; disabling scheduler");
             self.cron_schedule = None;
             self.next_scheduled_at = None;
@@ -42,11 +42,11 @@ impl CardPool {
         };
         // Persist the natural tick immediately so the next recompute call always
         // advances past this occurrence, even if the jittered start lands earlier.
-        self.last_fired_tick = Some(next_tick);
+        self.last_fired_tick = Some(next_tick.clone());
         let mut rng = rand::rng();
         let jitter =
             scheduler::jitter_offset(&mut rng, self.config.scheduled_restart.start_jitter_seconds);
-        let delta_sec = (next_tick - now_local).num_seconds() + jitter;
+        let delta_sec = now_local.duration_until(&next_tick).as_secs() + jitter;
         let now_instant = tokio::time::Instant::now();
         let target = if delta_sec <= 0 {
             now_instant
@@ -129,8 +129,8 @@ impl CardPool {
             return;
         }
 
-        let cron_tick = chrono::Local::now();
-        let id = cron_tick.timestamp().max(0) as u64;
+        let cron_tick = jiff::Zoned::now();
+        let id = cron_tick.timestamp().as_second().max(0) as u64;
 
         let mut as_vec: Vec<u32> = slots.keys().copied().collect();
         as_vec.sort_unstable();
@@ -139,7 +139,7 @@ impl CardPool {
         tracing::info!(
             cycle_id = id,
             cron_tick = %cron_tick,
-            actual_start = %chrono::Local::now(),
+            actual_start = %jiff::Zoned::now(),
             n_slots = pending.len(),
             pending_slots = ?as_vec,
             "scheduled_restart cycle-start"

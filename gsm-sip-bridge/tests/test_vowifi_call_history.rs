@@ -59,7 +59,7 @@ async fn test_answered_and_missed_calls_are_persisted_with_vowifi_transport() {
 
     obs.report_call_answered_and_ended(
         "+15551110000",
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
         30.0,
         gsm_sip_bridge::ims::media_stats::DirectionVerdict::BothWays,
         gsm_sip_bridge::store::calls::CallDirection::Inbound,
@@ -68,7 +68,7 @@ async fn test_answered_and_missed_calls_are_persisted_with_vowifi_transport() {
         CallStatus::Missed,
         BridgeFailureReason::RingTimeout,
         "+15552220000",
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
 
     wait_for(
@@ -124,7 +124,7 @@ async fn test_outbound_calls_are_persisted_with_outbound_direction() {
     let db_path = dir.path().join("outbound-history.db");
     let store = StoreHandle::open(&db_path).unwrap();
     let tx = store.sender();
-    let started = chrono::Utc::now();
+    let started = jiff::Timestamp::now();
 
     tx.send(StoreCommand::InsertCall(CallRecord::outbound(
         "card-out",
@@ -223,7 +223,7 @@ async fn test_media_quality_lands_on_the_call_row_and_not_the_next_one() {
     obs.report_media_quality(QualitySource::Local, 1.5, 0.012, None);
     obs.report_call_answered_and_ended(
         "+919000000001",
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
         30.0,
         DirectionVerdict::BothWays,
         gsm_sip_bridge::store::calls::CallDirection::Inbound,
@@ -231,7 +231,7 @@ async fn test_media_quality_lands_on_the_call_row_and_not_the_next_one() {
     // Call two: nothing reported, and one this side placed.
     obs.report_call_answered_and_ended(
         "+919000000002",
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
         10.0,
         DirectionVerdict::BothWays,
         gsm_sip_bridge::store::calls::CallDirection::Outbound,

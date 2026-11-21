@@ -82,7 +82,7 @@ pub enum StoreCommand {
     InsertEvent(events::EventRecord),
     /// Deletes timeline rows older than the given time.
     PruneEvents {
-        older_than: chrono::DateTime<chrono::Utc>,
+        older_than: jiff::Timestamp,
     },
     Shutdown,
 }

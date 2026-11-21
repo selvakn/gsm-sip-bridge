@@ -656,6 +656,20 @@ pub enum GmConnectionState {
     Failed { since: std::time::SystemTime },
 }
 
+/// RFC 3339 in UTC for a log line or a status render, range-checked: a
+/// hostile `Retry-After` can push a `SystemTime` past the last date jiff
+/// represents (year 9999) without overflowing `SystemTime` itself (Greptile,
+/// PR #130). Out of range, the raw unix seconds are shown instead.
+pub(crate) fn rfc3339(t: std::time::SystemTime) -> String {
+    jiff::Timestamp::try_from(t).map_or_else(
+        |_| match t.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => format!("unix:{}", d.as_secs()),
+            Err(e) => format!("unix:-{}", e.duration().as_secs()),
+        },
+        |ts| ts.to_string(),
+    )
+}
+
 impl GmConnectionState {
     /// Whether the connection is currently healthy — the input `can_answer`
     /// and the metrics gauge both read.
@@ -666,9 +680,7 @@ impl GmConnectionState {
     /// Wire/CLI rendering: `up`, `reconnecting since <ts> (attempt N)`, or
     /// `failed since <ts>`. Timestamps are RFC 3339 in UTC.
     pub fn render(&self) -> String {
-        fn ts(t: std::time::SystemTime) -> String {
-            chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
-        }
+        let ts = rfc3339;
         match self {
             GmConnectionState::Up => "up".to_string(),
             GmConnectionState::Reconnecting { since, attempts } => {
@@ -711,9 +723,7 @@ impl SubscriptionHealth {
     /// Wire/CLI rendering (`specs/090-reg-event-subscription-tracking/contracts/control.md`).
     /// Timestamps are RFC 3339 in UTC, as in [`GmConnectionState::render`].
     pub fn render(&self) -> String {
-        fn ts(t: std::time::SystemTime) -> String {
-            chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
-        }
+        let ts = rfc3339;
         match self {
             SubscriptionHealth::None => "none".to_string(),
             SubscriptionHealth::Pending { since } => format!("pending since {}", ts(*since)),
@@ -1718,6 +1728,15 @@ mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
 
+    #[test]
+    fn rfc3339_renders_utc_and_falls_back_out_of_range() {
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_779_271_200);
+        assert_eq!(rfc3339(t), "2026-05-20T10:00:00Z");
+        // Past year 9999 but a valid SystemTime: no panic, raw seconds.
+        let far = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000_000_000_000);
+        assert_eq!(rfc3339(far), "unix:10000000000000");
+    }
+
     // --- specs/091 R4: classification on real socket errors ---
 
     fn closed_local_port() -> SocketAddr {
@@ -1835,14 +1854,14 @@ mod tests {
         assert_eq!(SubscriptionHealth::None.render(), "none");
         assert_eq!(
             SubscriptionHealth::Pending { since: t }.render(),
-            "pending since 2023-11-14T22:13:20+00:00"
+            "pending since 2023-11-14T22:13:20Z"
         );
         assert_eq!(
             SubscriptionHealth::Confirmed {
                 expires_at: Some(later)
             }
             .render(),
-            "confirmed, expires 2023-11-14T22:15:28+00:00"
+            "confirmed, expires 2023-11-14T22:15:28Z"
         );
         assert_eq!(
             SubscriptionHealth::Confirmed { expires_at: None }.render(),
@@ -1854,7 +1873,7 @@ mod tests {
                 retry_at: Some(later)
             }
             .render(),
-            "unconfirmed since 2023-11-14T22:13:20+00:00; retry at 2023-11-14T22:15:28+00:00"
+            "unconfirmed since 2023-11-14T22:13:20Z; retry at 2023-11-14T22:15:28Z"
         );
         assert_eq!(
             SubscriptionHealth::Unconfirmed {
@@ -1862,7 +1881,7 @@ mod tests {
                 retry_at: None
             }
             .render(),
-            "unconfirmed since 2023-11-14T22:13:20+00:00"
+            "unconfirmed since 2023-11-14T22:13:20Z"
         );
         assert_eq!(
             SubscriptionHealth::Stopped {

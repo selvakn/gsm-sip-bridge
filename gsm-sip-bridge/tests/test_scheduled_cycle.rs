@@ -93,7 +93,7 @@ fn fresh_state(slots: &[u32]) -> CycleState {
     let now = tokio::time::Instant::now();
     CycleState {
         id: 42,
-        cron_tick: chrono::Local::now(),
+        cron_tick: jiff::Zoned::now(),
         started_at: now,
         phase: CyclePhase::Initial,
         pending: slots.iter().copied().collect(),
@@ -483,15 +483,13 @@ fn no_catch_up_on_startup_uses_future_occurrence() {
     // scheduler must arm the *next* future occurrence, not the missed one.
     let schedule = scheduler::parse_cron_5field("0 1 * * *").unwrap();
     // Simulate "now" as 03:00 local — well past today's 01:00 tick.
-    use chrono::TimeZone;
-    let now_local = chrono::Local
-        .with_ymd_and_hms(2026, 5, 26, 3, 0, 0)
-        .single()
+    let now_local = jiff::civil::date(2026, 5, 26)
+        .at(3, 0, 0, 0)
+        .in_tz("Asia/Kolkata")
         .unwrap();
-    let next = scheduler::compute_next_scheduled_at(&schedule, now_local).unwrap();
+    let next = scheduler::compute_next_scheduled_at(&schedule, &now_local).unwrap();
     // The next tick must be strictly AFTER now (tomorrow 01:00, not today's missed 01:00).
     assert!(next > now_local, "next must be after now (no catch-up)");
-    use chrono::Datelike;
     assert_eq!(next.day(), 27, "must be tomorrow, not today");
 }
 

@@ -124,7 +124,7 @@ async fn refresh_sms_delivery() {
         .map_err(|e| e.to_string())?;
         conn.busy_timeout(Duration::from_secs(2))
             .map_err(|e| e.to_string())?;
-        let now = chrono::Utc::now().timestamp();
+        let now = jiff::Timestamp::now().as_second();
         crate::store::sms::summary(&conn, now).map_err(|e| e.to_string())
     })
     .await;
