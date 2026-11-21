@@ -507,7 +507,9 @@ pub fn amr_mode_set(codec: NegotiatedCodec, fmtp: &str) -> Option<u16> {
         .split(',')
         .try_fold(0u16, |set, mode| {
             let mode: u16 = mode.trim().parse().ok()?;
-            (mode < modes).then_some(set | 1 << mode)
+            // `then`, not `then_some`: the shift must wait for the range
+            // check, as `1 << 16` on a `u16` panics in a debug build.
+            (mode < modes).then(|| set | 1 << mode)
         })
         .filter(|&set| set != 0)
 }
@@ -2729,6 +2731,15 @@ mod tests {
         assert_eq!(amr_mode_set(AmrWb, "mode-set=x"), None);
         assert_eq!(amr_mode_set(AmrNb, "mode-set=8"), None);
         assert_eq!(amr_mode_set(Pcmu, "mode-set=0"), None);
+        // Modes no `u16` bit can hold are refused before any shift, not
+        // shifted out of range (code review finding).
+        for set in ["16", "0,16", "65535", "2,15", "9"] {
+            assert_eq!(
+                amr_mode_set(AmrWb, &format!("mode-set={set}")),
+                None,
+                "{set}"
+            );
+        }
     }
 
     /// The answer echoes the offer's `a=fmtp`, so the chosen codec keeps to
