@@ -14,7 +14,7 @@ const SECRET_BODY: &str = "one-time-code-482913";
 fn seed(path: &std::path::Path) {
     let conn = Connection::open(path).unwrap();
     init_schema(&conn).unwrap();
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     for (i, (status, age)) in [
         ("sent", 900),
         ("sent", 800),

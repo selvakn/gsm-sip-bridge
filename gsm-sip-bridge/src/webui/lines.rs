@@ -13,7 +13,7 @@ use crate::control::protocol::{
 };
 use crate::metrics::ingest::AgentSnapshot;
 use crate::modules::signal::SignalReading;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -135,8 +135,8 @@ pub struct Inputs<'a> {
 }
 
 fn unix_to_rfc3339(secs: u64) -> Option<String> {
-    DateTime::<Utc>::from_timestamp(i64::try_from(secs).ok()?, 0)
-        .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+    let t = Timestamp::from_second(i64::try_from(secs).ok()?).ok()?;
+    Some(format!("{t:.0}"))
 }
 
 /// Operator names for the PLMNs this bridge is run against; anything else is

@@ -18,7 +18,7 @@ use crate::observability::reporter::Reporter;
 use crate::store::calls::CallRecord;
 use crate::store::{StoreCommand, StoreHandle, Transport};
 use crate::vowifi::control::reason;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use std::sync::{Arc, Mutex};
 
 /// What the web UI shows about this line beyond the gauges
@@ -411,7 +411,7 @@ impl AgentObservability {
         status: CallStatus,
         reason: BridgeFailureReason,
         caller: &str,
-        started_at: DateTime<Utc>,
+        started_at: Timestamp,
     ) {
         self.push(vec![
             ObservedEvent::CallCompleted {
@@ -436,7 +436,7 @@ impl AgentObservability {
     pub fn report_call_answered_and_ended(
         &self,
         caller: &str,
-        started_at: DateTime<Utc>,
+        started_at: Timestamp,
         duration_seconds: f64,
         media: super::media_stats::DirectionVerdict,
         direction: crate::store::calls::CallDirection,
@@ -514,7 +514,7 @@ impl AgentObservability {
     fn insert_call_row(
         &self,
         caller: &str,
-        started_at: DateTime<Utc>,
+        started_at: Timestamp,
         duration_seconds: f64,
         status: CallStatus,
         direction: crate::store::calls::CallDirection,
@@ -528,7 +528,7 @@ impl AgentObservability {
         let record = CallRecord {
             module_id: self.module_id.clone(),
             caller_id: caller.to_string(),
-            started_at: started_at.to_rfc3339(),
+            started_at: started_at.to_string(),
             duration_seconds,
             status: status.as_str().to_string(),
             sip_destination: self.sip_destination.clone(),

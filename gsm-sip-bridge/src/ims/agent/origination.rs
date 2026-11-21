@@ -19,7 +19,7 @@ use crate::ims::lifecycle::{BridgedCall, CallStage};
 use crate::ims::sdp::{self, NegotiatedCodec};
 use crate::ims::sip_client::{random_hex, SipResponse};
 use crate::vowifi::control::{reason, write_msg, ControlMessage};
-use chrono::Utc;
+use jiff::Timestamp;
 use std::net::{IpAddr, TcpStream, UdpSocket};
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
@@ -1704,7 +1704,7 @@ fn finish_origination(
         dialog,
         call_id,
         caller: destination,
-        answered_at: Utc::now(),
+        answered_at: Timestamp::now(),
         answered_instant: Instant::now(),
         meter,
         lifecycle,

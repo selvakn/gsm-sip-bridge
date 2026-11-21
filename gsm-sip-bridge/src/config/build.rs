@@ -610,10 +610,9 @@ fn build_scheduled_restart(raw: RawScheduledRestart) -> ScheduledRestartConfig {
         return ScheduledRestartConfig::disabled();
     }
 
-    // The `cron` crate takes 7 fields; this project's config takes the usual
-    // 5, so seconds are prepended and year appended before validating.
-    let translated = format!("0 {} *", raw.cron);
-    if let Err(e) = translated.parse::<cron::Schedule>() {
+    // The same parser the card pool uses, so a schedule that validates here
+    // is one the pool can arm.
+    if let Err(e) = crate::modules::scheduler::parse_cron_5field(&raw.cron) {
         tracing::error!(
             cron = %raw.cron,
             error = %e,

@@ -18,7 +18,7 @@
 //! endpoint failure, the Gm keepalive escalation). This module only records it.
 
 use crate::ims::pcscf_files::{Outage, PoolState, PoolStateMark, POOL_STATE_VERSION};
-use crate::ims::PcscfSnapshot;
+use crate::ims::{rfc3339, PcscfSnapshot};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -162,18 +162,6 @@ fn to_unix(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// RFC 3339 for a log line, range-checked: `DateTime::from(SystemTime)`
-/// panics past chrono's last representable date, which a hostile
-/// `Retry-After` can reach without overflowing `SystemTime` itself (Greptile,
-/// PR #130). Out of range, the raw unix seconds are logged instead.
-fn rfc3339(t: SystemTime) -> String {
-    let secs = to_unix(t);
-    i64::try_from(secs)
-        .ok()
-        .and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0))
-        .map_or_else(|| format!("unix:{secs}"), |d| d.to_rfc3339())
 }
 
 /// One line's P-CSCF candidates, marks and choice.
@@ -1013,7 +1001,7 @@ mod tests {
             .on_failure(ip(A), FailureCause::RetryAfter(secs(172_800)), t0())
             .unwrap();
         assert_eq!(m.until, t0() + secs(172_800), "two days stays two days");
-        // Past chrono's last date but still a valid SystemTime: the log line
+        // Past jiff's last date but still a valid SystemTime: the log line
         // that reports the mark must not panic.
         let mut p = mem(A, &[A, B]);
         p.select(t0());

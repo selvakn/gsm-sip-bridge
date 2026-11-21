@@ -4,7 +4,6 @@
 
 mod common;
 
-use chrono::{Duration, Utc};
 use common::{open_store, wait_for_rows, Fixture};
 use gsm_sip_bridge::alerts::discord::DiscordClient;
 use gsm_sip_bridge::alerts::{self, AlertCategory, CriticalEvent, CriticalEventKind};
@@ -15,6 +14,7 @@ use gsm_sip_bridge::control::protocol::{
     TunnelRecoveryReason, UplinkHoldCause,
 };
 use gsm_sip_bridge::store::{events, StoreCommand};
+use jiff::{SignedDuration, Timestamp};
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
@@ -36,7 +36,7 @@ fn event(
         unit_id: Some(module.to_string()),
         description: format!("{} {:?}", category.as_str(), kind),
         phone_number: None,
-        at: Utc::now() + Duration::seconds(secs),
+        at: Timestamp::now() + SignedDuration::from_secs(secs),
         kind,
     }
 }
@@ -294,7 +294,7 @@ async fn rows_survive_a_reopen_and_pruning_keeps_the_recent_ones() {
         let tx = store.sender();
         for days in [45, 31, 5, 0] {
             tx.send(StoreCommand::InsertEvent(events::EventRecord {
-                at: Utc::now() - Duration::days(days),
+                at: Timestamp::now() - SignedDuration::from_hours(24 * days),
                 module_id: Some("line-a".into()),
                 kind: events::EventKind::ScheduledRestart,
                 detail: format!("{days} days ago"),
@@ -314,7 +314,7 @@ async fn rows_survive_a_reopen_and_pruning_keeps_the_recent_ones() {
     store
         .sender()
         .send(StoreCommand::PruneEvents {
-            older_than: Utc::now() - Duration::days(30),
+            older_than: Timestamp::now() - SignedDuration::from_hours(720),
         })
         .unwrap();
     wait_for_rows(&f.db_path, "events", 2);

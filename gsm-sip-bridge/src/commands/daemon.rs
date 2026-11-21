@@ -211,13 +211,16 @@ pub fn run(cli: &Cli) -> ExitCode {
         // prunes at startup and then every few hours.
         let prune_handle = {
             let tx = store.sender();
-            let keep = chrono::Duration::days(i64::from(config.alerts.event_retention_days));
+            // Up to u32::MAX days is accepted; past jiff's range, keep everything.
+            let keep = jiff::SignedDuration::from_hours(24 * i64::from(config.alerts.event_retention_days));
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(EVENT_PRUNE_INTERVAL);
                 loop {
                     tick.tick().await;
                     let _ = tx.send(crate::store::StoreCommand::PruneEvents {
-                        older_than: chrono::Utc::now() - keep,
+                        older_than: jiff::Timestamp::now()
+                            .checked_sub(keep)
+                            .unwrap_or(jiff::Timestamp::MIN),
                     });
                 }
             })

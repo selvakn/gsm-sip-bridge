@@ -3,13 +3,13 @@
 
 mod common;
 
-use chrono::{Duration, Utc};
 use common::{open_store, wait_for_rows, Fixture};
 use gsm_sip_bridge::control::protocol::{
     ActiveCallInfoWire, AgentDetails, AgentKind, AgentReport, AgentState, CallDirectionWire,
 };
 use gsm_sip_bridge::store::calls::{CallDirection, CallRecord};
 use gsm_sip_bridge::store::{StoreCommand, Transport};
+use jiff::{SignedDuration, Timestamp};
 
 struct Seed {
     line: &'static str,
@@ -17,7 +17,7 @@ struct Seed {
     transport: Transport,
     status: &'static str,
     seconds: f64,
-    age: Duration,
+    age: SignedDuration,
     quality: Option<(f64, f64, f64)>,
 }
 
@@ -25,7 +25,7 @@ fn record(s: &Seed) -> CallRecord {
     CallRecord {
         module_id: s.line.to_string(),
         caller_id: "+919000000001".to_string(),
-        started_at: (Utc::now() - s.age).to_rfc3339(),
+        started_at: (Timestamp::now() - s.age).to_string(),
         duration_seconds: s.seconds,
         status: s.status.to_string(),
         sip_destination: String::new(),
@@ -52,7 +52,7 @@ fn seed(f: &Fixture) -> gsm_sip_bridge::store::StoreHandle {
             transport: Transport::Vowifi,
             status: "answered",
             seconds: 100.0,
-            age: Duration::seconds(30),
+            age: SignedDuration::from_secs(30),
             quality: Some((0.5, 12.0, 80.0)),
         },
         Seed {
@@ -61,7 +61,7 @@ fn seed(f: &Fixture) -> gsm_sip_bridge::store::StoreHandle {
             transport: Transport::Vowifi,
             status: "answered",
             seconds: 200.0,
-            age: Duration::seconds(20),
+            age: SignedDuration::from_secs(20),
             quality: None,
         },
         Seed {
@@ -70,7 +70,7 @@ fn seed(f: &Fixture) -> gsm_sip_bridge::store::StoreHandle {
             transport: Transport::Cs,
             status: "missed",
             seconds: 0.0,
-            age: Duration::seconds(10),
+            age: SignedDuration::from_secs(10),
             quality: None,
         },
         Seed {
@@ -79,7 +79,7 @@ fn seed(f: &Fixture) -> gsm_sip_bridge::store::StoreHandle {
             transport: Transport::Cs,
             status: "failed",
             seconds: 0.0,
-            age: Duration::seconds(5),
+            age: SignedDuration::from_secs(5),
             quality: None,
         },
         Seed {
@@ -88,7 +88,7 @@ fn seed(f: &Fixture) -> gsm_sip_bridge::store::StoreHandle {
             transport: Transport::Vowifi,
             status: "answered",
             seconds: 60.0,
-            age: Duration::seconds(2),
+            age: SignedDuration::from_secs(2),
             quality: None,
         },
         Seed {
@@ -97,7 +97,7 @@ fn seed(f: &Fixture) -> gsm_sip_bridge::store::StoreHandle {
             transport: Transport::Vowifi,
             status: "answered",
             seconds: 400.0,
-            age: Duration::days(3),
+            age: SignedDuration::from_hours(72),
             quality: None,
         },
         Seed {
@@ -106,7 +106,7 @@ fn seed(f: &Fixture) -> gsm_sip_bridge::store::StoreHandle {
             transport: Transport::Vowifi,
             status: "answered",
             seconds: 999.0,
-            age: Duration::days(10),
+            age: SignedDuration::from_hours(240),
             quality: None,
         },
     ];
@@ -183,7 +183,7 @@ async fn the_log_filters_by_every_field_and_comes_newest_first() {
         assert_eq!(body["total"], expected, "{query}");
     }
 
-    let from = (Utc::now() - Duration::days(5)).to_rfc3339();
+    let from = (Timestamp::now() - SignedDuration::from_hours(120)).to_string();
     let (_, recent) = f
         .get_json(
             &cookie,
@@ -192,7 +192,7 @@ async fn the_log_filters_by_every_field_and_comes_newest_first() {
         .await;
     assert_eq!(recent["total"], 6, "from= excludes the 10-day-old call");
 
-    let to = (Utc::now() - Duration::days(1)).to_rfc3339();
+    let to = (Timestamp::now() - SignedDuration::from_hours(24)).to_string();
     let (_, old) = f
         .get_json(
             &cookie,
@@ -286,21 +286,19 @@ async fn a_call_in_progress_appears_on_its_overview_line() {
 async fn the_upper_date_bound_includes_its_own_second() {
     let f = Fixture::start("").await;
     let store = open_store(&f.db_path);
-    let at = chrono::DateTime::parse_from_rfc3339("2026-10-20T23:59:59Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let at: Timestamp = "2026-10-20T23:59:59Z".parse().unwrap();
     // Stored the way the bridge writes it: with a zone suffix.
     store
         .sender()
         .send(StoreCommand::InsertCall(CallRecord {
-            started_at: at.to_rfc3339(),
+            started_at: at.to_string(),
             ..record(&Seed {
                 line: "line-a",
                 direction: CallDirection::Inbound,
                 transport: Transport::Vowifi,
                 status: "answered",
                 seconds: 5.0,
-                age: Duration::zero(),
+                age: SignedDuration::ZERO,
                 quality: None,
             })
         }))
@@ -345,7 +343,7 @@ async fn calls_from_before_direction_was_recorded_are_unknown_not_inbound() {
     conn.execute(
         "INSERT INTO calls (module_id, caller_id, started_at, duration_seconds, status, sip_destination, transport) \
          VALUES ('line-a', '+919000000001', ?1, 30.0, 'answered', '', 'vowifi')",
-        [Utc::now().to_rfc3339()],
+        [Timestamp::now().to_string()],
     )
     .unwrap();
     drop(store);
@@ -365,14 +363,45 @@ async fn calls_from_before_direction_was_recorded_are_unknown_not_inbound() {
 }
 
 #[tokio::test]
-async fn the_summary_says_whose_midnight_today_starts_at() {
+async fn the_summary_counts_today_from_the_viewers_midnight() {
     let f = Fixture::start("").await;
-    let _store = open_store(&f.db_path);
+    let _store = seed(&f);
     let cookie = f.login().await;
-    let (_, s) = f.get_json(&cookie, "/api/calls/summary").await;
-    let start = s["today_start"].as_str().expect("today_start");
-    let parsed = chrono::DateTime::parse_from_rfc3339(start).expect("an RFC 3339 time");
-    assert_eq!(parsed.format("%H:%M:%S").to_string(), "00:00:00", "{start}");
-    let offset = s["host_utc_offset"].as_str().expect("host_utc_offset");
-    assert_eq!(offset, parsed.format("%:z").to_string());
+    let summary = |since: Timestamp| format!("/api/calls/summary?since={since:.0}");
+
+    // A "midnight" in the future is clamped to now: nothing is today yet.
+    let (status, s) = f
+        .get_json(
+            &cookie,
+            &summary(Timestamp::now() + SignedDuration::from_hours(1)),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(s["today"]["answered"], 0);
+    assert_eq!(
+        s["last_7d"]["answered"], 4,
+        "the 7-day window ignores since"
+    );
+
+    // One more than two days back is clamped to two days: the 3-day-old call
+    // stays out of today.
+    let (_, s) = f
+        .get_json(
+            &cookie,
+            &summary(Timestamp::now() - SignedDuration::from_hours(72)),
+        )
+        .await;
+    assert_eq!(s["today"]["answered"], 3);
+}
+
+#[tokio::test]
+async fn the_summary_rejects_a_since_that_is_not_an_rfc3339_time() {
+    let f = Fixture::start("").await;
+    let cookie = f.login().await;
+    for bad in ["yesterday", "2026-10-20T00:00:00"] {
+        let (status, body) = f
+            .get_json(&cookie, &format!("/api/calls/summary?since={bad}"))
+            .await;
+        assert_eq!(status, 400, "{bad}: {body}");
+    }
 }

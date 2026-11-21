@@ -1063,19 +1063,19 @@ mod tests {
     #[test]
     fn a_failed_gm_connection_is_unhealthy_and_names_the_pcscf() {
         let fault = only_fault(verdict_for(AgentStatusProbe::Reply(status_reply(
-            "failed since 2026-10-16T00:00:00+00:00",
+            "failed since 2026-10-16T00:00:00Z",
             Some("192.0.2.10"),
         ))));
         assert_eq!(
             fault,
             LineFault::GmConnectionFailed {
-                gm_connection: "failed since 2026-10-16T00:00:00+00:00".to_string(),
+                gm_connection: "failed since 2026-10-16T00:00:00Z".to_string(),
                 pcscf: Some("192.0.2.10".to_string()),
             }
         );
         assert_eq!(
             fault.to_string(),
-            "IMS agent reports Gm connection failed since 2026-10-16T00:00:00+00:00 \
+            "IMS agent reports Gm connection failed since 2026-10-16T00:00:00Z \
              (P-CSCF 192.0.2.10)"
         );
     }
@@ -1084,12 +1084,12 @@ mod tests {
     fn a_failed_gm_connection_without_an_active_pcscf_leaves_it_out() {
         for pcscf in [None, Some("")] {
             let fault = only_fault(verdict_for(AgentStatusProbe::Reply(status_reply(
-                "failed since 2026-10-16T00:00:00+00:00",
+                "failed since 2026-10-16T00:00:00Z",
                 pcscf,
             ))));
             assert_eq!(
                 fault.to_string(),
-                "IMS agent reports Gm connection failed since 2026-10-16T00:00:00+00:00"
+                "IMS agent reports Gm connection failed since 2026-10-16T00:00:00Z"
             );
         }
     }
@@ -1100,7 +1100,7 @@ mod tests {
     fn a_reconnecting_gm_connection_is_not_a_fault() {
         assert_eq!(
             verdict_for(AgentStatusProbe::Reply(status_reply(
-                "reconnecting since 2026-10-16T00:00:00+00:00 (attempt 2)",
+                "reconnecting since 2026-10-16T00:00:00Z (attempt 2)",
                 Some("192.0.2.10"),
             ))),
             Health::Healthy

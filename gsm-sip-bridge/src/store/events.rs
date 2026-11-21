@@ -18,8 +18,8 @@
 
 use crate::error::BridgeResult;
 use crate::store::StoreCommand;
-use chrono::{DateTime, SecondsFormat, Utc};
 use crossbeam_channel::Sender;
+use jiff::Timestamp;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -107,7 +107,7 @@ impl EventKind {
 /// One row to write.
 #[derive(Debug, Clone)]
 pub struct EventRecord {
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     pub module_id: Option<String>,
     pub kind: EventKind,
     pub detail: String,
@@ -115,11 +115,13 @@ pub struct EventRecord {
     /// For a resolve: the `at` of the raise it closes. The writer looks the
     /// raise's id up when it inserts, which is safe because the raise went
     /// down the same ordered channel to the same thread earlier.
-    pub resolves_raise_at: Option<DateTime<Utc>>,
+    pub resolves_raise_at: Option<Timestamp>,
 }
 
-fn stamp(t: DateTime<Utc>) -> String {
-    t.to_rfc3339_opts(SecondsFormat::Secs, true)
+/// Whole seconds, `Z`: `2026-11-20T10:00:00Z`. Rows are deduplicated and
+/// pruned by comparing this text, so its shape must not change.
+fn stamp(t: Timestamp) -> String {
+    format!("{t:.0}")
 }
 
 fn truncate(detail: &str) -> String {
@@ -160,7 +162,7 @@ pub fn insert_event(conn: &Connection, record: &EventRecord) -> BridgeResult<()>
 }
 
 /// Deletes rows older than `older_than`, returning how many went.
-pub fn prune_events(conn: &Connection, older_than: DateTime<Utc>) -> BridgeResult<usize> {
+pub fn prune_events(conn: &Connection, older_than: Timestamp) -> BridgeResult<usize> {
     Ok(conn.execute("DELETE FROM events WHERE at < ?1", [stamp(older_than)])?)
 }
 
@@ -174,8 +176,8 @@ fn sink() -> &'static Mutex<Option<Sender<StoreCommand>>> {
 /// `(category, module_id)` of an alert raised and not yet resolved, with when.
 type OpenKey = (String, Option<String>);
 
-fn open() -> &'static Mutex<HashMap<OpenKey, DateTime<Utc>>> {
-    static OPEN: OnceLock<Mutex<HashMap<OpenKey, DateTime<Utc>>>> = OnceLock::new();
+fn open() -> &'static Mutex<HashMap<OpenKey, Timestamp>> {
+    static OPEN: OnceLock<Mutex<HashMap<OpenKey, Timestamp>>> = OnceLock::new();
     OPEN.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -209,7 +211,7 @@ pub fn record(
     duration_seconds: Option<f64>,
 ) {
     send(EventRecord {
-        at: Utc::now(),
+        at: Timestamp::now(),
         module_id: module_id.map(str::to_string),
         kind,
         detail: detail.to_string(),
@@ -226,7 +228,7 @@ pub fn record_alert(
     module_id: Option<&str>,
     raised: bool,
     detail: &str,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) {
     let key = (category.to_string(), module_id.map(str::to_string));
     let mut open = open().lock().unwrap_or_else(|e| e.into_inner());
@@ -249,7 +251,7 @@ pub fn record_alert(
             return;
         };
         drop(open);
-        let seconds = (at - raised_at).num_milliseconds() as f64 / 1000.0;
+        let seconds = at.duration_since(raised_at).as_secs_f64();
         send(EventRecord {
             at,
             module_id: module_id.map(str::to_string),
@@ -266,7 +268,7 @@ pub fn record_alert(
 pub struct OpenRaise {
     pub category: String,
     pub module_id: Option<String>,
-    pub since: DateTime<Utc>,
+    pub since: Timestamp,
 }
 
 /// Alerts raised and not yet resolved in this process, oldest first.
@@ -290,13 +292,23 @@ mod tests {
     use super::*;
     use crate::store::schema::init_schema;
 
+    #[test]
+    fn stamp_is_whole_seconds_in_z_form_truncated() {
+        // Existing rows hold exactly this shape; dedupe and prune compare it
+        // as text.
+        let t: Timestamp = "2026-11-20T10:00:59.999999999Z".parse().unwrap();
+        assert_eq!(stamp(t), "2026-11-20T10:00:59Z");
+        let t: Timestamp = "2026-11-20T15:30:00+05:30".parse().unwrap();
+        assert_eq!(stamp(t), "2026-11-20T10:00:00Z");
+    }
+
     fn conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         conn
     }
 
-    fn rec(kind: EventKind, module: Option<&str>, at: DateTime<Utc>) -> EventRecord {
+    fn rec(kind: EventKind, module: Option<&str>, at: Timestamp) -> EventRecord {
         EventRecord {
             at,
             module_id: module.map(str::to_string),
@@ -324,7 +336,7 @@ mod tests {
     #[test]
     fn detail_is_truncated_to_500_characters() {
         let c = conn();
-        let mut r = rec(EventKind::ModuleInitFailed, Some("m"), Utc::now());
+        let mut r = rec(EventKind::ModuleInitFailed, Some("m"), Timestamp::now());
         r.detail = "é".repeat(900);
         insert_event(&c, &r).unwrap();
         let stored: String = c
@@ -336,7 +348,7 @@ mod tests {
     #[test]
     fn a_resolve_finds_its_raise_by_kind_module_and_time() {
         let c = conn();
-        let t0 = Utc::now();
+        let t0 = Timestamp::now();
         insert_event(
             &c,
             &rec(
@@ -359,7 +371,7 @@ mod tests {
         let mut resolve = rec(
             EventKind::AlertResolved("tunnel_failure".into()),
             Some("m1"),
-            t0 + chrono::Duration::seconds(90),
+            t0 + jiff::SignedDuration::from_secs(90),
         );
         resolve.resolves_raise_at = Some(t0);
         resolve.duration_seconds = Some(90.0);
@@ -379,19 +391,19 @@ mod tests {
     #[test]
     fn prune_deletes_only_older_rows() {
         let c = conn();
-        let now = Utc::now();
+        let now = Timestamp::now();
         for days in [40, 31, 10, 0] {
             insert_event(
                 &c,
                 &rec(
                     EventKind::ScheduledRestart,
                     None,
-                    now - chrono::Duration::days(days),
+                    now - jiff::SignedDuration::from_hours(24 * days),
                 ),
             )
             .unwrap();
         }
-        let gone = prune_events(&c, now - chrono::Duration::days(30)).unwrap();
+        let gone = prune_events(&c, now - jiff::SignedDuration::from_hours(720)).unwrap();
         assert_eq!(gone, 2);
         let left: i64 = c
             .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))

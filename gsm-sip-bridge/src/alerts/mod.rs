@@ -15,7 +15,7 @@ pub mod discord;
 
 use crate::config::secret::Secret;
 use crate::config::{AlertsConfig, CategoryAlertConfig};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 /// The value shown in an alert's phone field when no number can be determined,
 /// and the ultimate hostname fallback (specs/034-alert-identity, FR-005).
@@ -175,7 +175,7 @@ pub struct CriticalEvent {
     /// the origin can determine it. `None` renders as `unknown` in the alert
     /// (FR-005) — never a fabricated value.
     pub phone_number: Option<String>,
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     pub kind: CriticalEventKind,
 }
 

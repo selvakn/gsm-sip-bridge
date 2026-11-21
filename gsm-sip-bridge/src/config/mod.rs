@@ -1642,7 +1642,7 @@ pub struct LoadedConfig {
     /// (research R11). Never serialise `config` for display instead.
     pub snapshot: Value,
     pub source_path: std::path::PathBuf,
-    pub loaded_at: chrono::DateTime<chrono::Utc>,
+    pub loaded_at: jiff::Timestamp,
 }
 
 /// [`load_config`], keeping the pre-resolution document.
@@ -1688,7 +1688,7 @@ pub fn load_config_with_snapshot(path: &Path) -> BridgeResult<LoadedConfig> {
         config: build::build(raw)?,
         snapshot,
         source_path: path.to_path_buf(),
-        loaded_at: chrono::Utc::now(),
+        loaded_at: jiff::Timestamp::now(),
     })
 }
 

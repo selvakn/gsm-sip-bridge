@@ -92,17 +92,22 @@ Fields that don't apply to a transport are `null`. For example, a CS line has `t
 
 ### `GET /api/calls/summary`
 
+Query parameter: `since` (optional, RFC 3339 with an offset, e.g. `2026-10-24T00:00:00+05:30` or `2026-10-23T18:30:00Z`). This is where "today" starts. The web UI sends the browser's local midnight.
+
+- Absent: "today" is the last 24 hours.
+- Earlier than 48 hours ago, or in the future: clamped to that range, so a future `since` gives zero counts for `today`.
+- Not RFC 3339, or missing an offset: `400` with `{"error":"bad_request","detail":"since must be an RFC 3339 time"}`.
+
 ```json
 {
   "today":  {"answered": 3, "missed": 1, "failed": 0, "avg_answered_seconds": 142.5},
   "last_7d": {"answered": 20, "missed": 4, "failed": 2, "avg_answered_seconds": 131.0},
   "by_line": [{"module_id": "card-1a2b", "today": {}, "last_7d": {}}],
-  "by_direction": {"inbound": {"today": {}, "last_7d": {}}, "outbound": {"today": {}, "last_7d": {}}, "unknown": {"today": {}, "last_7d": {}}},
-  "today_start": "2026-10-24T00:00:00+05:30", "host_utc_offset": "+05:30"
+  "by_direction": {"inbound": {"today": {}, "last_7d": {}}, "outbound": {"today": {}, "last_7d": {}}, "unknown": {"today": {}, "last_7d": {}}}
 }
 ```
 
-The empty `{}` objects in the example have the same shape as `today`. "Today" is the bridge host's local midnight to now; `today_start` and `host_utc_offset` say which. `unknown` holds calls recorded before direction was (schema v6 backfill).
+The empty `{}` objects in the example have the same shape as `today`. "Today" runs from `since` (as clamped) to now. `last_7d` is the last 7 × 24 hours and does not depend on `since`. The response doesn't echo the start time or include any host time zone. `unknown` holds calls recorded before direction was (schema v6 backfill).
 
 ### `GET /api/calls`
 

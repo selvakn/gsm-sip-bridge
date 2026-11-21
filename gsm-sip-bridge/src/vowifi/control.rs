@@ -774,7 +774,7 @@ mod tests {
         let msg = ControlMessage::SmsReceived {
             sender: "+919000000000".to_string(),
             body: "hello over VoWiFi".to_string(),
-            received_at: "2026-07-13T00:00:00+00:00".to_string(),
+            received_at: "2026-07-13T00:00:00Z".to_string(),
         };
         assert_eq!(roundtrip(&msg), msg);
     }
@@ -785,7 +785,7 @@ mod tests {
             ControlMessage::SmsReceived {
                 sender: "+919000000000".to_string(),
                 body: "hi".to_string(),
-                received_at: "2026-07-13T00:00:00+00:00".to_string(),
+                received_at: "2026-07-13T00:00:00Z".to_string(),
             }
             .call_id(),
             None
@@ -812,7 +812,7 @@ mod tests {
             gm_connection: "up".to_string(),
             rejection_cooldown_until: None,
             refresh: None,
-            reg_subscription: "confirmed, expires 2026-10-14T11:02:11+00:00".to_string(),
+            reg_subscription: "confirmed, expires 2026-10-14T11:02:11Z".to_string(),
             reg_subscription_last_failure: Some((
                 1_699_999_500,
                 "accepted but no NOTIFY within 128s".to_string(),
@@ -835,7 +835,7 @@ mod tests {
             last_failure: None,
             can_answer: false,
             blocked_reason: Some("not registered".to_string()),
-            gm_connection: "reconnecting since 2026-08-07T10:14:03+00:00 (attempt 2)".to_string(),
+            gm_connection: "reconnecting since 2026-08-07T10:14:03Z (attempt 2)".to_string(),
             rejection_cooldown_until: Some(1_700_001_800),
             refresh: None,
             reg_subscription: "none".to_string(),

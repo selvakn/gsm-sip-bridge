@@ -260,7 +260,7 @@ does a full reset, regardless of `restart_mode`). See
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `true` | Master switch |
-| `cron` | string | `0 1 * * *` | Standard 5-field cron expression in system local time. Invalid expressions disable the scheduler without aborting the daemon. |
+| `cron` | string | `0 1 * * *` | Standard 5-field cron expression (`minute hour day-of-month month day-of-week`) in system local time. Day-of-week `0` and `7` are Sunday, `1` is Monday; names (`MON-FRI`) work too. When both day-of-month and day-of-week are restricted, a day must match both. `L`, `W`, `#` and `?` are accepted; a seconds or year field is not. A time skipped by a daylight-saving change does not run that day; a repeated hour runs once. Invalid expressions disable the scheduler without aborting the daemon. |
 | `start_jitter_seconds` | integer | `600` | Symmetric jitter on the cycle start time. Range 0–86400; 0 disables. |
 | `inter_card_gap_seconds` | integer | `30` | Base wait between consecutive per-card restarts. Range 0–3600. |
 | `inter_card_gap_jitter_seconds` | integer | `15` | Symmetric jitter on the inter-card gap; must be ≤ `inter_card_gap_seconds`. |

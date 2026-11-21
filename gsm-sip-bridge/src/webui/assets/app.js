@@ -680,12 +680,12 @@
       container.appendChild(results);
 
       function loadSummary() {
-        api("/api/calls/summary").then(function (s) {
+        // "Today" is this browser's day, like every time the UI shows.
+        var midnight = new Date();
+        midnight.setHours(0, 0, 0, 0);
+        api("/api/calls/summary?since=" + encodeURIComponent(midnight.toISOString())).then(function (s) {
           clear(summary);
-          // "Today" is counted from the bridge host's midnight, which need not
-          // be this browser's, so say whose.
-          var offset = s.host_utc_offset && s.host_utc_offset !== "+00:00" ? "UTC" + s.host_utc_offset : "UTC";
-          var today = tile("Today (bridge host time, " + offset + ")", s.today);
+          var today = tile("Today", s.today);
           today.appendChild(directionLine("In", s.by_direction.inbound));
           today.appendChild(directionLine("Out", s.by_direction.outbound));
           var u = s.by_direction.unknown;

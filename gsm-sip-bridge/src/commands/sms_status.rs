@@ -19,7 +19,7 @@ pub fn run(cli: &Cli, json: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     let sum = match read(&config.sms.db_path, now) {
         Ok(s) => s,
         Err(e) => {
@@ -59,8 +59,8 @@ fn duration(secs: i64) -> String {
 }
 
 fn at(ts: Option<i64>) -> String {
-    ts.and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-        .map(|d| d.format("%Y-%m-%dT%H:%MZ").to_string())
+    ts.and_then(|t| jiff::Timestamp::from_second(t).ok())
+        .map(|d| d.strftime("%Y-%m-%dT%H:%MZ").to_string())
         .unwrap_or_else(|| "-".into())
 }
 

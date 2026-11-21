@@ -42,7 +42,7 @@ impl CallRecord {
     pub fn outbound(
         module_id: &str,
         destination: &str,
-        started_at: chrono::DateTime<chrono::Utc>,
+        started_at: jiff::Timestamp,
         duration_seconds: f64,
         status: &str,
         transport: Transport,
@@ -50,7 +50,7 @@ impl CallRecord {
         Self {
             module_id: module_id.to_string(),
             caller_id: destination.to_string(),
-            started_at: started_at.to_rfc3339(),
+            started_at: started_at.to_string(),
             duration_seconds,
             status: status.to_string(),
             sip_destination: String::new(),

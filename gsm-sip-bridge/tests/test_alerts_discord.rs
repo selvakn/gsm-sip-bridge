@@ -4,11 +4,11 @@
 //! third-party service Constitution Principle I carves out as impractical to
 //! run for real in tests.
 
-use chrono::Utc;
 use gsm_sip_bridge::alerts::discord::DiscordClient;
 use gsm_sip_bridge::alerts::{dispatch, AlertCategory, CriticalEvent, CriticalEventKind};
 use gsm_sip_bridge::config::secret::Secret;
 use gsm_sip_bridge::config::{AlertsConfig, CategoryAlertConfig};
+use jiff::Timestamp;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -63,7 +63,7 @@ fn module_lifecycle_event() -> CriticalEvent {
         unit_id: Some("card0".to_string()),
         description: "SIM unreadable after 5 recovery attempts".to_string(),
         phone_number: None,
-        at: Utc::now(),
+        at: Timestamp::now(),
         kind: CriticalEventKind::Failure,
     }
 }
@@ -103,7 +103,7 @@ async fn send_alert_embed_includes_instance_footer_and_phone_field() {
         unit_id: Some("ec20-A1B2C3".to_string()),
         description: "SIM unreadable".to_string(),
         phone_number: Some("+919000000001".to_string()),
-        at: Utc::now(),
+        at: Timestamp::now(),
         kind: CriticalEventKind::Failure,
     };
     client.send_alert(&webhook, &event).await.unwrap();
@@ -213,7 +213,7 @@ async fn dispatch_posts_tunnel_and_registration_alerts_independently() {
             unit_id: Some("line0".to_string()),
             description: "tunnel non-established for 300s".to_string(),
             phone_number: None,
-            at: Utc::now(),
+            at: Timestamp::now(),
             kind: CriticalEventKind::Failure,
         },
     )
@@ -226,7 +226,7 @@ async fn dispatch_posts_tunnel_and_registration_alerts_independently() {
             unit_id: Some("line0".to_string()),
             description: "unregistered for 300s".to_string(),
             phone_number: None,
-            at: Utc::now(),
+            at: Timestamp::now(),
             kind: CriticalEventKind::Failure,
         },
     )
@@ -267,7 +267,7 @@ async fn dispatch_posts_line_discovery_failed_and_its_recovery_pair() {
                 "configured VoWiFi line /dev/ttyUSB3 was not found after 3m of retrying discovery"
                     .to_string(),
             phone_number: None,
-            at: Utc::now(),
+            at: Timestamp::now(),
             kind: CriticalEventKind::Failure,
         },
     )
@@ -288,7 +288,7 @@ async fn dispatch_posts_line_discovery_failed_and_its_recovery_pair() {
             unit_id: Some(identifier.to_string()),
             description: "configured VoWiFi line /dev/ttyUSB3 was found and started after previously being reported as not found".to_string(),
             phone_number: None,
-            at: Utc::now(),
+            at: Timestamp::now(),
             kind: CriticalEventKind::Recovered,
         },
     )
@@ -329,7 +329,7 @@ async fn dispatch_skips_disabled_line_discovery_failed_without_any_http_call() {
             unit_id: Some("/dev/ttyUSB3".to_string()),
             description: "configured VoWiFi line /dev/ttyUSB3 was not found".to_string(),
             phone_number: None,
-            at: Utc::now(),
+            at: Timestamp::now(),
             kind: CriticalEventKind::Failure,
         },
     )
@@ -362,7 +362,7 @@ async fn dispatch_posts_missed_call_alert() {
             unit_id: Some("card0".to_string()),
             description: "call from +911234567890 was never answered".to_string(),
             phone_number: None,
-            at: Utc::now(),
+            at: Timestamp::now(),
             kind: CriticalEventKind::Failure,
         },
     )
@@ -395,7 +395,7 @@ async fn dispatch_skips_disabled_category_without_any_http_call() {
             unit_id: Some("card0".to_string()),
             description: "call from +911234567890 was never answered".to_string(),
             phone_number: None,
-            at: Utc::now(),
+            at: Timestamp::now(),
             kind: CriticalEventKind::Failure,
         },
     )

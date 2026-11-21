@@ -48,7 +48,7 @@ pub struct SmsForwardingByTimeUpdate {
 }
 
 pub fn insert_sms(conn: &Connection, record: &SmsRecord) -> BridgeResult<()> {
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     // `attempt_count > 0` is what marks a row as delivery-tracked (so
     // `sms-status` and the gauges count it even with retry off); rows that
     // predate v5 keep 0 and are history. Only retry-eligible rows take a lease.

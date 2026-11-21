@@ -46,11 +46,12 @@ libc = "0.2"
 crossbeam-channel = "0.5"
 rusb = { version = "0.9", features = ["vendored"] }
 serialport = "4"
-chrono = { version = "0.4", features = ["serde"] }
+jiff = "0.2.46"
 once_cell = "1"
 thiserror = "2"
 serde_json = "1"
-cron = "0.17"
+# croner's default features pull in a second date-time library; jiff only.
+croner = { version = "4.0.3", default-features = false, features = ["jiff"] }
 rand = "0.10"
 md-5 = "0.11"
 base64 = "0.23"

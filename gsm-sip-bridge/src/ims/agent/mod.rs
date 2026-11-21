@@ -74,7 +74,7 @@ use crate::observability::reporter::Reporter;
 use crate::store::StoreHandle;
 use crate::vowifi::control::{read_msg, reason, write_msg, ControlMessage};
 use crate::vowifi::VETH_SIP_PORT;
-use chrono::Utc;
+use jiff::Timestamp;
 use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::PathBuf;
@@ -1638,7 +1638,7 @@ fn handle_message(
     let msg = ControlMessage::SmsReceived {
         sender: sender.clone(),
         body,
-        received_at: chrono::Utc::now().to_rfc3339(),
+        received_at: jiff::Timestamp::now().to_string(),
     };
     let relayed = match TcpStream::connect_timeout(&p.control_addr, CONTROL_TIMEOUT) {
         Ok(mut control) => match write_msg(&mut control, &msg) {
@@ -1753,7 +1753,7 @@ fn deliver_flushed_part(p: &DispatchParams, part: &crate::volte::sms::QueuedFlus
     let msg = ControlMessage::SmsReceived {
         sender: sender.to_string(),
         body,
-        received_at: chrono::Utc::now().to_rfc3339(),
+        received_at: jiff::Timestamp::now().to_string(),
     };
     match TcpStream::connect_timeout(&p.control_addr, CONTROL_TIMEOUT) {
         Ok(mut control) => match write_msg(&mut control, &msg) {
@@ -2352,7 +2352,7 @@ impl LoopState {
                 tracing::warn!(
                     cooldown_secs = hold.as_secs(),
                     retry_after_secs = deregistration.retry_after.map(|r| r.as_secs()),
-                    next_attempt_at = %chrono::DateTime::<Utc>::from(until_wall).to_rfc3339(),
+                    next_attempt_at = %crate::ims::rfc3339(until_wall),
                     "the network rejected our registration; holding off"
                 );
                 Ok(())
@@ -3404,7 +3404,7 @@ impl LoopState {
                 CallStatus::Failed,
                 BridgeFailureReason::BridgeSetupFailed,
                 &extract_caller(req),
-                Utc::now(),
+                Timestamp::now(),
             );
             return;
         }
@@ -3434,7 +3434,7 @@ impl LoopState {
                 CallStatus::Failed,
                 BridgeFailureReason::AgentUnreachable,
                 &extract_caller(req),
-                Utc::now(),
+                Timestamp::now(),
             );
             return;
         }
@@ -3497,7 +3497,7 @@ impl LoopState {
                     CallStatus::Failed,
                     BridgeFailureReason::AgentUnreachable,
                     &extract_caller(req),
-                    Utc::now(),
+                    Timestamp::now(),
                 );
             }
         }
@@ -3795,7 +3795,7 @@ impl LoopState {
         let reason = match (&deregistration, &self.rejection) {
             (Some(d), Some(r)) if d.event == DeregEvent::Rejected => format!(
                 "the network rejected our registration (reg-event rejected); next attempt at {}",
-                chrono::DateTime::<Utc>::from(r.until_wall).to_rfc3339()
+                crate::ims::rfc3339(r.until_wall)
             ),
             (Some(d), _) => format!(
                 "the network deregistered our binding (reg-event {})",
