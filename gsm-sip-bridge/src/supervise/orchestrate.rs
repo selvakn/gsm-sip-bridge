@@ -20,7 +20,7 @@ use super::shutdown::{self, StartedState};
 use super::{daemon_supervisor, epdg_iface, sim_recovery, vpcd};
 use crate::alerts::{self, discord::DiscordClient, AlertContext};
 use crate::config::secret::Secret;
-use crate::config::{AppConfig, TunnelAddressFamily};
+use crate::config::{AppConfig, PcscdMode, TunnelAddressFamily};
 use crate::vowifi::discovery::LineResolutionEntry;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -335,51 +335,12 @@ fn start_vowifi_subsystem(
         // over empty vpcd slots ("SCardConnect: No smart card
         // inserted") before reaching the real one.
         let needs_vpcd = needs_vpcd_reader(vowifi_lines);
-        if needs_vpcd {
-            vpcd::write_vpcd_reader_conf(runner.as_ref(), config.vowifi.vpcd_port);
-            println!(
-                "[supervise] starting shared pcscd; one vpcd reader, slots from {}",
-                config.vowifi.vpcd_port
-            );
+        if let Some(handle) = start_pass_pcscd(runner.as_ref(), config, needs_vpcd)? {
+            started.lock().unwrap().pcscd = Some(handle);
         }
-        // Retries the whole spawn+ready cycle rather than failing on the
-        // first hiccup (github.com/selvakn/gsm-sip-bridge/issues/53): a
-        // force-killed container's old pcscd can still be holding this
-        // host-shared port (`network_mode: host`) for a brief window after
-        // `docker kill` returns, and a single attempt had no way to tell
-        // that transient race apart from a genuinely misconfigured port.
-        let pcscd_handle = match vpcd::start_pcscd_with_retries(
-            runner.as_ref(),
-            needs_vpcd,
-            &config.vowifi.vpcd_host,
-            config.vowifi.vpcd_port,
-        ) {
-            Ok(handle) => Arc::new(handle),
-            Err(vpcd::StartPcscdError::SpawnFailed) => {
-                return Err("failed to start pcscd".to_string());
-            }
-            Err(vpcd::StartPcscdError::NotReady(other)) => {
-                return Err(format!(
-                        "pcscd's vpcd reader never came up on {}:{} after {} attempt(s) ({other:?}). \
-                         If pcscd logged 'Address in use', another process holds that port — pick a \
-                         [vowifi].vpcd_port below the ephemeral range.",
-                        config.vowifi.vpcd_host,
-                        config.vowifi.vpcd_port,
-                        vpcd::PCSCD_STARTUP_ATTEMPTS
-                    ));
-            }
-        };
-        started.lock().unwrap().pcscd = Some(pcscd_handle.clone());
-
-        if needs_vpcd {
+        if !needs_vpcd {
             println!(
-                "[supervise] vpcd reader ready on {}:{}",
-                config.vowifi.vpcd_host, config.vowifi.vpcd_port
-            );
-        } else {
-            println!(
-                "[supervise] started shared pcscd; no vpcd reader \
-                 (all {} line(s) are card-reader-backed)",
+                "[supervise] no vpcd reader (all {} line(s) are card-reader-backed)",
                 vowifi_lines.len()
             );
         }
@@ -1088,6 +1049,14 @@ fn resolve_imsi(
 /// over PC/SC instead — keyed by the line's IMSI, which is exactly how
 /// `PcscTransport::connect` already picks that line's reader. That is why
 /// `mcc`/`mnc` are optional on a card-reader line rather than mandatory.
+/// How many times a card-reader line's PLMN read is tried before the line is
+/// given up. pcscd accepting connections does not mean it has enumerated
+/// the USB reader yet, and a host pcscd started by socket activation
+/// enumerates from scratch. 15 attempts 5 s apart give the reader about 70 s
+/// to show up before the line is skipped for the rest of the run.
+const PCSC_PLMN_READ_ATTEMPTS: u32 = 15;
+const PCSC_PLMN_READ_RETRY_DELAY: Duration = Duration::from_secs(5);
+
 fn resolve_mcc_mnc(
     runner: &dyn CommandRunner,
     bin: &str,
@@ -1096,26 +1065,85 @@ fn resolve_mcc_mnc(
     if !line.mcc.is_empty() && !line.mnc.is_empty() {
         return Some((line.mcc.clone(), line.mnc.clone()));
     }
-    let out = if line.pcsc_reader {
-        // Config validation guarantees a pcsc_reader line has an
-        // imsi_override — it is how the line names its own physical card.
-        let imsi = line.config.imsi_override.clone().unwrap_or_default();
-        runner
-            .run(&[bin, "vowifi-plmn", "--pcsc-imsi", &imsi])
-            .ok()?
-    } else {
-        runner
-            .run(&[bin, "vowifi-plmn", "--modem", &line.modem_port])
-            .ok()?
+    if !line.pcsc_reader {
+        return read_plmn_once(runner, &[bin, "vowifi-plmn", "--modem", &line.modem_port])
+            .map_err(|why| eprintln!("[supervise] line {}: vowifi-plmn failed: {why}", line.index))
+            .ok();
+    }
+    // Config validation guarantees a pcsc_reader line has an
+    // imsi_override — it is how the line names its own physical card.
+    let imsi = line.config.imsi_override.clone().unwrap_or_default();
+    let argv = [bin, "vowifi-plmn", "--pcsc-imsi", &imsi];
+    for attempt in 1..=PCSC_PLMN_READ_ATTEMPTS {
+        match read_plmn_once(runner, &argv) {
+            Ok(plmn) => return Some(plmn),
+            Err(why) => {
+                eprintln!(
+                    "[supervise] line {}: reading MCC/MNC from the card failed \
+                     (attempt {attempt}/{PCSC_PLMN_READ_ATTEMPTS}): {why}",
+                    line.index
+                );
+                if attempt < PCSC_PLMN_READ_ATTEMPTS {
+                    runner.sleep(PCSC_PLMN_READ_RETRY_DELAY);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Masks every run of 10 or more digits, keeping its first 5 (the PLMN
+/// part of an IMSI). `vowifi-plmn`'s error for a missing card lists the
+/// requested IMSI and every IMSI it saw, and reader names can carry ICCID-like
+/// serials; none of that belongs in the journal. A PLMN (`250 020`) and
+/// ordinary numbers are far shorter, so they pass through.
+fn mask_subscriber_ids(text: &str) -> String {
+    const MIN_RUN: usize = 10;
+    const KEEP: usize = 5;
+    let mut out = String::with_capacity(text.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.len() >= MIN_RUN {
+            out.push_str(&run[..KEEP]);
+            out.extend(std::iter::repeat_n('X', run.len() - KEEP));
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
     };
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
+/// One `vowifi-plmn` run: `Ok((mcc, mnc))`, or why it gave none — the
+/// command's own last stderr line when it has one, so a skipped line says
+/// why in the log instead of only "could not derive MCC/MNC".
+fn read_plmn_once(runner: &dyn CommandRunner, argv: &[&str]) -> Result<(String, String), String> {
+    let out = runner
+        .run(argv)
+        .map_err(|e| format!("could not run: {e}"))?;
     if !out.status.success() {
-        return None;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
+        return Err(match last {
+            Some(l) => mask_subscriber_ids(l.trim()),
+            None => format!("exited with {}", out.status),
+        });
     }
     let s = String::from_utf8_lossy(&out.stdout);
     let mut parts = s.split_whitespace();
-    let mcc = parts.next()?.to_string();
-    let mnc = parts.next()?.to_string();
-    Some((mcc, mnc))
+    match (parts.next(), parts.next()) {
+        (Some(mcc), Some(mnc)) => Ok((mcc.to_string(), mnc.to_string())),
+        _ => Err(format!("unexpected output {:?}", s.trim())),
+    }
 }
 
 fn resolve_epdg_ip(
@@ -1352,6 +1380,86 @@ mod swu_payload_tests {
         assert!(swu_payload_available(&marker, &dialer));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// Makes pcscd available for one pass (the main VoWiFi start or a priming
+/// pass) per `[vowifi].pcscd`, logging which one is used. Returns the
+/// handle of a pcscd this pass spawned, which the caller records in its
+/// teardown state; `None` means the host's own pcscd is used, which the
+/// bridge must never stop.
+pub(super) fn start_pass_pcscd(
+    runner: &dyn CommandRunner,
+    config: &AppConfig,
+    needs_vpcd: bool,
+) -> Result<Option<Arc<ChildHandle>>, String> {
+    let mode = config.vowifi.pcscd;
+    let socket = vpcd::pcscd_socket_path();
+    if needs_vpcd && mode != PcscdMode::External {
+        vpcd::write_vpcd_reader_conf(runner, config.vowifi.vpcd_port);
+        println!(
+            "[supervise] starting shared pcscd; one vpcd reader, slots from {}",
+            config.vowifi.vpcd_port
+        );
+    }
+    match vpcd::start_pcscd(
+        runner,
+        mode,
+        needs_vpcd,
+        &socket,
+        &config.vowifi.vpcd_host,
+        config.vowifi.vpcd_port,
+    ) {
+        Ok(vpcd::Pcscd::Managed(handle)) => {
+            if needs_vpcd {
+                println!(
+                    "[supervise] vpcd reader ready on {}:{}",
+                    config.vowifi.vpcd_host, config.vowifi.vpcd_port
+                );
+            } else {
+                println!(
+                    "[supervise] started shared pcscd ([vowifi].pcscd = {mode}); serving on {}",
+                    socket.display()
+                );
+            }
+            Ok(Some(Arc::new(handle)))
+        }
+        Ok(vpcd::Pcscd::External) => {
+            println!(
+                "[supervise] using the host's pcscd on {} ([vowifi].pcscd = {mode}); \
+                 the bridge does not start or stop it",
+                socket.display()
+            );
+            Ok(None)
+        }
+        Err(vpcd::StartPcscdError::SpawnFailed) => Err("failed to start pcscd".to_string()),
+        Err(vpcd::StartPcscdError::NotReady(vpcd::ReadyOutcome::SocketNotReady)) => Err(format!(
+            "pcscd never accepted connections on {} after {} attempt(s). Check /tmp/pcscd.log; \
+             if the host runs its own pcscd, set [vowifi].pcscd = \"external\" or stop the \
+             host's pcscd.socket.",
+            socket.display(),
+            vpcd::PCSCD_STARTUP_ATTEMPTS
+        )),
+        Err(vpcd::StartPcscdError::NotReady(other)) => Err(format!(
+            "pcscd's vpcd reader never came up on {}:{} after {} attempt(s) ({other:?}). \
+             If pcscd logged 'Address in use', another process holds that port — pick a \
+             [vowifi].vpcd_port below the ephemeral range.",
+            config.vowifi.vpcd_host,
+            config.vowifi.vpcd_port,
+            vpcd::PCSCD_STARTUP_ATTEMPTS
+        )),
+        Err(vpcd::StartPcscdError::ExternalCannotServeVpcd) => Err(
+            "[vowifi].pcscd = \"external\", but at least one line is modem-backed and needs \
+             the vpcd reader only the bridge's own pcscd provides; set [vowifi].pcscd = \
+             \"auto\" or \"managed\""
+                .to_string(),
+        ),
+        Err(vpcd::StartPcscdError::ExternalUnreachable) => Err(format!(
+            "[vowifi].pcscd = \"external\", but nothing accepts connections on {}; start the \
+             host's pcscd (e.g. `systemctl enable --now pcscd.socket`) or set \
+             [vowifi].pcscd = \"managed\"",
+            socket.display()
+        )),
     }
 }
 
@@ -4235,6 +4343,142 @@ mod tests {
             resolve_mcc_mnc(mock.as_ref(), "gsm-sip-bridge", &line),
             None
         );
+    }
+
+    #[test]
+    fn resolve_mcc_mnc_retries_a_card_read_until_the_reader_shows_up() {
+        // pcscd can accept connections before it has enumerated the USB
+        // reader: the first read fails, a later one succeeds.
+        use std::os::unix::process::ExitStatusExt;
+        let mock = Arc::new(MockCommandRunner::new());
+        let no_reader = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"Error: IMS error: no PC/SC reader has a card matching IMSI\n".to_vec(),
+        };
+        mock.set_run_output_sequence(
+            "gsm-sip-bridge vowifi-plmn --pcsc-imsi 404940123456789",
+            vec![no_reader.clone(), no_reader, ok_stdout("404 094\n")],
+        );
+        let mut line = pcsc_line(0);
+        line.mcc = String::new();
+        line.mnc = String::new();
+        assert_eq!(
+            resolve_mcc_mnc(mock.as_ref(), "gsm-sip-bridge", &line),
+            Some(("404".to_string(), "094".to_string()))
+        );
+        assert_eq!(
+            *mock.sleeps.lock().unwrap(),
+            vec![PCSC_PLMN_READ_RETRY_DELAY; 2]
+        );
+    }
+
+    #[test]
+    fn resolve_mcc_mnc_gives_a_card_line_up_after_a_bounded_number_of_reads() {
+        let mock = Arc::new(MockCommandRunner::new());
+        let mut line = pcsc_line(0);
+        line.mcc = String::new();
+        line.mnc = String::new();
+        assert_eq!(
+            resolve_mcc_mnc(mock.as_ref(), "gsm-sip-bridge", &line),
+            None
+        );
+        let reads = mock
+            .run_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|argv| argv.iter().any(|a| a == "vowifi-plmn"))
+            .count() as u32;
+        assert_eq!(reads, PCSC_PLMN_READ_ATTEMPTS);
+        assert_eq!(
+            mock.sleeps.lock().unwrap().len() as u32,
+            PCSC_PLMN_READ_ATTEMPTS - 1
+        );
+    }
+
+    #[test]
+    fn read_plmn_once_reports_the_commands_own_last_error_line() {
+        use std::os::unix::process::ExitStatusExt;
+        let mock = MockCommandRunner::new();
+        mock.set_run_output(
+            "x vowifi-plmn",
+            std::process::Output {
+                status: std::process::ExitStatus::from_raw(1 << 8),
+                stdout: Vec::new(),
+                stderr: b"INFO noise\nError: no PC/SC reader\n\n".to_vec(),
+            },
+        );
+        assert_eq!(
+            read_plmn_once(&mock, &["x", "vowifi-plmn"]),
+            Err("Error: no PC/SC reader".to_string())
+        );
+    }
+
+    #[test]
+    fn a_logged_plmn_error_masks_imsis_but_keeps_short_numbers() {
+        use std::os::unix::process::ExitStatusExt;
+        let mock = MockCommandRunner::new();
+        mock.set_run_output(
+            "x vowifi-plmn",
+            std::process::Output {
+                status: std::process::ExitStatus::from_raw(1 << 8),
+                stdout: Vec::new(),
+                stderr: b"Error: no PC/SC reader has a card matching IMSI 404940123456789 \
+                          (IMSIs seen: [\"919000000000001\"], port 7050)\n"
+                    .to_vec(),
+            },
+        );
+        let why = read_plmn_once(&mock, &["x", "vowifi-plmn"]).unwrap_err();
+        assert!(!why.contains("123456789"), "{why}");
+        assert!(!why.contains("000000001"), "{why}");
+        assert!(why.contains("IMSI 40494XXXXXXXXXX"), "{why}");
+        assert!(why.contains("port 7050"), "{why}");
+        assert_eq!(mask_subscriber_ids("250 020"), "250 020");
+        assert_eq!(mask_subscriber_ids("123456789"), "123456789");
+        assert_eq!(mask_subscriber_ids("1234567890"), "12345XXXXX");
+    }
+
+    #[test]
+    fn start_pass_pcscd_hands_back_no_handle_for_the_hosts_pcscd() {
+        // `None` keeps the host's pcscd out of the teardown plan: the bridge
+        // must never stop a pcscd it did not start.
+        let mock = MockCommandRunner::new();
+        mock.set_unix_connect_ok(&vpcd::pcscd_socket_path().to_string_lossy(), true);
+        let mut config = test_config();
+        config.vowifi.pcscd = PcscdMode::Auto;
+        assert_eq!(start_pass_pcscd(&mock, &config, false), Ok(None));
+        assert!(mock.spawn_specs.lock().unwrap().is_empty());
+        assert!(
+            !mock
+                .files
+                .lock()
+                .unwrap()
+                .contains_key(std::path::Path::new("/etc/reader.conf.d/vpcd")),
+            "no vpcd reader config for a card-reader-only pass"
+        );
+    }
+
+    #[test]
+    fn start_pass_pcscd_hands_back_the_handle_of_a_pcscd_it_spawned() {
+        let mock = MockCommandRunner::new();
+        mock.set_unix_connect_ok(&vpcd::pcscd_socket_path().to_string_lossy(), true);
+        let mut config = test_config();
+        config.vowifi.pcscd = PcscdMode::Managed;
+        let handle = start_pass_pcscd(&mock, &config, false).unwrap();
+        assert!(handle.is_some());
+        assert_eq!(mock.spawn_specs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn start_pass_pcscd_external_with_a_modem_line_is_a_startup_error() {
+        let mock = MockCommandRunner::new();
+        mock.set_unix_connect_ok(&vpcd::pcscd_socket_path().to_string_lossy(), true);
+        let mut config = test_config();
+        config.vowifi.pcscd = PcscdMode::External;
+        let err = start_pass_pcscd(&mock, &config, true).unwrap_err();
+        assert!(err.contains("modem-backed"), "{err}");
+        assert!(mock.spawn_specs.lock().unwrap().is_empty());
     }
 
     #[test]

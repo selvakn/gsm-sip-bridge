@@ -104,6 +104,53 @@ impl std::fmt::Display for TunnelAddressFamily {
     }
 }
 
+/// Who runs the pcscd smart-card daemon the strongswan engine's lines read
+/// their SIMs through (`[vowifi].pcscd`).
+///
+/// `Managed` is the original behaviour: `supervise` spawns its own pcscd,
+/// which is the only option inside the container image, where nothing else
+/// provides one, and the only option for a modem-backed line, whose SIM
+/// reaches pcscd through the vpcd virtual reader `supervise` configures.
+/// `External` uses a pcscd the host already provides (typically systemd's
+/// `pcscd.socket`), which is only possible when every line is
+/// card-reader-backed. `Auto` picks `External` when no line needs vpcd and
+/// something already answers on pcscd's socket, otherwise `Managed`. Two
+/// pcscd instances cannot coexist on one host: their control socket path is
+/// fixed at compile time (specs/013-multi-card-vowifi research §4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PcscdMode {
+    #[default]
+    Auto,
+    Managed,
+    External,
+}
+
+impl std::str::FromStr for PcscdMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "managed" => Ok(Self::Managed),
+            "external" => Ok(Self::External),
+            other => Err(format!(
+                "must be \"auto\", \"managed\" or \"external\", got {other:?}"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for PcscdMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Managed => "managed",
+            Self::External => "external",
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SipTransport {
     Udp,
@@ -1170,6 +1217,10 @@ pub struct VowifiConfig {
     /// range (`net.ipv4.ip_local_port_range`) — under `network_mode: host`
     /// an unrelated outbound connection can otherwise grab the port first.
     pub vpcd_port: u16,
+    /// Who runs pcscd — see [`PcscdMode`]. `#[serde(default)]` so a
+    /// line-resolution file from an older build reads as `Auto`.
+    #[serde(default)]
+    pub pcscd: PcscdMode,
     /// Diagnostic escape hatch: use this IMSI instead of reading it from the
     /// SIM via `vowifi-imsi` (`AT+CIMI`). Not a `[vowifi]` TOML key — set it
     /// on a `[[vowifi.line]]` entry instead.
@@ -1296,6 +1347,7 @@ impl Default for VowifiConfig {
             strongswan_if_id: 23,
             vpcd_host: "127.0.0.1".to_string(),
             vpcd_port: 15963,
+            pcscd: PcscdMode::Auto,
             imsi_override: None,
             imei_override: None,
             pcsc_reader: false,
@@ -2516,6 +2568,66 @@ password = "pass"
         let src = format!("{}\n[vowifi]\nvpcd_port = 20000\n", MINIMAL_TOML);
         let cfg = parse(&src);
         assert_eq!(cfg.vowifi.vpcd_port, 20000);
+    }
+
+    #[test]
+    fn vowifi_pcscd_defaults_to_auto_and_accepts_each_mode() {
+        assert_eq!(parse(MINIMAL_TOML).vowifi.pcscd, PcscdMode::Auto);
+        for (spelling, mode) in [
+            ("auto", PcscdMode::Auto),
+            ("managed", PcscdMode::Managed),
+            ("external", PcscdMode::External),
+        ] {
+            let cfg = parse(&format!(
+                "{MINIMAL_TOML}\n[vowifi]\npcscd = \"{spelling}\"\n"
+            ));
+            assert_eq!(cfg.vowifi.pcscd, mode);
+            assert_eq!(mode.to_string(), spelling);
+        }
+    }
+
+    #[test]
+    fn vowifi_pcscd_rejects_other_spellings_listing_the_accepted_ones() {
+        let err = try_parse(&format!("{MINIMAL_TOML}\n[vowifi]\npcscd = \"host\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("vowifi.pcscd"), "{err}");
+        assert!(err.contains("\"managed\""), "{err}");
+    }
+
+    #[test]
+    fn vowifi_pcscd_external_is_accepted_for_card_reader_lines_only() {
+        let pcsc_line =
+            "[[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404940123456789\"\n";
+        let ok = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nenabled = true\npcscd = \"external\"\n{pcsc_line}"
+        ));
+        assert_eq!(ok.vowifi.pcscd, PcscdMode::External);
+
+        let no_lines = try_parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nenabled = true\npcscd = \"external\"\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(no_lines.contains("discovered modems"), "{no_lines}");
+
+        let modem_line = try_parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nenabled = true\npcscd = \"external\"\n{pcsc_line}\
+             [[vowifi.line]]\nmodem_port = \"/dev/ttyUSB2\"\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(modem_line.contains("vowifi.line[1]"), "{modem_line}");
+
+        let swu = try_parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nenabled = true\ntunnel_engine = \"swu\"\npcscd = \"external\"\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(swu.contains("strongswan"), "{swu}");
+
+        // VoWiFi off: nothing will start, so nothing to object to.
+        parse(&format!("{MINIMAL_TOML}\n[vowifi]\npcscd = \"external\"\n"));
     }
 
     #[test]

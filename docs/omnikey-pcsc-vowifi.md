@@ -188,7 +188,50 @@ IKE_SA_INIT on UDP/500 — any reply (even `NO_PROPOSAL_CHOSEN` or
 
 A card-reader-only deployment (no modem-backed lines at all) needs no vpcd
 virtual reader, and `supervise` no longer provisions or waits for one — expect
-`started shared pcscd; no vpcd reader (all N line(s) are card-reader-backed)`.
+`no vpcd reader (all N line(s) are card-reader-backed)`. It does wait until
+pcscd accepts connections on its control socket, and a line whose MCC/MNC is
+read from the card retries that read every 5 seconds for about 70 seconds
+(logging the reason each time) before the line is skipped.
+
+## Running on a host with its own pcscd
+
+Inside the Docker image nothing else provides pcscd, so the bridge starts its
+own. Run the binary directly on a host (e.g. as a systemd service) and the
+distribution's pcscd is usually there too: Debian and Ubuntu enable
+`pcscd.socket`, which listens on the same `/run/pcscd/pcscd.comm`. Only one
+pcscd can use that path and a USB reader at a time.
+
+`[vowifi].pcscd` decides who runs it:
+
+- `auto` (default): if every line is a card-reader line and something already
+  accepts connections on `/run/pcscd/pcscd.comm`, the bridge uses that pcscd
+  and logs `using the host's pcscd on /run/pcscd/pcscd.comm`; otherwise it
+  starts its own, as before.
+- `external`: always use the host's pcscd. Card-reader lines only; startup
+  fails if nothing answers on the socket within about 10 s.
+- `managed`: always start the bridge's own pcscd. With a host
+  `pcscd.socket` still enabled, stop it (`systemctl disable --now
+  pcscd.socket`), or a later PC/SC client on the host can activate the
+  host's pcscd and take the reader away.
+
+The bridge never stops a pcscd it did not start. A distribution pcscd started
+by socket activation usually runs with `--auto-exit` and exits after a minute
+without clients; the next client starts it again, and it then has to
+enumerate the reader before it can serve it. This is not yet verified live
+with a VoWiFi line.
+
+An earlier run that started the bridge's own pcscd on such a host (any
+release before this setting, or `managed`) leaves systemd's socket
+unreachable: that pcscd replaced the socket file and removed it on exit.
+systemd still listens, but no client can reach it by path, so `auto` keeps
+starting the bridge's own pcscd and `external` fails at startup. `ss -xlp |
+grep pcscd.comm` then shows two listeners while the bridge runs, or the file
+is missing while it is stopped. Restore the socket once, with the bridge
+stopped:
+
+```bash
+sudo systemctl restart pcscd.socket
+```
 
 Note that `epdg.epc.mnc043.mcc404.pub.3gppnetwork.org` resolves to more than
 one address and DNS rotates the order; the line uses whichever `dig` returns
