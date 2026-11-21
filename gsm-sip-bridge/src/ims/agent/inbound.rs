@@ -713,8 +713,8 @@ pub(super) fn handle_invite(
                         veth.rtp_socket,
                         stop.clone(),
                         &meter,
-                        chosen.dtmf_payload_type,
-                        veth.codec.dtmf_payload_type,
+                        chosen.telephone_event(),
+                        veth.codec.telephone_event(),
                         rtcp_bundle.clone(),
                     );
                 }
@@ -861,11 +861,11 @@ pub(super) fn handle_invite(
 /// by calling the same functions `handle_invite` already calls, not by
 /// duplicating what they do.
 ///
-/// **Scope note (FR-002a)**: the offer this sends carries audio codecs
-/// only — no `telephone-event` (DTMF) and no RTCP, because
-/// [`sdp::build_offer`] (reused as-is from the origination path,
-/// research.md Decision 2) has never offered either. A deliberate,
-/// recorded residue, not an oversight.
+/// **Scope note (FR-002a)**: the offer this sends is the origination path's
+/// own (`origination::bridged_call_offer`, research.md Decision 2): audio codecs and
+/// `telephone-event`, so DTMF crosses when the caller's answer accepts it, but
+/// no RTCP. The missing RTCP is a deliberate, recorded residue, not an
+/// oversight.
 ///
 /// Eight parameters: `#[allow]` rather than a bundling struct, since this
 /// is a single-call-site internal helper — `handle_invite`'s own single
@@ -958,13 +958,8 @@ fn handle_offerless_invite(
         .map_err(|e| BridgeError::Ims(format!("IMS RTP local_addr failed: {e}")))?
         .port();
 
-    let session_id: u64 = rand::random::<u32>() as u64;
-    let our_offer = sdp::build_offer(
-        session.local_addr.ip(),
-        ims_rtp_port,
-        session_id,
-        sdp::CodecOffer::preferring_wideband(ctx.wideband && amr_safe::is_available()),
-    );
+    let our_offer =
+        super::origination::bridged_call_offer(session.local_addr.ip(), ims_rtp_port, ctx.wideband);
 
     let mut held = HeldMessages::new(&inbound.tx);
     let ring_outcome = await_pbx_answer(
@@ -1135,7 +1130,7 @@ fn handle_offerless_invite(
     let chosen = answer
         .as_ref()
         .ok()
-        .and_then(|a| sdp::offered_chosen_codec(a.codec));
+        .and_then(|a| sdp::offered_chosen_codec(a.codec, a.dtmf_payload_type));
     let (Ok(answer), Some(chosen)) = (answer, chosen) else {
         // FR-005/SC-002: the caller's device answered with something this
         // bridge cannot service — end the call explicitly, never silently.
@@ -1182,8 +1177,8 @@ fn handle_offerless_invite(
             veth.rtp_socket,
             stop.clone(),
             &meter,
-            chosen.dtmf_payload_type,
-            veth.codec.dtmf_payload_type,
+            chosen.telephone_event(),
+            veth.codec.telephone_event(),
             None,
         );
     }

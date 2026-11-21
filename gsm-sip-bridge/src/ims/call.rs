@@ -211,11 +211,14 @@ pub fn run_call(cfg: &CallConfig) -> BridgeResult<CallOutcome> {
         .port();
 
     let session_id: u64 = rand::random::<u32>() as u64;
+    // No `telephone-event`: this test call relays no DTMF, and its receive
+    // loop decodes every packet as audio.
     let offer = sdp::build_offer(
         session.local_addr.ip(),
         rtp_port,
         session_id,
         cfg.codec_offer,
+        false,
     );
 
     // `;user=phone` (RFC 3261 §19.1.1 / TS 24.229) tells the network this is

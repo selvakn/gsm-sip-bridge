@@ -63,7 +63,10 @@ re-bridging audio the modem has already decoded.
 - RTCP per RFC 3550 on the carrier leg. Carrier-reported loss, jitter and
   round-trip are logged per call and exported as metrics.
 - DTMF (RFC 4733) is forwarded across transcoding, and re-stamped when the two
-  legs negotiate different payload types.
+  legs negotiate different payload types. Each event's duration is re-counted
+  when the legs' `telephone-event` clocks differ (8 kHz and 16 kHz), so a
+  keypress keeps its length. On calls the bridge places, its offer to the
+  carrier includes `telephone-event` so the carrier's answer has one.
 - SMS over IMS per TS 23.040 and TS 24.011, including the TS 24.341 delivery
   report (RP-ACK) that some carriers require before they deliver messages.
 - In-dialog requests are matched against the call they name.

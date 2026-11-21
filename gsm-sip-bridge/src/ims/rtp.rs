@@ -100,6 +100,38 @@ pub fn parse_packet(data: &[u8]) -> Option<ParsedPacket<'_>> {
     })
 }
 
+/// Rescales an RFC 4733 `telephone-event` payload's duration (§2.3, bytes
+/// 2–3, counted in the event's own RTP clock) from a `from_hz` clock to a
+/// `to_hz` one, in place. A keypress crossing between legs whose events
+/// count in different clocks keeps its length in milliseconds: a 100 ms
+/// digit is 800 at 8 kHz and must become 1600 at 16 kHz, not stay 800 and
+/// last 50 ms. Saturates at the field's maximum, as RFC 4733 §2.5.2.3 has
+/// a long event do. Equal clocks, a zero clock, or a payload too short to
+/// be an event leave it as it is.
+pub fn rescale_event_duration(payload: &mut [u8], from_hz: u32, to_hz: u32) {
+    if from_hz == to_hz || from_hz == 0 || payload.len() < 4 {
+        return;
+    }
+    let duration = u64::from(u16::from_be_bytes([payload[2], payload[3]]));
+    let scaled = duration * u64::from(to_hz) / u64::from(from_hz);
+    let scaled = u16::try_from(scaled).unwrap_or(u16::MAX);
+    payload[2..4].copy_from_slice(&scaled.to_be_bytes());
+}
+
+/// [`rescale_event_duration`] on the payload of a whole RTP packet, for a
+/// relay that forwards the packet itself rather than re-originating it. A
+/// packet [`parse_packet`] rejects is left as it is.
+pub fn rescale_packet_event_duration(packet: &mut [u8], from_hz: u32, to_hz: u32) {
+    let Some(payload) = parse_packet(packet).map(|parsed| {
+        // `parsed.payload` borrows from `packet`: its offset in it.
+        let start = parsed.payload.as_ptr() as usize - packet.as_ptr() as usize;
+        start..start + parsed.payload.len()
+    }) else {
+        return;
+    };
+    rescale_event_duration(&mut packet[payload], from_hz, to_hz);
+}
+
 /// How often one direction's SSRC-change log can fire, at most (specs/044
 /// RTP-04, PR review 2026-08-27). A change is a legitimate RFC 3550 signal
 /// (a source restart) worth surfacing, but a peer alternating SSRC every
@@ -381,6 +413,54 @@ mod tests {
                         // a padding count larger than what's available.
         pkt[RTP_HEADER_LEN] = 200;
         assert!(parse_packet(&pkt).is_none());
+    }
+
+    /// RFC 4733 §2.3: event `5`, E=1, volume 10, duration 800 — 100 ms at
+    /// 8 kHz.
+    const DIGIT_5_100MS_AT_8K: [u8; 4] = [5, 0x80 | 10, 0x03, 0x20];
+
+    #[test]
+    fn an_events_duration_keeps_its_milliseconds_across_clocks() {
+        let mut event = DIGIT_5_100MS_AT_8K;
+        rescale_event_duration(&mut event, 8000, 16000);
+        assert_eq!(event, [5, 0x80 | 10, 0x06, 0x40], "1600 at 16 kHz");
+        rescale_event_duration(&mut event, 16000, 8000);
+        assert_eq!(event, DIGIT_5_100MS_AT_8K, "and back to 800 at 8 kHz");
+    }
+
+    #[test]
+    fn an_events_duration_is_unchanged_between_equal_clocks() {
+        let mut event = DIGIT_5_100MS_AT_8K;
+        rescale_event_duration(&mut event, 16000, 16000);
+        assert_eq!(event, DIGIT_5_100MS_AT_8K);
+    }
+
+    #[test]
+    fn a_rescaled_duration_saturates_at_the_fields_maximum() {
+        let mut event = [5, 10, 0xc0, 0x00]; // 49152 at 8 kHz
+        rescale_event_duration(&mut event, 8000, 16000);
+        assert_eq!(&event[2..], &[0xff, 0xff]);
+    }
+
+    #[test]
+    fn a_payload_too_short_for_an_event_is_left_alone() {
+        let mut short = [5u8, 10, 0x03];
+        rescale_event_duration(&mut short, 8000, 16000);
+        assert_eq!(short, [5, 10, 0x03]);
+    }
+
+    #[test]
+    fn a_packets_event_duration_is_rescaled_past_its_csrcs_and_padding() {
+        let mut pkt = build_packet(1, 100, 0x1234, 101, &[]);
+        pkt[0] |= 0x20 | 0x01; // P, and one CSRC
+        pkt.extend_from_slice(&0xdead_beef_u32.to_be_bytes());
+        pkt.extend_from_slice(&DIGIT_5_100MS_AT_8K);
+        pkt.extend_from_slice(&[0, 0, 0, 4]); // 4 bytes of padding
+        let mut expected = pkt.clone();
+        expected[RTP_HEADER_LEN + 4 + 2..RTP_HEADER_LEN + 4 + 4].copy_from_slice(&[0x06, 0x40]);
+
+        rescale_packet_event_duration(&mut pkt, 8000, 16000);
+        assert_eq!(pkt, expected, "only the duration changes");
     }
 
     #[test]

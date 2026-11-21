@@ -16,7 +16,7 @@ use super::veth::{spawn_relay, spawn_veth_uas_listener, VethUasResult, VETH_INVI
 use crate::error::BridgeResult;
 use crate::ims::body;
 use crate::ims::lifecycle::{BridgedCall, CallStage};
-use crate::ims::sdp::{self, NegotiatedCodec};
+use crate::ims::sdp;
 use crate::ims::sip_client::{random_hex, SipResponse};
 use crate::vowifi::control::{reason, write_msg, ControlMessage};
 use jiff::Timestamp;
@@ -148,11 +148,11 @@ pub(super) struct PendingOrigination {
     /// retried on a later provisional; the call just proceeds without early
     /// media, exactly as it did before this feature existed).
     early_media_sent: bool,
-    /// The codec the early SDP negotiated, captured alongside
+    /// The early SDP answer (codec and DTMF payload type), captured alongside
     /// `early_media_sent` — needed once `early_veth_rx` resolves (which can
     /// happen well before the real final response) to decide whether the
-    /// relay started then needs transcoding.
-    early_media_codec: Option<NegotiatedCodec>,
+    /// relay started then needs transcoding, and where it puts DTMF.
+    early_media_answer: Option<sdp::SdpAnswer>,
     /// Set once `early_veth_rx` resolves successfully and the audio relay
     /// actually starts — *not* merely once early media was attempted.
     /// Without this, early media was signaling-only: Agent B would pair and
@@ -255,12 +255,14 @@ enum OriginationStep {
         /// to wait for; `finish_origination` reuses `PendingOrigination::
         /// early_relay` instead of spawning or waiting for anything.
         veth_rx: Option<mpsc::Receiver<BridgeResult<VethUasResult>>>,
-        /// The codec the carrier answered with, carried to `finish_origination`
-        /// where the transcoding decision (and the "codec we never offered"
-        /// check) is made — kept in the same order as the old blocking path.
-        /// Unused when `veth_rx` is `None` (the relay's codecs were already
-        /// resolved during early media).
+        /// The codec and DTMF payload type the carrier answered with, carried
+        /// to `finish_origination` where the transcoding decision (and the
+        /// "codec we never offered" check) is made — kept in the same order as
+        /// the old blocking path. When `veth_rx` is `None` (the relay was
+        /// already started during early media), only checked against that
+        /// relay.
         answer_codec: sdp::NegotiatedCodec,
+        answer_dtmf_payload_type: Option<u8>,
     },
     /// A CANCEL is being sent (abandonment or our own timeout) and we are
     /// waiting for its outcome — a `487` for the INVITE (expected), or a `200`
@@ -309,6 +311,28 @@ pub(super) struct OriginationSetup {
     pub(super) originating_headers: crate::config::OriginatingHeaders,
 }
 
+/// The SDP offer this agent sends the carrier for a call it bridges: one it
+/// places ([`begin_origination`]) or one it answers that came without an offer
+/// (`inbound::handle_offerless_invite`).
+///
+/// Offering, not answering — "prefer wideband when available" for both
+/// carrier paths, rather than reusing `AnswerPreference`'s legacy/cellular
+/// split, which is about the *answer* fallback order (AMR-NB vs. PCMU) when
+/// the far end's own offer lacks AMR-WB — not applicable to what we ourselves
+/// offer here. With `telephone-event`: without it the carrier's answer has
+/// none, and the phone's keypresses have no payload type to reach the carrier
+/// on, so the relay drops them (a live outbound T2 call, 2026-11-18).
+pub(super) fn bridged_call_offer(local_ip: IpAddr, rtp_port: u16, wideband: bool) -> String {
+    let session_id: u64 = rand::random::<u32>() as u64;
+    sdp::build_offer(
+        local_ip,
+        rtp_port,
+        session_id,
+        sdp::CodecOffer::preferring_wideband(wideband && amr_safe::is_available()),
+        true,
+    )
+}
+
 /// Builds and sends the carrier INVITE and returns the in-flight state, or
 /// `None` (having told Agent B `CallFailed`) if it could not even be sent. The
 /// front half of the old `originate_and_bridge`, up to and including the
@@ -355,18 +379,7 @@ pub(super) fn begin_origination(
         }
     };
 
-    let session_id: u64 = rand::random::<u32>() as u64;
-    // Offering, not answering — "prefer wideband when available" for both
-    // carrier paths, rather than reusing `AnswerPreference`'s legacy/cellular
-    // split, which is about the *answer* fallback order (AMR-NB vs. PCMU)
-    // when the far end's own offer lacks AMR-WB — not applicable to what we
-    // ourselves offer here.
-    let offer = sdp::build_offer(
-        session.local_addr.ip(),
-        rtp_port,
-        session_id,
-        sdp::CodecOffer::preferring_wideband(setup.wideband && amr_safe::is_available()),
-    );
+    let offer = bridged_call_offer(session.local_addr.ip(), rtp_port, setup.wideband);
 
     // `;user=phone` (RFC 3261 §19.1.1 / TS 24.229): tells the network this is
     // a PSTN/mobile number, not a resolvable SIP address — the same header
@@ -451,7 +464,7 @@ pub(super) fn begin_origination(
         provisional_answer: None,
         early_veth_rx: None,
         early_media_sent: false,
-        early_media_codec: None,
+        early_media_answer: None,
         early_relay: None,
         early_veth_socket: None,
         callee_uri,
@@ -886,7 +899,7 @@ impl PendingOrigination {
                             ) {
                                 Ok(rx) => {
                                     self.early_veth_rx = Some(rx);
-                                    self.early_media_codec = Some(early_answer.codec);
+                                    self.early_media_answer = Some(early_answer);
                                     let _ = write_msg(
                                         &mut self.control,
                                         &ControlMessage::CallEarlyMedia {
@@ -1027,14 +1040,15 @@ impl PendingOrigination {
         );
         // What a carrier's session-refresh re-INVITE is later compared
         // against: the answer just parsed, and our own offer.
-        self.established_media = sdp::offered_chosen_codec(answer.codec).and_then(|chosen| {
-            EstablishedMedia::new(
-                self.offer_sdp.clone(),
-                &answer_text,
-                answer.remote_rtp,
-                chosen.payload_type,
-            )
-        });
+        self.established_media = sdp::offered_chosen_codec(answer.codec, answer.dtmf_payload_type)
+            .and_then(|chosen| {
+                EstablishedMedia::new(
+                    self.offer_sdp.clone(),
+                    &answer_text,
+                    answer.remote_rtp,
+                    chosen.payload_type,
+                )
+            });
 
         // specs/037-p-early-media: reuse the listener a provisional already
         // spawned, *if* it's still usable. Its `VETH_INVITE_TIMEOUT` clock
@@ -1128,6 +1142,7 @@ impl PendingOrigination {
             dialog,
             veth_rx,
             answer_codec: answer.codec,
+            answer_dtmf_payload_type: answer.dtmf_payload_type,
         };
         self.deadline = Instant::now() + VETH_INVITE_TIMEOUT;
         OriginationStatus::Pending
@@ -1202,10 +1217,13 @@ pub(super) fn tick_pending_origination(
             match rx.try_recv() {
                 Ok(Ok(veth_result)) => {
                     p.early_veth_rx = None;
-                    let early_codec = p
-                        .early_media_codec
-                        .expect("early_media_codec is always set alongside early_veth_rx");
-                    match sdp::offered_chosen_codec(early_codec) {
+                    let early_answer = p
+                        .early_media_answer
+                        .expect("early_media_answer is always set alongside early_veth_rx");
+                    match sdp::offered_chosen_codec(
+                        early_answer.codec,
+                        early_answer.dtmf_payload_type,
+                    ) {
                         // Clone both sockets: one clone of each goes into the
                         // relay, the originals stay available in `p` — the
                         // carrier one for the existing unconditional
@@ -1242,8 +1260,8 @@ pub(super) fn tick_pending_origination(
                                             veth_sock_clone,
                                             stop.clone(),
                                             &meter,
-                                            chosen.dtmf_payload_type,
-                                            veth_result.codec.dtmf_payload_type,
+                                            chosen.telephone_event(),
+                                            veth_result.codec.telephone_event(),
                                             // Originated calls are out of
                                             // scope for RTCP reporting
                                             // (specs/046-rtcp-reporting
@@ -1267,7 +1285,7 @@ pub(super) fn tick_pending_origination(
                             }
                         }
                         None => {
-                            tracing::warn!(call_id = %p.call_id, codec = early_codec.name(), "outbound: carrier's early SDP selected a codec we never offered; continuing without early media (FR-006)");
+                            tracing::warn!(call_id = %p.call_id, codec = early_answer.codec.name(), "outbound: carrier's early SDP selected a codec we never offered; continuing without early media (FR-006)");
                         }
                     }
                 }
@@ -1451,6 +1469,7 @@ fn finish_origination(
     let OriginationStep::AwaitingVeth {
         dialog,
         answer_codec,
+        answer_dtmf_payload_type,
         ..
     } = step
     else {
@@ -1468,27 +1487,29 @@ fn finish_origination(
     // underlying socket alive.
     let (stop, meter, carrier_codec_name, transcoding) = match (veth_result, early_relay) {
         (None, Some((stop, meter, early_chosen))) => {
-            match sdp::offered_chosen_codec(answer_codec) {
-                Some(final_chosen) if final_chosen.codec == early_chosen.codec => {
+            match sdp::offered_chosen_codec(answer_codec, answer_dtmf_payload_type) {
+                Some(final_chosen) if final_chosen == early_chosen => {
                     // The real 200 OK agrees with what the relay was already
-                    // built for — trust it, exactly as before this check
-                    // existed.
+                    // built for — codec and DTMF payload type — so trust it,
+                    // exactly as before this check existed.
                     let transcoding = early_veth_socket
                         .as_ref()
                         .is_some_and(|(_, vc)| early_chosen.codec != vc.codec);
                     (stop, meter, early_chosen.codec.name(), transcoding)
                 }
                 Some(final_chosen) => {
-                    // Real 200 OK selected a *different* codec than the early,
-                    // non-100rel provisional did (code review finding — RFC
-                    // 3264 doesn't bind them together, so this is legal, not a
-                    // carrier bug). Reusing the running relay here would feed
-                    // it RTP payloads its encoder/decoder pair was never built
-                    // for, corrupting or silently dropping audio rather than
-                    // erroring. Stop it and rebuild from the retained veth
-                    // socket instead — `rtp_socket` (the carrier side) is
-                    // already reconnected to the real answer's address by the
-                    // unconditional reconnect above this function's call site.
+                    // Real 200 OK selected a *different* codec (or DTMF payload
+                    // type) than the early, non-100rel provisional did (code
+                    // review finding — RFC 3264 doesn't bind them together, so
+                    // this is legal, not a carrier bug). Reusing the running
+                    // relay here would feed it RTP payloads its encoder/decoder
+                    // pair was never built for, corrupting or silently dropping
+                    // audio (or sending DTMF under a payload type the carrier
+                    // no longer expects) rather than erroring. Stop it and
+                    // rebuild from the retained veth socket instead —
+                    // `rtp_socket` (the carrier side) is already reconnected to
+                    // the real answer's address by the unconditional reconnect
+                    // above this function's call site.
                     stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     let Some((veth_sock, veth_codec)) = early_veth_socket else {
                         tracing::error!(
@@ -1526,8 +1547,8 @@ fn finish_origination(
                             veth_sock,
                             new_stop.clone(),
                             &new_meter,
-                            final_chosen.dtmf_payload_type,
-                            veth_codec.dtmf_payload_type,
+                            final_chosen.telephone_event(),
+                            veth_codec.telephone_event(),
                             // Originated calls are out of scope for RTCP
                             // reporting (specs/046-rtcp-reporting FR-023).
                             None,
@@ -1546,11 +1567,13 @@ fn finish_origination(
                         return None;
                     }
                     tracing::info!(
-                    call_id,
-                    old_codec = early_chosen.codec.name(),
-                    new_codec = final_chosen.codec.name(),
-                    "outbound: real 200 OK selected a different codec than early media; rebuilt the relay"
-                );
+                        call_id,
+                        old_codec = early_chosen.codec.name(),
+                        new_codec = final_chosen.codec.name(),
+                        old_dtmf_payload_type = ?early_chosen.dtmf_payload_type,
+                        new_dtmf_payload_type = ?final_chosen.dtmf_payload_type,
+                        "outbound: real 200 OK selected a different codec or DTMF payload type than early media; rebuilt the relay"
+                    );
                     (new_stop, new_meter, final_chosen.codec.name(), transcoding)
                 }
                 None => {
@@ -1603,13 +1626,13 @@ fn finish_origination(
                 }
             };
 
-            // `parse_answer` only returns which codec the answer picked
-            // (`NegotiatedCodec`), not a payload type — by RFC 3264, a re-used
-            // dynamic payload type on the answer must mean what *our own
-            // offer* said it meant, so there is nothing to re-parse.
+            // `parse_answer` only returns which codec (and DTMF payload type)
+            // the answer picked, not the codec's payload type — by RFC 3264, a
+            // re-used dynamic payload type on the answer must mean what *our
+            // own offer* said it meant, so there is nothing to re-parse.
             // Reconstructs the rest from what `sdp::build_offer` is known to
             // always send.
-            let chosen = match sdp::offered_chosen_codec(answer_codec) {
+            let chosen = match sdp::offered_chosen_codec(answer_codec, answer_dtmf_payload_type) {
                 Some(c) => c,
                 None => {
                     // Never offered — `sdp::build_offer` only ever lists
@@ -1655,8 +1678,8 @@ fn finish_origination(
                     veth.rtp_socket,
                     stop.clone(),
                     &meter,
-                    chosen.dtmf_payload_type,
-                    veth.codec.dtmf_payload_type,
+                    chosen.telephone_event(),
+                    veth.codec.telephone_event(),
                     // Originated calls are out of scope for RTCP reporting
                     // (specs/046-rtcp-reporting FR-023).
                     None,
@@ -1725,6 +1748,7 @@ fn finish_origination(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ims::sdp::NegotiatedCodec;
     use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 
     /// A connected loopback pair for `PendingOrigination::control` — the
@@ -1767,6 +1791,35 @@ mod tests {
         }
     }
 
+    /// Both offers this agent makes the carrier carry `telephone-event`, at
+    /// the rate of every codec offered — or a keypress on the bridged phone
+    /// never reaches the far end.
+    #[test]
+    fn the_bridged_call_offer_carries_dtmf() {
+        for wideband in [false, true] {
+            let offer = bridged_call_offer(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000, wideband);
+            assert!(
+                offer.contains("a=rtpmap:100 telephone-event/8000\r\n"),
+                "{offer}"
+            );
+            assert_eq!(
+                offer.contains("AMR-WB/16000"),
+                offer.contains("a=rtpmap:105 telephone-event/16000\r\n"),
+                "wideband events exactly when wideband audio is offered: {offer}"
+            );
+        }
+    }
+
+    /// A carrier's early SDP answer selecting PCMU, with no DTMF, its media at
+    /// `peer`.
+    fn pcmu_answer(peer: &UdpSocket) -> sdp::SdpAnswer {
+        sdp::SdpAnswer {
+            remote_rtp: peer.local_addr().unwrap(),
+            codec: NegotiatedCodec::Pcmu,
+            dtmf_payload_type: None,
+        }
+    }
+
     /// Returns the `ControlMessage` sender alongside the `PendingOrigination`
     /// — most callers just let it drop (equivalent to today's behavior,
     /// which never kept it), but `tick_pending_origination` treats a
@@ -1795,7 +1848,7 @@ mod tests {
             provisional_answer: None,
             early_veth_rx: None,
             early_media_sent: false,
-            early_media_codec: None,
+            early_media_answer: None,
             early_relay: None,
             early_veth_socket: None,
             callee_uri: "sip:9000000001@example.test".to_string(),
@@ -2244,7 +2297,7 @@ mod tests {
         p.rtp_socket
             .connect(carrier_peer.local_addr().unwrap())
             .unwrap();
-        p.early_media_codec = Some(NegotiatedCodec::Pcmu);
+        p.early_media_answer = Some(pcmu_answer(&carrier_peer));
         let (veth_tx, veth_rx) = mpsc::channel();
         p.early_veth_rx = Some(veth_rx);
 
@@ -2261,6 +2314,7 @@ mod tests {
                     payload_type: 0,
                     octet_aligned: false,
                     dtmf_payload_type: None,
+                    dtmf_clock_rate: None,
                 },
             }))
             .unwrap();
@@ -2369,7 +2423,7 @@ mod tests {
         p.rtp_socket
             .connect(carrier_peer.local_addr().unwrap())
             .unwrap();
-        p.early_media_codec = Some(NegotiatedCodec::Pcmu);
+        p.early_media_answer = Some(pcmu_answer(&carrier_peer));
         let (veth_tx, veth_rx) = mpsc::channel();
         p.early_veth_rx = Some(veth_rx);
         let veth_peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -2383,6 +2437,7 @@ mod tests {
                     payload_type: 0,
                     octet_aligned: false,
                     dtmf_payload_type: None,
+                    dtmf_clock_rate: None,
                 },
             }))
             .unwrap();

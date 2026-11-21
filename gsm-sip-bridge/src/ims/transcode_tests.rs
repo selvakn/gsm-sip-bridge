@@ -14,6 +14,7 @@ fn codec(codec: NegotiatedCodec, payload_type: u8) -> ChosenCodec {
         payload_type,
         octet_aligned: true,
         dtmf_payload_type: None,
+        dtmf_clock_rate: None,
     }
 }
 

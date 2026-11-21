@@ -762,6 +762,15 @@ finding.
       evidence any carrier or handset here has ever sent an offerless
       INVITE at all yet. The same class of documented residue RTP-01's
       FR-023a already established precedent for, not a silent gap.
+      **DTMF part closed (2026-11-18)**: the origination path had the same
+      gap, and it was found live: an outbound T2 call lost every keypress,
+      because an offer without `telephone-event` got an answer without it
+      and the transcoding relay dropped the phone's events silently.
+      `build_offer` now offers `telephone-event` at each audio rate (105 at
+      16 kHz, 100 at 8 kHz) on both the origination and this offerless path,
+      `parse_answer` reads the one the answer accepted, and
+      `offered_chosen_codec` hands it to the relay; a keypress with no
+      destination event type is now logged. RTCP is the residue that remains.
       **Code-review fix (2026-08-28)**: the ACK-wait drain loop originally
       recognized only an `ACK`, silently ignoring anything else — including
       a `BYE`. RFC 3261 §12.1.1 confirms a UAS-side dialog the moment the
