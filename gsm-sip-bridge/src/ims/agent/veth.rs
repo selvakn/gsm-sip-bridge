@@ -423,6 +423,7 @@ mod tests {
                 octet_aligned: false,
                 dtmf_payload_type: dtmf.map(|(pt, _)| pt),
                 dtmf_clock_rate: dtmf.map(|(_, clock)| clock),
+                mode_set: None,
             },
             Relabel::DtmfOnly,
         )
@@ -600,6 +601,7 @@ mod tests {
                     octet_aligned: false,
                     dtmf_payload_type: carrier_dtmf.map(|(pt, _)| pt),
                     dtmf_clock_rate: carrier_dtmf.map(|(_, clock)| clock),
+                    mode_set: None,
                 },
                 veth_dtmf,
                 None,

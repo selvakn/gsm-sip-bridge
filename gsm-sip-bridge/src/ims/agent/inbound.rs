@@ -1139,7 +1139,7 @@ fn handle_offerless_invite(
     let chosen = answer
         .as_ref()
         .ok()
-        .and_then(|a| sdp::offered_chosen_codec(a.codec, a.dtmf_payload_type));
+        .and_then(|a| sdp::offered_chosen_codec(a.codec, a.dtmf_payload_type, a.mode_set));
     let (Ok(answer), Some(chosen)) = (answer, chosen) else {
         // FR-005/SC-002: the caller's device answered with something this
         // bridge cannot service — end the call explicitly, never silently.

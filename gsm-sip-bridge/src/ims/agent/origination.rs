@@ -267,6 +267,8 @@ enum OriginationStep {
         /// relay.
         answer_codec: sdp::NegotiatedCodec,
         answer_dtmf_payload_type: Option<u8>,
+        /// The AMR `mode-set` the answer stated, if any.
+        answer_mode_set: Option<u16>,
     },
     /// A CANCEL is being sent (abandonment or our own timeout) and we are
     /// waiting for its outcome — a `487` for the INVITE (expected), or a `200`
@@ -1044,15 +1046,16 @@ impl PendingOrigination {
         );
         // What a carrier's session-refresh re-INVITE is later compared
         // against: the answer just parsed, and our own offer.
-        self.established_media = sdp::offered_chosen_codec(answer.codec, answer.dtmf_payload_type)
-            .and_then(|chosen| {
-                EstablishedMedia::new(
-                    self.offer_sdp.clone(),
-                    &answer_text,
-                    answer.remote_rtp,
-                    chosen.payload_type,
-                )
-            });
+        self.established_media =
+            sdp::offered_chosen_codec(answer.codec, answer.dtmf_payload_type, answer.mode_set)
+                .and_then(|chosen| {
+                    EstablishedMedia::new(
+                        self.offer_sdp.clone(),
+                        &answer_text,
+                        answer.remote_rtp,
+                        chosen.payload_type,
+                    )
+                });
 
         // specs/037-p-early-media: reuse the listener a provisional already
         // spawned, *if* it's still usable. Its `VETH_INVITE_TIMEOUT` clock
@@ -1147,6 +1150,7 @@ impl PendingOrigination {
             veth_rx,
             answer_codec: answer.codec,
             answer_dtmf_payload_type: answer.dtmf_payload_type,
+            answer_mode_set: answer.mode_set,
         };
         self.deadline = Instant::now() + VETH_INVITE_TIMEOUT;
         OriginationStatus::Pending
@@ -1227,6 +1231,7 @@ pub(super) fn tick_pending_origination(
                     match sdp::offered_chosen_codec(
                         early_answer.codec,
                         early_answer.dtmf_payload_type,
+                        early_answer.mode_set,
                     ) {
                         // Clone both sockets: one clone of each goes into the
                         // relay, the originals stay available in `p` — the
@@ -1473,6 +1478,7 @@ fn finish_origination(
         dialog,
         answer_codec,
         answer_dtmf_payload_type,
+        answer_mode_set,
         ..
     } = step
     else {
@@ -1493,10 +1499,12 @@ fn finish_origination(
         early_relay,
     ) {
         (None, Some((stop, meter, early_chosen, early_leg))) => {
-            match sdp::offered_chosen_codec(answer_codec, answer_dtmf_payload_type) {
+            match sdp::offered_chosen_codec(answer_codec, answer_dtmf_payload_type, answer_mode_set)
+            {
                 Some(final_chosen) if final_chosen == early_chosen => {
                     // The real 200 OK agrees with what the relay was already
-                    // built for — codec and DTMF payload type — so trust it,
+                    // built for — codec, DTMF payload type and AMR mode-set —
+                    // so trust it,
                     // exactly as before this check existed.
                     let transcoding = early_veth_socket
                         .as_ref()
@@ -1511,7 +1519,8 @@ fn finish_origination(
                 }
                 Some(final_chosen) => {
                     // Real 200 OK selected a *different* codec (or DTMF payload
-                    // type) than the early, non-100rel provisional did (code
+                    // type, or AMR mode-set) than the early, non-100rel
+                    // provisional did (code
                     // review finding — RFC 3264 doesn't bind them together, so
                     // this is legal, not a carrier bug). Reusing the running
                     // relay here would feed it RTP payloads its encoder/decoder
@@ -1652,7 +1661,11 @@ fn finish_origination(
             // own offer* said it meant, so there is nothing to re-parse.
             // Reconstructs the rest from what `sdp::build_offer` is known to
             // always send.
-            let chosen = match sdp::offered_chosen_codec(answer_codec, answer_dtmf_payload_type) {
+            let chosen = match sdp::offered_chosen_codec(
+                answer_codec,
+                answer_dtmf_payload_type,
+                answer_mode_set,
+            ) {
                 Some(c) => c,
                 None => {
                     // Never offered — `sdp::build_offer` only ever lists
@@ -1841,6 +1854,7 @@ mod tests {
             remote_rtp: peer.local_addr().unwrap(),
             codec: NegotiatedCodec::Pcmu,
             dtmf_payload_type: None,
+            mode_set: None,
         }
     }
 
@@ -2339,6 +2353,7 @@ mod tests {
                     octet_aligned: false,
                     dtmf_payload_type: None,
                     dtmf_clock_rate: None,
+                    mode_set: None,
                 },
             }))
             .unwrap();
@@ -2462,6 +2477,7 @@ mod tests {
                     octet_aligned: false,
                     dtmf_payload_type: None,
                     dtmf_clock_rate: None,
+                    mode_set: None,
                 },
             }))
             .unwrap();

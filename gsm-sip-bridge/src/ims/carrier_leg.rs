@@ -21,8 +21,8 @@ use super::sdp::{ChosenCodec, NegotiatedCodec};
 use std::sync::{Arc, Mutex};
 
 /// How the carrier leg's RTP is labelled for the codec the call runs: its
-/// payload type number, AMR framing, and `telephone-event` payload type and
-/// clock rate.
+/// payload type number, AMR framing and `mode-set`, and `telephone-event`
+/// payload type and clock rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CarrierLabels {
     pub payload_type: u8,
@@ -35,6 +35,10 @@ pub struct CarrierLabels {
     /// another rate as well as another number. `Some` exactly when
     /// `dtmf_payload_type` is.
     pub dtmf_clock_rate: Option<u32>,
+    /// The AMR modes agreed for the audio, as [`ChosenCodec::mode_set`]: a
+    /// re-offer can narrow them, and the transcoder then encodes in a mode
+    /// the new set allows. Meaningless for PCMU.
+    pub mode_set: Option<u16>,
 }
 
 impl CarrierLabels {
@@ -44,6 +48,7 @@ impl CarrierLabels {
             octet_aligned: chosen.octet_aligned,
             dtmf_payload_type: chosen.dtmf_payload_type,
             dtmf_clock_rate: chosen.dtmf_clock_rate,
+            mode_set: chosen.mode_set,
         }
     }
 
@@ -192,6 +197,7 @@ mod tests {
             octet_aligned,
             dtmf_payload_type: dtmf,
             dtmf_clock_rate: dtmf.map(|_| 16000),
+            mode_set: None,
         }
     }
 
@@ -206,6 +212,7 @@ mod tests {
                     octet_aligned: true,
                     dtmf_payload_type: Some(105),
                     dtmf_clock_rate: Some(16000),
+                    mode_set: None,
                 },
                 sending: true,
                 previous_audio: None,
@@ -234,6 +241,7 @@ mod tests {
             octet_aligned: false,
             dtmf_payload_type: Some(101),
             dtmf_clock_rate: Some(8000),
+            mode_set: None,
         };
         let leg = CarrierLeg::new(&pcmu, Relabel::DtmfOnly);
         let start = leg.state();

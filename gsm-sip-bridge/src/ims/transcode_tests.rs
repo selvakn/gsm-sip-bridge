@@ -15,6 +15,7 @@ fn codec(codec: NegotiatedCodec, payload_type: u8) -> ChosenCodec {
         octet_aligned: true,
         dtmf_payload_type: None,
         dtmf_clock_rate: None,
+        mode_set: None,
     }
 }
 
@@ -140,7 +141,7 @@ fn speech_payloads(kind: AmrKind, octet_aligned: bool, count: usize) -> Vec<Vec<
                     (position.mul_add(frequency, 0.0).sin() * 12_000.0) as i16
                 })
                 .collect();
-            let frame = encoder.encode(&pcm).unwrap();
+            let frame = encoder.encode(&pcm, encoder.preferred_mode()).unwrap();
             amr_rtp::frame_to_payload(&frame, kind, octet_aligned).unwrap()
         })
         .collect()
@@ -744,6 +745,7 @@ fn amr_wb_follows_a_relabel_to_bandwidth_efficient_framing_both_ways() {
             octet_aligned: false,
             dtmf_payload_type: None,
             dtmf_clock_rate: None,
+            mode_set: None,
         },
         sending: true,
         previous_audio: Some((96, true)),
@@ -793,6 +795,7 @@ fn a_retired_payload_type_is_no_longer_read_as_audio() {
             octet_aligned: false,
             dtmf_payload_type: None,
             dtmf_clock_rate: None,
+            mode_set: None,
         },
         sending: true,
         previous_audio: None,
@@ -806,4 +809,53 @@ fn a_retired_payload_type_is_no_longer_read_as_audio() {
     relay.downlink(&source_packet(11, 3_520, 102, &bandwidth_efficient[1]));
     let down = receive(&relay.pbx);
     assert_eq!((down.payload_type, down.payload.len()), (103, 640));
+}
+
+/// The uplink keeps to the carrier leg's `mode-set` (RFC 4867 §8.1): 12.65
+/// kbit/s while the set allows it, and the highest mode below once a re-offer
+/// narrows the set to modes 0 and 1 (code review finding). A carrier may
+/// discard frames outside the agreed set.
+#[test]
+fn the_uplink_encodes_within_the_carrier_legs_mode_set() {
+    let relay = Relay::start(
+        ChosenCodec {
+            mode_set: Some(0b111),
+            ..codec(NegotiatedCodec::AmrWb, 96)
+        },
+        codec(NegotiatedCodec::L16, 103),
+        REORDER_WAIT,
+    );
+    let tone: Vec<u8> = (0..amr_safe::FRAME_SAMPLES)
+        .flat_map(|i| (((i as f64 * 0.2).sin() * 8_000.0) as i16).to_be_bytes())
+        .collect();
+    let uplink_mode = |seq: u16| {
+        relay
+            .pbx
+            .send(&rtp::build_packet(
+                seq,
+                u32::from(seq) * 320,
+                0xb0b0,
+                103,
+                &tone,
+            ))
+            .unwrap();
+        let up = receive(&relay.carrier);
+        let frame = amr_rtp::payload_to_frame(&up.payload, AmrKind::Wb, true)
+            .expect("octet-aligned AMR-WB");
+        (frame[0] >> 3) & 0x0f
+    };
+    assert_eq!(uplink_mode(1), 2, "mode-set=0,1,2 allows 12.65 kbit/s");
+
+    let labels = relay.leg.state().labels;
+    assert!(relay.leg.set(super::super::carrier_leg::CarrierLegState {
+        labels: CarrierLabels {
+            mode_set: Some(0b11),
+            ..labels
+        },
+        sending: true,
+        previous_audio: None,
+    }));
+    // The relay reads the new labels after its next receive.
+    let _ = uplink_mode(2);
+    assert_eq!(uplink_mode(3), 1, "mode-set=0,1: 8.85 kbit/s");
 }

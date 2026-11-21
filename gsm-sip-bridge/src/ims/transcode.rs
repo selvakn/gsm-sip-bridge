@@ -41,12 +41,74 @@ use std::time::{Duration, Instant};
 /// How often a blocking `recv` wakes to re-check `stop`, bounding how
 /// quickly a hangup silences the relay. Matches `agent::RELAY_POLL_INTERVAL`.
 const RELAY_POLL_INTERVAL: Duration = Duration::from_millis(200);
-/// The rates we encode AMR at, one per flavour. Both are the usual VoLTE
-/// operating points and sit inside the `mode-set` carriers advertise. The far
-/// end signals its own mode per-frame and we decode whatever it sends, so
-/// these only govern our own encoding.
-const WB_ENCODE_MODE: amr_safe::Mode = amr_safe::Mode::R1265;
-const NB_ENCODE_MODE: amr_safe::NbMode = amr_safe::NbMode::R1220;
+/// The AMR mode we prefer to encode in, one per flavour: AMR-WB mode 2
+/// (12.65 kbit/s) and AMR mode 7 (12.2 kbit/s), the usual VoLTE operating
+/// points. A leg whose `mode-set` leaves the preferred mode out is encoded in
+/// another mode the set allows ([`encode_mode`]). The far end signals its own
+/// mode per frame and we decode whatever it sends, so these only govern our
+/// own encoding.
+const WB_PREFERRED_MODE: u8 = 2;
+const NB_PREFERRED_MODE: u8 = 7;
+
+/// The mode to encode in on a leg that agreed `mode_set` (bit `n` for mode
+/// `n`, `None` for every mode): `preferred` when the set includes it, or
+/// else the highest mode below it, or else the lowest above it. RFC 4867
+/// §8.1 has a sender keep to the agreed set; a carrier may discard frames
+/// outside it. A re-offer can narrow the set mid-call (code review finding),
+/// so the relay picks the mode again whenever the carrier leg's labels change.
+fn encode_mode(preferred: u8, mode_set: Option<u16>) -> u8 {
+    let Some(set) = mode_set.filter(|&set| set != 0) else {
+        return preferred;
+    };
+    let allowed = |mode: u8| set & (1 << mode) != 0;
+    if allowed(preferred) {
+        return preferred;
+    }
+    (0..preferred)
+        .rev()
+        .find(|&mode| allowed(mode))
+        .or_else(|| (preferred + 1..16).find(|&mode| allowed(mode)))
+        .unwrap_or(preferred)
+}
+
+/// The mode `kind` prefers to encode in.
+fn preferred_mode(kind: AmrKind) -> u8 {
+    match kind {
+        AmrKind::Nb => NB_PREFERRED_MODE,
+        AmrKind::Wb => WB_PREFERRED_MODE,
+    }
+}
+
+/// AMR-WB mode `mode` (0 to 8); anything higher is mode 8.
+fn wb_mode(mode: u8) -> amr_safe::Mode {
+    use amr_safe::Mode::*;
+    match mode {
+        0 => R660,
+        1 => R885,
+        2 => R1265,
+        3 => R1425,
+        4 => R1585,
+        5 => R1825,
+        6 => R1985,
+        7 => R2305,
+        _ => R2385,
+    }
+}
+
+/// AMR mode `mode` (0 to 7); anything higher is mode 7.
+fn nb_mode(mode: u8) -> amr_safe::NbMode {
+    use amr_safe::NbMode::*;
+    match mode {
+        0 => R475,
+        1 => R515,
+        2 => R590,
+        3 => R670,
+        4 => R740,
+        5 => R795,
+        6 => R1020,
+        _ => R1220,
+    }
+}
 /// Big enough for any payload either leg can send: the largest is one 20 ms
 /// L16/16000 frame, 320 samples × 2 bytes + RTP header.
 const RECV_BUF: usize = 2048;
@@ -150,18 +212,26 @@ enum AmrEncoder {
 
 impl AmrEncoder {
     /// Encode exactly one frame's worth of PCM (already at the codec's own
-    /// rate), returning the MIME-layout frame.
-    fn encode(&mut self, pcm: &[i16]) -> Option<Vec<u8>> {
+    /// rate) in mode `mode`, returning the MIME-layout frame.
+    fn encode(&mut self, pcm: &[i16], mode: u8) -> Option<Vec<u8>> {
         match self {
             Self::Nb(e) => {
                 let frame: [i16; amr_safe::NB_FRAME_SAMPLES] = pcm.try_into().ok()?;
-                Some(e.encode(NB_ENCODE_MODE, &frame))
+                Some(e.encode(nb_mode(mode), &frame))
             }
             Self::Wb(e) => {
                 let frame: [i16; amr_safe::FRAME_SAMPLES] = pcm.try_into().ok()?;
-                Some(e.encode(WB_ENCODE_MODE, &frame))
+                Some(e.encode(wb_mode(mode), &frame))
             }
         }
+    }
+
+    /// The mode this flavour prefers to encode in.
+    fn preferred_mode(&self) -> u8 {
+        preferred_mode(match self {
+            Self::Nb(_) => AmrKind::Nb,
+            Self::Wb(_) => AmrKind::Wb,
+        })
     }
 }
 
@@ -249,6 +319,8 @@ enum Encoder {
         encoder: AmrEncoder,
         kind: AmrKind,
         octet_aligned: bool,
+        /// The mode every frame is encoded in ([`encode_mode`]).
+        mode: u8,
     },
 }
 
@@ -257,18 +329,22 @@ impl Encoder {
         Ok(match amr_kind(leg.codec) {
             None if leg.codec == NegotiatedCodec::L16 => Self::L16,
             None => Self::Pcmu,
-            Some(kind) => Self::Amr {
-                encoder: match kind {
+            Some(kind) => {
+                let encoder = match kind {
                     AmrKind::Nb => AmrEncoder::Nb(amr_safe::NbEncoder::new().map_err(|e| {
                         BridgeError::Ims(format!("AMR-NB encoder init failed: {e}"))
                     })?),
                     AmrKind::Wb => AmrEncoder::Wb(amr_safe::WbEncoder::new().map_err(|e| {
                         BridgeError::Ims(format!("AMR-WB encoder init failed: {e}"))
                     })?),
-                },
-                kind,
-                octet_aligned: leg.octet_aligned,
-            },
+                };
+                Self::Amr {
+                    mode: encode_mode(encoder.preferred_mode(), leg.mode_set),
+                    encoder,
+                    kind,
+                    octet_aligned: leg.octet_aligned,
+                }
+            }
         })
     }
 
@@ -276,6 +352,22 @@ impl Encoder {
     fn set_octet_aligned(&mut self, framing: bool) {
         if let Self::Amr { octet_aligned, .. } = self {
             *octet_aligned = framing;
+        }
+    }
+
+    /// Encodes in a mode `mode_set` allows from now on (a carrier re-INVITE
+    /// can narrow it, `ims::carrier_leg`).
+    fn set_mode_set(&mut self, mode_set: Option<u16>) {
+        if let Self::Amr { encoder, mode, .. } = self {
+            *mode = encode_mode(encoder.preferred_mode(), mode_set);
+        }
+    }
+
+    /// The AMR mode frames are encoded in; `None` for PCMU and L16.
+    fn mode(&self) -> Option<u8> {
+        match self {
+            Self::Amr { mode, .. } => Some(*mode),
+            Self::Pcmu | Self::L16 => None,
         }
     }
 
@@ -288,8 +380,9 @@ impl Encoder {
                 encoder,
                 kind,
                 octet_aligned,
+                mode,
             } => {
-                let frame = encoder.encode(pcm)?;
+                let frame = encoder.encode(pcm, *mode)?;
                 amr_rtp::frame_to_payload(&frame, *kind, *octet_aligned)
             }
         }
@@ -432,6 +525,9 @@ pub fn spawn_transcoding_relay(
         carrier_codec = ?carrier.codec,
         carrier_payload_type = carrier.payload_type,
         carrier_octet_aligned = carrier.octet_aligned,
+        carrier_mode_set = ?carrier.mode_set,
+        carrier_encode_mode = ?amr_kind(carrier.codec)
+            .map(|kind| encode_mode(preferred_mode(kind), carrier.mode_set)),
         veth_codec = ?veth_codec.codec,
         veth_payload_type = veth_codec.payload_type,
         resampling = carrier_rate != veth_rate,
@@ -626,6 +722,7 @@ fn relay_direction(
                         src_codec.octet_aligned = labels.octet_aligned;
                         src_codec.dtmf_payload_type = labels.dtmf_payload_type;
                         src_codec.dtmf_clock_rate = labels.dtmf_clock_rate;
+                        src_codec.mode_set = labels.mode_set;
                         src_event_clock = event_clock(&src_codec);
                     }
                     CarrierEnd::Destination(_) => {
@@ -634,8 +731,10 @@ fn relay_direction(
                         dst_codec.dtmf_payload_type = labels.dtmf_payload_type;
                         dst_codec.dtmf_clock_rate = labels.dtmf_clock_rate;
                         dst_event_clock = event_clock(&dst_codec);
+                        dst_codec.mode_set = labels.mode_set;
                         sender.payload_type = labels.payload_type;
                         encoder.set_octet_aligned(labels.octet_aligned);
+                        encoder.set_mode_set(labels.mode_set);
                         dtmf_sender = match (dtmf_sender.take(), labels.dtmf_payload_type) {
                             (Some(mut events), Some(payload_type)) => {
                                 events.payload_type = payload_type;
@@ -652,6 +751,8 @@ fn relay_direction(
                     octet_aligned = labels.octet_aligned,
                     dtmf_payload_type = ?labels.dtmf_payload_type,
                     dtmf_clock_rate = ?labels.dtmf_clock_rate,
+                    mode_set = ?labels.mode_set,
+                    encode_mode = ?encoder.mode(),
                     "transcoding relay: the carrier leg's payload types changed"
                 );
                 applied_labels = labels;
@@ -917,7 +1018,26 @@ mod tests {
             octet_aligned: true,
             dtmf_payload_type,
             dtmf_clock_rate: dtmf_payload_type.map(|_| codec.sample_rate()),
+            mode_set: None,
         }
+    }
+
+    #[test]
+    fn the_encode_mode_keeps_to_the_mode_set() {
+        // No set, or one including the preferred mode: the preferred mode.
+        assert_eq!(encode_mode(WB_PREFERRED_MODE, None), 2);
+        assert_eq!(encode_mode(WB_PREFERRED_MODE, Some(0b1_1111_1111)), 2);
+        assert_eq!(encode_mode(WB_PREFERRED_MODE, Some(0b100)), 2);
+        // Otherwise the highest below it, then the lowest above it.
+        assert_eq!(encode_mode(WB_PREFERRED_MODE, Some(0b011)), 1);
+        assert_eq!(encode_mode(WB_PREFERRED_MODE, Some(0b001)), 0);
+        assert_eq!(encode_mode(WB_PREFERRED_MODE, Some(0b1_1000_0000)), 7);
+        assert_eq!(encode_mode(WB_PREFERRED_MODE, Some(1 << 8)), 8);
+        // AMR prefers its top mode, so any set gives its highest mode.
+        assert_eq!(encode_mode(NB_PREFERRED_MODE, Some(0b1001_0101)), 7);
+        assert_eq!(encode_mode(NB_PREFERRED_MODE, Some(0b0001_0101)), 4);
+        // An empty set (never produced by `sdp::amr_mode_set`) restricts nothing.
+        assert_eq!(encode_mode(WB_PREFERRED_MODE, Some(0)), 2);
     }
 
     #[test]
@@ -1741,6 +1861,7 @@ mod tests {
                 octet_aligned: false,
                 dtmf_payload_type: Some(100),
                 dtmf_clock_rate: Some(8000),
+                mode_set: None,
             },
             sending: true,
             previous_audio: Some((0, false)),

@@ -43,7 +43,12 @@
 //! below). An answer that fails the check means the refresh failed
 //! — there is no response to an `ACK` to decline it with — so the call is ended
 //! with `BYE`, as RFC 3261 §13.2.2.4 has a UAC do with an unacceptable offer in
-//! a `2xx`, rather than left with media neither side agreed on. An `ACK` that
+//! a `2xx`, rather than left with media neither side agreed on. An answer that
+//! changed the direction leaves this side's last SDP, its offer, saying
+//! `sendrecv` while the carrier's says `sendonly`; when the carrier then
+//! re-offers that SDP at the same version, the `sendrecv` offer is no valid
+//! answer to it (RFC 3264 §6.1), so it is answered with that SDP's next
+//! version stating the answering direction. An `ACK` that
 //! brings no answer this bridge can read (no body, or one that is not SDP) is
 //! a different case: nothing in it says the media changed, and the offer it
 //! answers was the SDP already in force, so the call carries on with the media
@@ -315,7 +320,13 @@ impl EstablishedMedia {
         let origin = sdp::origin_line(offer).map(normalized);
         if origin.as_deref() == Some(self.remote_origin.as_str()) {
             return match self.check_unchanged(offer) {
-                Ok(()) => ReinviteVerdict::Refresh,
+                Ok(()) if answers(self.remote_direction, self.local_direction) => {
+                    ReinviteVerdict::Refresh
+                }
+                Ok(()) => match self.restate_answer() {
+                    Ok(modification) => ReinviteVerdict::Modify(modification),
+                    Err(why) => ReinviteVerdict::Decline(why),
+                },
                 Err(why) => ReinviteVerdict::Decline(why),
             };
         }
@@ -323,6 +334,33 @@ impl EstablishedMedia {
             Ok(modification) => ReinviteVerdict::Modify(modification),
             Err(why) => ReinviteVerdict::Decline(why),
         }
+    }
+
+    /// The answer to an unchanged offer that the SDP this side last sent does
+    /// not answer: that SDP at its next version, stating the direction that
+    /// answers the carrier's (see [`sdp::restate_direction`]). This happens
+    /// after an offerless refresh whose `ACK` answer changed the direction:
+    /// what this side last sent was its offer, which a `sendonly` or
+    /// `inactive` answer leaves saying `sendrecv`. The media path is already
+    /// running as the carrier's answer says, so nothing else changes.
+    fn restate_answer(&self) -> Result<Modification, &'static str> {
+        let Some(leg) = &self.carrier_leg else {
+            return Err("the call's media relay cannot follow a session modification");
+        };
+        let local_direction = self.remote_direction.answered();
+        let answer = sdp::restate_direction(&self.local_sdp, local_direction)
+            .map_err(|_| "this side's previous SDP cannot be given a new version")?;
+        Ok(Modification {
+            answer,
+            local_direction,
+            remote_origin: self.remote_origin.clone(),
+            remote_direction: self.remote_direction,
+            remote_format: self.remote_format,
+            leg: CarrierLegState {
+                sending: local_direction.sends() && self.remote_direction.receives(),
+                ..leg.state()
+            },
+        })
     }
 
     /// The carrier's media address and direction in an offer at the same
@@ -943,6 +981,7 @@ pub(super) mod tests {
                 octet_aligned: true,
                 dtmf_payload_type: Some(105),
                 dtmf_clock_rate: Some(16000),
+                mode_set: None,
             },
             relabel,
         );
@@ -970,6 +1009,7 @@ pub(super) mod tests {
             octet_aligned: false,
             dtmf_payload_type: Some(103),
             dtmf_clock_rate: Some(16000),
+            mode_set: None,
         },
         sending: false,
         // The hold leaves 96 unlisted, so the carrier's late AMR-WB under it
@@ -1130,6 +1170,76 @@ pub(super) mod tests {
         assert_eq!(leg.state().labels.payload_type, 96, "labels unchanged");
     }
 
+    /// After an offerless refresh whose `ACK` answer held the call, the
+    /// carrier's next refresh re-offers that `sendonly` SDP unchanged. What
+    /// this side last sent was its `sendrecv` offer, which does not answer
+    /// `sendonly` (RFC 3264 §6.1), so the answer is that SDP's next version
+    /// saying `recvonly`; the relay stays held, and later refreshes resend it.
+    /// Code review finding.
+    #[test]
+    fn a_refresh_of_a_hold_answered_in_an_ack_is_answered_recvonly() {
+        for (held, answered) in [
+            ("a=sendonly\r\n", MediaDirection::RecvOnly),
+            ("a=inactive\r\n", MediaDirection::Inactive),
+        ] {
+            let (mut media, leg) = live_established(Relabel::Any);
+            let held_sdp =
+                LIVE_SETUP_ANSWER.replace("73193688 73193688", "73193688 73193689") + held;
+            assert_eq!(media.classify(None), ReinviteVerdict::OfferlessRefresh);
+            assert_eq!(media.take_answer(&held_sdp), Ok(()));
+            assert!(!leg.state().sending);
+            let before = leg.state();
+
+            let restated = modification(media.classify(Some(&held_sdp)));
+            assert_eq!(restated.local_direction(), answered);
+            let answer = sdp::parse_offer(restated.answer()).unwrap();
+            assert_eq!(answer.direction, answered, "{}", restated.answer());
+            assert_eq!(
+                sdp::origin_line(restated.answer()),
+                Some("o=- 2357052722 2357052723 IN IP4 192.0.2.67"),
+                "the next version of our offer"
+            );
+            assert_eq!(
+                restated
+                    .answer()
+                    .replace(answered.attribute(), "a=sendrecv"),
+                LIVE_OUR_OFFER.replace("2357052722 2357052722", "2357052722 2357052723"),
+                "nothing else changes"
+            );
+            assert_eq!(restated.leg(), before, "the relay stays as the ACK left it");
+
+            media.apply(&restated);
+            assert_eq!(leg.state(), before);
+            assert_eq!(
+                media.classify(Some(&held_sdp)),
+                ReinviteVerdict::Refresh,
+                "now answered by what this side last sent"
+            );
+            assert_eq!(media.local_sdp(), restated.answer());
+        }
+    }
+
+    /// A resume that narrows the running codec's `mode-set` is followed: the
+    /// relay's labels carry the new set, so the transcoder encodes within it
+    /// (RFC 4867 §8.1). Code review finding: it used to answer with the
+    /// offer's limits and go on sending 12.65 kbit/s.
+    #[test]
+    fn a_re_offer_narrowing_the_mode_set_is_passed_to_the_relay() {
+        let (media, _leg) = live_established(Relabel::Any);
+        let offer = LIVE_SETUP_ANSWER
+            .replace("73193688 73193688", "73193688 73193689")
+            .replace(
+                "a=fmtp:96 octet-align=1\r\n",
+                "a=fmtp:96 octet-align=1;mode-set=0,1\r\n",
+            );
+        let resume = modification(media.classify(Some(&offer)));
+        assert!(resume
+            .answer()
+            .contains("a=fmtp:96 octet-align=1;mode-set=0,1\r\n"));
+        assert_eq!(resume.leg().labels.mode_set, Some(0b11));
+        assert_eq!(resume.leg().labels.payload_type, 96);
+    }
+
     /// A hold that still lists the running format keeps it: no relabel.
     #[test]
     fn a_hold_listing_the_running_format_keeps_it() {
@@ -1145,6 +1255,7 @@ pub(super) mod tests {
                     octet_aligned: true,
                     dtmf_payload_type: Some(105),
                     dtmf_clock_rate: Some(16000),
+                    mode_set: None,
                 },
                 sending: false,
                 previous_audio: None,
@@ -1212,6 +1323,7 @@ pub(super) mod tests {
                     octet_aligned: true,
                     dtmf_payload_type: Some(105),
                     dtmf_clock_rate: Some(16000),
+                    mode_set: None,
                 },
                 sending: true,
                 previous_audio: Some((102, false)),
@@ -1417,6 +1529,7 @@ pub(super) mod tests {
                 octet_aligned: false,
                 dtmf_payload_type: Some(101),
                 dtmf_clock_rate: Some(8000),
+                mode_set: None,
             },
             Relabel::DtmfOnly,
         );
