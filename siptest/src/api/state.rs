@@ -169,6 +169,53 @@ pub struct SharedState {
     pub registration_config: crate::sip::registration::RegistrationConfig,
     pub inbound_policy: Mutex<InboundPolicy>,
     pub manual_decisions: Mutex<std::collections::HashMap<CallId, ManualDecision>>,
+    /// Where the inbound listener hands in-dialog requests (BYE, re-INVITE,
+    /// UPDATE...) for the outbound call currently in flight. `None` whenever
+    /// no outbound call is registered — see [`DialogRoute`].
+    pub dialog_route: Mutex<Option<DialogRoute>>,
+}
+
+/// Registered by an outbound call for its whole lifetime so the inbound
+/// listener — the only reader of unsolicited requests — can forward requests
+/// belonging to that call's dialog instead of treating them as strays.
+/// Bounded and non-blocking on the sending side: a stuck call must never
+/// stall the listener.
+pub struct DialogRoute {
+    pub sip_call_id: String,
+    pub tx: std::sync::mpsc::SyncSender<(
+        gsm_sip_bridge::ims::sip_client::SipRequest,
+        std::net::SocketAddr,
+    )>,
+}
+
+/// What [`DialogRoute::try_forward`] did with a request.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Forwarded {
+    /// Not part of this dialog: the caller handles it as it would any stray.
+    NotMine,
+    /// Queued for the call.
+    Queued,
+    /// Part of this dialog but not queued — the call's queue is full or the
+    /// call has already gone. Dropped (the peer retransmits) rather than
+    /// blocking the thread that answers every other caller.
+    Dropped,
+}
+
+impl DialogRoute {
+    /// Never blocks.
+    pub fn try_forward(
+        &self,
+        req: &gsm_sip_bridge::ims::sip_client::SipRequest,
+        peer: std::net::SocketAddr,
+    ) -> Forwarded {
+        if req.header("Call-ID") != Some(self.sip_call_id.as_str()) {
+            return Forwarded::NotMine;
+        }
+        match self.tx.try_send((req.clone(), peer)) {
+            Ok(()) => Forwarded::Queued,
+            Err(_) => Forwarded::Dropped,
+        }
+    }
 }
 
 impl SharedState {
@@ -207,6 +254,70 @@ mod tests {
             state: CallState::Inviting,
             ..dummy_call(id)
         }
+    }
+
+    fn request(method: &str, call_id: &str) -> gsm_sip_bridge::ims::sip_client::SipRequest {
+        gsm_sip_bridge::ims::sip_client::SipRequest {
+            method: method.to_string(),
+            request_uri: "sip:1002@127.0.0.1:5065".to_string(),
+            headers: vec![("Call-ID".to_string(), call_id.to_string())],
+            body: String::new(),
+            body_bytes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_route_only_takes_requests_of_its_own_dialog() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        let route = DialogRoute {
+            sip_call_id: "call-a".to_string(),
+            tx,
+        };
+        let peer: std::net::SocketAddr = "127.0.0.1:5060".parse().unwrap();
+
+        assert_eq!(
+            route.try_forward(&request("OPTIONS", "call-b"), peer),
+            Forwarded::NotMine
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "another dialog's request was queued"
+        );
+
+        assert_eq!(
+            route.try_forward(&request("BYE", "call-a"), peer),
+            Forwarded::Queued
+        );
+        let (queued, from) = rx.try_recv().expect("the BYE was queued");
+        assert_eq!((queued.method.as_str(), from), ("BYE", peer));
+    }
+
+    /// The listener is the only thread answering every other caller; a call
+    /// that stopped draining its queue must cost it nothing but a dropped
+    /// request.
+    #[test]
+    fn a_full_or_abandoned_queue_drops_the_request_instead_of_blocking() {
+        let peer: std::net::SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let route = DialogRoute {
+            sip_call_id: "call-a".to_string(),
+            tx,
+        };
+        assert_eq!(
+            route.try_forward(&request("INVITE", "call-a"), peer),
+            Forwarded::Queued
+        );
+        assert_eq!(
+            route.try_forward(&request("INVITE", "call-a"), peer),
+            Forwarded::Dropped,
+            "a full queue must not block"
+        );
+        drop(rx);
+        assert_eq!(
+            route.try_forward(&request("BYE", "call-a"), peer),
+            Forwarded::Dropped,
+            "a call that is gone must not block either"
+        );
     }
 
     /// Outbound and inbound admission share this one reservation, so whichever

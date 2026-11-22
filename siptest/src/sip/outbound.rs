@@ -84,11 +84,39 @@ pub fn place_call(
     rtp_port: u16,
     ring_timeout: Duration,
 ) -> SipTestResult<OutboundCallOutcome> {
+    place_call_with_call_id(
+        socket,
+        registrar_addr,
+        registrar_host,
+        from_user,
+        destination,
+        codec,
+        rtp_port,
+        ring_timeout,
+        &crate::sip::message::new_tag(),
+    )
+}
+
+/// [`place_call`] with the SIP `Call-ID` chosen by the caller, so it can be
+/// registered with the inbound listener (`api::state::DialogRoute`) *before*
+/// the INVITE leaves — a `BYE` can arrive the instant the `200` is ACKed.
+#[allow(clippy::too_many_arguments)]
+pub fn place_call_with_call_id(
+    socket: &SipSocket,
+    registrar_addr: SocketAddr,
+    registrar_host: &str,
+    from_user: &str,
+    destination: &str,
+    codec: CodecProfile,
+    rtp_port: u16,
+    ring_timeout: Duration,
+    call_id: &str,
+) -> SipTestResult<OutboundCallOutcome> {
     if !is_valid_destination(destination) {
         return Err(SipTestError::InvalidDestination(destination.to_string()));
     }
 
-    let call_id = crate::sip::message::new_tag();
+    let call_id = call_id.to_string();
     let from_tag = crate::sip::message::new_tag();
     let session_id: u64 = rand::random();
     let offer = sdp::build_offer(socket.local_ip, rtp_port, session_id, codec);

@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::api::state::{Counters, InboundMode, InboundPolicy, SharedState};
+use gsm_sip_bridge::ims::sip_client::SipRequest;
+
+use crate::api::state::{Counters, Forwarded, InboundMode, InboundPolicy, SharedState};
 use crate::config::Config;
 use crate::error::SipTestResult;
 use crate::sip::registration::{
@@ -97,6 +99,7 @@ fn run_with_config(config: Config) -> SipTestResult<()> {
             duration_secs: config.inbound.duration_secs,
         }),
         manual_decisions: Mutex::new(std::collections::HashMap::new()),
+        dialog_route: Mutex::new(None),
     });
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -167,6 +170,11 @@ pub fn inbound_listener_loop(state: Arc<SharedState>, stop: Arc<AtomicBool>) {
             tracing::warn!(%peer, "dropping SIP request from an unexpected source IP");
             continue;
         }
+        // A request belonging to the outbound call in flight goes to that
+        // call (its BYE, re-INVITE...), never to the stray handling below.
+        if forward_to_dialog(&state, &req, peer) {
+            continue;
+        }
         match req.method.as_str() {
             "OPTIONS" => {
                 let _ = state
@@ -198,6 +206,24 @@ pub fn inbound_listener_loop(state: Arc<SharedState>, stop: Arc<AtomicBool>) {
                     .sip_socket
                     .send(peer, &crate::sip::inbound::build_405(&req));
             }
+        }
+    }
+}
+
+/// Hands `req` to the outbound call whose dialog it belongs to, if one is
+/// registered (`SharedState::dialog_route`). Never blocks: see
+/// [`crate::api::state::Forwarded::Dropped`].
+fn forward_to_dialog(state: &SharedState, req: &SipRequest, peer: std::net::SocketAddr) -> bool {
+    let route = state.dialog_route.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(route) = route.as_ref() else {
+        return false;
+    };
+    match route.try_forward(req, peer) {
+        Forwarded::NotMine => false,
+        Forwarded::Queued => true,
+        Forwarded::Dropped => {
+            tracing::warn!(method = %req.method, "dropping an in-dialog request: the call's queue is full or gone");
+            true
         }
     }
 }

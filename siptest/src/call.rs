@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,7 @@ use gsm_sip_bridge::ims::sip_client::{
 };
 use serde::Serialize;
 
-use crate::api::state::{InboundMode, ManualDecision, SharedState};
+use crate::api::state::{DialogRoute, InboundMode, ManualDecision, SharedState};
 use crate::error::{SipTestError, SipTestResult};
 use crate::media::codec::{resolve_codec, select_inbound_codec};
 use crate::media::report::{
@@ -205,6 +206,17 @@ pub fn execute_outbound_call(
         serde_json::json!({"call_id": call_id.0, "state": "inviting", "destination": destination}),
     );
 
+    // The dialog's `Call-ID` is chosen here, and registered with the inbound
+    // listener *before* the INVITE leaves: a `BYE` can arrive the instant the
+    // 200 is ACKed, and without a route the listener would drop it as a
+    // stray. Cleared by `OutboundRun`'s `Drop` on every exit.
+    let sip_call_id = crate::sip::message::new_tag();
+    let (route_tx, route_rx) = std::sync::mpsc::sync_channel(DIALOG_ROUTE_DEPTH);
+    *state.dialog_route.lock().unwrap_or_else(|e| e.into_inner()) = Some(DialogRoute {
+        sip_call_id: sip_call_id.clone(),
+        tx: route_tx,
+    });
+
     // From here every exit — an error, an early `?`, a panic — must leave the
     // registry and the far end tidy; `OutboundRun`'s `Drop` guarantees it.
     let mut run = OutboundRun {
@@ -213,6 +225,8 @@ pub fn execute_outbound_call(
         dialog: None,
         failure: None,
         done: false,
+        sip_call_id,
+        route_rx: Some(route_rx),
     };
     match drive_outbound(
         state,
@@ -246,10 +260,36 @@ struct OutboundRun<'a> {
     dialog: Option<outbound::ConfirmedDialog>,
     failure: Option<String>,
     done: bool,
+    /// The SIP `Call-ID` of this call's dialog, registered as the listener's
+    /// [`DialogRoute`].
+    sip_call_id: String,
+    /// The receiving end of that route, taken by the media phase's watcher.
+    route_rx: Option<Receiver<(SipRequest, SocketAddr)>>,
 }
+
+/// How many in-dialog requests may queue between the listener and the
+/// watcher. A call's dialog sees a handful at most; a full queue drops the
+/// newest rather than ever blocking the listener.
+const DIALOG_ROUTE_DEPTH: usize = 16;
 
 impl Drop for OutboundRun<'_> {
     fn drop(&mut self) {
+        // Always — a finished call must not leave a route behind to swallow
+        // some later request that happens to share its Call-ID. Only clear a
+        // route that is still ours.
+        {
+            let mut route = self
+                .state
+                .dialog_route
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if route
+                .as_ref()
+                .is_some_and(|r| r.sip_call_id == self.sip_call_id)
+            {
+                *route = None;
+            }
+        }
         if self.done {
             return;
         }
@@ -275,7 +315,7 @@ fn drive_outbound(
 ) -> SipTestResult<()> {
     let call_id = run.call.id.clone();
     let call = &mut run.call;
-    let outcome = outbound::place_call(
+    let outcome = outbound::place_call_with_call_id(
         &state.sip_socket,
         state.bridge_registrar,
         &state.config.sip.realm,
@@ -284,6 +324,7 @@ fn drive_outbound(
         codec,
         rtp_port,
         ring_timeout,
+        &run.sip_call_id,
     )?;
 
     if let Some(observed) = outcome.remote_target {
@@ -363,21 +404,41 @@ fn drive_outbound(
     let tone_enabled = state.config.media.tone_plan != "silence";
     let play = play_audio(&state.config, codec);
     let stop = Arc::new(AtomicBool::new(false));
-    let media_result = crate::media::session::run(
-        crate::media::session::MediaSessionConfig {
-            local_rtp,
-            remote_rtp,
-            codec,
-            duration,
-            sent_wav_path: sent_wav_path.clone(),
-            received_wav_path: received_wav_path.clone(),
-            tone_enabled,
-            play: play.clone(),
+    let route_rx = run
+        .route_rx
+        .take()
+        .expect("the dialog route's receiver is taken exactly once");
+    let (media_result, remote_bye) = crate::sip::dialog::watch_while(
+        &state.sip_socket,
+        &dialog.call_id,
+        &stop,
+        move |wait: Duration| route_rx.recv_timeout(wait).ok(),
+        || {
+            crate::media::session::run(
+                crate::media::session::MediaSessionConfig {
+                    local_rtp,
+                    remote_rtp,
+                    codec,
+                    duration,
+                    sent_wav_path: sent_wav_path.clone(),
+                    received_wav_path: received_wav_path.clone(),
+                    tone_enabled,
+                    play: play.clone(),
+                },
+                stop.clone(),
+            )
         },
-        stop,
-    )?;
+    );
+    if remote_bye {
+        // The far end ended the dialog; a BYE of ours — now or from the
+        // failure guard — would go to a dialog that no longer exists.
+        run.dialog = None;
+    }
+    let media_result = media_result?;
 
-    let _ = outbound::send_bye(&state.sip_socket, &dialog);
+    if !remote_bye {
+        let _ = outbound::send_bye(&state.sip_socket, &dialog);
+    }
 
     let packets = media_stats::verdict(
         media_result.sent_packets,
@@ -409,7 +470,11 @@ fn drive_outbound(
         recordings,
     ));
     call.state = CallState::Ended;
-    call.end_reason = Some(EndReason::DurationElapsed);
+    call.end_reason = Some(if remote_bye {
+        EndReason::RemoteBye
+    } else {
+        EndReason::DurationElapsed
+    });
 
     finish(state, call_id, call.clone());
     run.done = true;
@@ -703,25 +768,36 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
             let tone_enabled = state.config.media.tone_plan != "silence";
             let play = play_audio(&state.config, codec);
             let stop = Arc::new(AtomicBool::new(false));
-            let media_result = crate::media::session::run(
-                crate::media::session::MediaSessionConfig {
-                    local_rtp,
-                    remote_rtp: offer.remote_rtp,
-                    codec,
-                    duration,
-                    sent_wav_path: sent_wav_path.clone(),
-                    received_wav_path: received_wav_path.clone(),
-                    tone_enabled,
-                    play: play.clone(),
+            // This thread is the listener, so nothing else reads the
+            // socket's request queue: the watcher does, and answers a `BYE`
+            // (ending the media early), re-INVITEs and keepalives.
+            let (media_result, remote_bye) = crate::sip::dialog::watch_while(
+                &state.sip_socket,
+                &call_id_hdr,
+                &stop,
+                |wait: Duration| state.sip_socket.recv_request(wait).ok().flatten(),
+                || {
+                    crate::media::session::run(
+                        crate::media::session::MediaSessionConfig {
+                            local_rtp,
+                            remote_rtp: offer.remote_rtp,
+                            codec,
+                            duration,
+                            sent_wav_path: sent_wav_path.clone(),
+                            received_wav_path: received_wav_path.clone(),
+                            tone_enabled,
+                            play: play.clone(),
+                        },
+                        stop.clone(),
+                    )
                 },
-                stop,
             );
 
             // We initiate the BYE at the end of the configured duration —
-            // mirroring outbound's own scope (an early BYE from the far end
-            // mid-call is not specially detected here either; the call runs
-            // for its full configured duration regardless).
-            send_our_bye(state, &to_tag, &call_id_hdr, peer, &caller_id);
+            // unless the far end already ended the dialog.
+            if !remote_bye {
+                send_our_bye(state, &to_tag, &call_id_hdr, peer, &caller_id);
+            }
 
             let media_result = match media_result {
                 Ok(r) => r,
@@ -765,7 +841,11 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
                 recordings,
             ));
             call.state = CallState::Ended;
-            call.end_reason = Some(EndReason::DurationElapsed);
+            call.end_reason = Some(if remote_bye {
+                EndReason::RemoteBye
+            } else {
+                EndReason::DurationElapsed
+            });
             finish(state, call_id, call);
         }
     }

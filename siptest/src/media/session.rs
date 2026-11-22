@@ -130,6 +130,10 @@ pub struct MediaSessionResult {
     pub tone: ToneStats,
 }
 
+/// How often the session re-checks an external `stop` while waiting out its
+/// duration. Bounds how long a remote hang-up takes to end the call.
+const STOP_POLL: Duration = Duration::from_millis(20);
+
 /// Binds the RTP socket, runs tx/rx threads for `config.duration` (or until
 /// `stop` is set externally), and returns the counters needed to build a
 /// [`crate::media::report::CallReport`].
@@ -215,7 +219,17 @@ pub fn run(
         })
     };
 
-    thread::sleep(config.duration);
+    // Waits out the configured duration, but wakes within `STOP_POLL` of
+    // `stop` being raised from outside (the far end hanging up) instead of
+    // sleeping through it.
+    let deadline = Instant::now() + config.duration;
+    while !stop.load(Ordering::Relaxed) {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        thread::sleep((deadline - now).min(STOP_POLL));
+    }
     stop.store(true, Ordering::Relaxed);
 
     let _ = tx_handle.join();
