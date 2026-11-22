@@ -21,7 +21,7 @@ use crate::ims::session::Inbound;
 use crate::ims::session::RegisterFailure;
 use crate::ims::sip_client::SipTransport;
 use crate::ims::sip_client::{
-    build_register, random_hex, RegisterRequest, SipMessage, SipResponse, SipSink,
+    build_register, random_hex, RegisterRequest, SipMessage, SipRequest, SipResponse, SipSink,
 };
 use crate::ims::GmSa;
 use crate::ims::{
@@ -644,6 +644,10 @@ impl super::inbound::RingService for RingRefresh<'_> {
         {
             self.defer(e);
         }
+    }
+
+    fn decline_busy(&mut self, invite: &SipRequest, sink: &SipSink) {
+        self.state.decline_busy(self.ctx.obs, invite, sink);
     }
 }
 

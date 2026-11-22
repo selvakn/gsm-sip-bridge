@@ -24,9 +24,9 @@ use crate::ims::session::{
 };
 use crate::ims::sip_client::{
     build_100_trying, build_180_ringing, build_415_unsupported_media, build_420_bad_extension,
-    build_488_incompatible_transport, build_488_not_acceptable, build_580_precondition_failure,
-    build_uas_response, build_uas_response_with_headers, format_sip_addr, SipMessage, SipRequest,
-    SipSink,
+    build_486_busy_here, build_488_incompatible_transport, build_488_not_acceptable,
+    build_580_precondition_failure, build_uas_response, build_uas_response_with_headers,
+    format_sip_addr, random_hex, SipMessage, SipRequest, SipSink,
 };
 use crate::vowifi::control::{reason, write_msg, ControlMessage};
 use jiff::Timestamp;
@@ -892,7 +892,7 @@ fn handle_offerless_invite(
     caller: &str,
     started_at: jiff::Timestamp,
     to_tag: &str,
-    ring_service: Option<&mut dyn RingService>,
+    mut ring_service: Option<&mut dyn RingService>,
 ) -> BridgeResult<Option<ActiveCall>> {
     let obs = ctx.obs;
     tracing::info!(call_id = %call_id, caller = %caller, "inbound INVITE carries no offer; will answer with our own");
@@ -981,7 +981,7 @@ fn handle_offerless_invite(
         sink,
         None,
         &mut held,
-        ring_service.map(|service| RingWork {
+        ring_service.as_deref_mut().map(|service| RingWork {
             service,
             session: &mut *session,
         }),
@@ -1033,7 +1033,8 @@ fn handle_offerless_invite(
     // this exact dialog (RFC 3261 §12.2.2: Call-ID plus both tags —
     // `names_active_dialog`, reused from `agent::mod` unchanged) — and
     // ignoring everything else, same posture `await_pbx_answer` already
-    // has for an irrelevant method.
+    // has for an irrelevant method. Except a new call: the line is occupied,
+    // so its INVITE is declined busy (`decline_second_call`), not ignored.
     //
     // A `BYE` naming this dialog is *not* one of the things safely ignored,
     // unlike an unrelated method: RFC 3261 §12.1.1 confirms this dialog the
@@ -1077,6 +1078,9 @@ fn handle_offerless_invite(
                 );
                 caller_bye = true;
                 break 'wait_for_ack;
+            }
+            if decline_second_call(&candidate, &req_sink, call_id, ring_service.as_deref_mut()) {
+                continue;
             }
             tracing::debug!(method = %candidate.method, "ignoring inbound request while awaiting the offerless call's ACK");
         }
@@ -1391,6 +1395,44 @@ pub(super) trait RingService {
     ) -> bool;
     /// Runs once per poll of the wait.
     fn tick(&mut self, session: &mut crate::ims::RegisteredSession);
+    /// Refuses `invite`, a second call offered to this occupied line, `486
+    /// Busy Here` on `sink`, the way the dispatch loop refuses one itself.
+    fn decline_busy(&mut self, invite: &SipRequest, sink: &SipSink);
+}
+
+/// Refuses an INVITE for a new call that reaches a wait parking the dispatch
+/// loop while this line's call (`call_id`) is still being set up — ringing
+/// the PBX, or answered and awaiting its ACK. The line is occupied, so it is
+/// declined `486 Busy Here` at once, exactly as the loop declines one during
+/// a connected call. Ignoring it instead would leave it unanswered for good:
+/// over a reliable transport the network never retransmits it, so the caller
+/// hears ringback until the network's own transaction timer expires, and it
+/// never comes back to the loop's busy check. `false` for anything else,
+/// including every request of `call_id`'s own dialog, which is the wait's to
+/// handle.
+fn decline_second_call(
+    req: &SipRequest,
+    req_sink: &SipSink,
+    call_id: &str,
+    service: Option<&mut (dyn RingService + '_)>,
+) -> bool {
+    if req.method != "INVITE" || req.header("Call-ID") == Some(call_id) {
+        return false;
+    }
+    tracing::info!(
+        call_id = ?req.header("Call-ID"),
+        setting_up = %call_id,
+        "declining inbound call: another VoWiFi call is still being set up on this line"
+    );
+    match service {
+        Some(service) => service.decline_busy(req, req_sink),
+        None => respond(
+            req_sink,
+            "486 Busy Here (line busy)",
+            &build_486_busy_here(req, &random_hex(4)),
+        ),
+    }
+    true
 }
 
 /// A [`RingService`] with the session it works on, lent to the ring wait.
@@ -1449,6 +1491,7 @@ impl Drop for HeldMessages<'_> {
 /// RFC 3261 §9.2) or the network keeps retransmitting and the caller is left
 /// listening to a phone that has already been hung up. So this polls both the
 /// control channel and the inbound SIP queue rather than blocking on either.
+/// A second call offered meanwhile is declined busy (`decline_second_call`).
 #[allow(clippy::too_many_arguments)]
 fn await_pbx_answer(
     call_id: &str,
@@ -1519,6 +1562,10 @@ fn await_pbx_answer(
                     "180 Ringing (retransmit)",
                     &build_180_ringing(&req, to_tag, contact),
                 );
+                continue;
+            }
+            let service = work.as_mut().map(|w| &mut *w.service);
+            if decline_second_call(&req, &req_sink, call_id, service) {
                 continue;
             }
             tracing::debug!(method = %req.method, "ignoring inbound request received while ringing");
@@ -1704,6 +1751,9 @@ mod tests {
                 self.answers_before_first_tick
                     .get_or_insert(self.answered.len());
             }
+            fn decline_busy(&mut self, _invite: &SipRequest, _sink: &SipSink) {
+                unreachable!("no second call is offered in this test");
+            }
         }
 
         let carrier = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1834,6 +1884,156 @@ mod tests {
             SipMessage::Response(r) => assert_eq!(r.header("CSeq"), Some("7 REGISTER")),
             _ => panic!("expected the response"),
         }
+    }
+
+    /// An INVITE like `invite_with_headers`'s, for another call.
+    fn second_invite(call_id: &str) -> SipRequest {
+        let raw = format!(
+            "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKtwo\r\n\
+             From: <sip:+919000000001@ims.example>;tag=b\r\nTo: <sip:me@ims.example>\r\n\
+             Call-ID: {call_id}\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// Records the second calls the wait hands to the dispatch loop.
+    #[derive(Default)]
+    struct BusyLoop {
+        declined: Vec<String>,
+    }
+    impl RingService for BusyLoop {
+        fn answer(
+            &mut self,
+            _session: &mut crate::ims::RegisteredSession,
+            _response: &crate::ims::sip_client::SipResponse,
+        ) -> bool {
+            false
+        }
+        fn tick(&mut self, _session: &mut crate::ims::RegisteredSession) {}
+        fn decline_busy(&mut self, invite: &SipRequest, _sink: &SipSink) {
+            self.declined
+                .push(invite.header("Call-ID").unwrap_or_default().to_string());
+        }
+    }
+
+    /// Only an INVITE for some other call is a second call; every request of
+    /// the call being set up, and every other method, stays the wait's.
+    #[test]
+    fn only_an_invite_for_another_call_is_declined_as_a_second_call() {
+        let carrier = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sink =
+            crate::ims::sip_client::SipTransport::connect(carrier.local_addr().unwrap(), false)
+                .unwrap()
+                .sink()
+                .unwrap();
+        let mut busy = BusyLoop::default();
+        let own = invite_with_headers("From: <sip:+919000000000@ims.example>;tag=abc\r\n");
+        let mut options = second_invite("other");
+        options.method = "OPTIONS".into();
+
+        assert!(!decline_second_call(&own, &sink, "c1", Some(&mut busy)));
+        assert!(!decline_second_call(&options, &sink, "c1", Some(&mut busy)));
+        assert!(busy.declined.is_empty());
+
+        assert!(decline_second_call(
+            &second_invite("c2"),
+            &sink,
+            "c1",
+            Some(&mut busy)
+        ));
+        assert_eq!(busy.declined, ["c2"], "the loop declines it");
+    }
+
+    /// The reported case: a second caller dials this line while the first
+    /// call still rings the PBX. It is refused `486` at once and the ringing
+    /// call carries on, rather than being left unanswered until the network
+    /// gives up on it.
+    #[test]
+    fn a_second_call_offered_while_the_first_rings_is_declined_busy() {
+        let carrier = UdpSocket::bind("127.0.0.1:0").unwrap();
+        carrier
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let sink =
+            crate::ims::sip_client::SipTransport::connect(carrier.local_addr().unwrap(), false)
+                .unwrap()
+                .sink()
+                .unwrap();
+        let (sip_tx, sip_rx) = mpsc::channel::<(SipMessage, SipSink)>();
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<ControlMessage>();
+        sip_tx
+            .send((SipMessage::Request(second_invite("c2")), sink.clone()))
+            .unwrap();
+        ctrl_tx
+            .send(ControlMessage::CallAnswered {
+                call_id: "c1".into(),
+            })
+            .unwrap();
+        let req = invite_with_headers("From: <sip:+919000000000@ims.example>;tag=abc\r\n");
+
+        // Through the dispatch loop when the wait has it ...
+        let mut session =
+            crate::ims::test_session_with_sa(None, carrier.local_addr().unwrap(), None);
+        let mut busy = BusyLoop::default();
+        let mut held = HeldMessages::new(&sip_tx);
+        let outcome = await_pbx_answer(
+            "c1",
+            &ctrl_rx,
+            &sip_rx,
+            &req,
+            "tag",
+            "<sip:me@10.0.0.9>",
+            &sink,
+            None,
+            &mut held,
+            Some(RingWork {
+                service: &mut busy,
+                session: &mut session,
+            }),
+        )
+        .unwrap();
+        drop(held);
+        assert!(
+            matches!(outcome, RingOutcome::Answered),
+            "the first call carries on"
+        );
+        assert_eq!(busy.declined, ["c2"]);
+        assert!(
+            sip_rx.try_recv().is_err(),
+            "the second INVITE is not left over"
+        );
+
+        // ... and on its own when it does not.
+        sip_tx
+            .send((SipMessage::Request(second_invite("c3")), sink.clone()))
+            .unwrap();
+        ctrl_tx
+            .send(ControlMessage::CallAnswered {
+                call_id: "c1".into(),
+            })
+            .unwrap();
+        let mut held = HeldMessages::new(&sip_tx);
+        let outcome = await_pbx_answer(
+            "c1",
+            &ctrl_rx,
+            &sip_rx,
+            &req,
+            "tag",
+            "<sip:me@10.0.0.9>",
+            &sink,
+            None,
+            &mut held,
+            None,
+        )
+        .unwrap();
+        drop(held);
+        assert!(matches!(outcome, RingOutcome::Answered));
+        let mut buf = [0u8; 4096];
+        let n = carrier.recv(&mut buf).unwrap();
+        let sent = String::from_utf8_lossy(&buf[..n]);
+        assert!(sent.starts_with("SIP/2.0 486 Busy Here\r\n"), "{sent}");
+        assert!(sent.contains("Call-ID: c3\r\n"), "{sent}");
     }
 
     #[test]

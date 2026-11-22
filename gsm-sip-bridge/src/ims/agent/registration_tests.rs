@@ -1775,3 +1775,48 @@ fn a_refresh_does_not_end_a_failure_a_full_registration_still_owes() {
     assert!(rig.st.force_renewal);
     assert_eq!(rig.obs.gm_connection_up(), Some(false));
 }
+
+/// A second call offered while this line's call still rings is declined
+/// through the dispatch loop's own busy path: `486` to the carrier, and the
+/// decline remembered, so its ACK is recognised rather than logged as
+/// matching nothing.
+#[test]
+fn a_call_declined_busy_from_the_ring_wait_is_the_loops_decline() {
+    use super::inbound::RingService;
+
+    let mut rig = Rig::new();
+    let raw = "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+               Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKsecond\r\n\
+               From: <sip:+919000000001@ims.example>;tag=b\r\n\
+               To: <sip:me@ims.example>\r\n\
+               Call-ID: second-call\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+    let invite = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0;
+    let sink = SipTransport::connect(rig.peer.local_addr().unwrap(), false)
+        .unwrap()
+        .sink()
+        .unwrap();
+    {
+        let ctx = RefreshCtx {
+            status: &rig.status,
+            obs: &rig.obs,
+            reg_cfg: &rig.cfg,
+        };
+        let mut ring = registration_refresh::RingRefresh::new(&mut rig.st, ctx, &rig.link.inbound);
+        ring.decline_busy(&invite, &sink);
+    }
+
+    let sent = rig.received().expect("a response to the second INVITE");
+    assert!(sent.starts_with("SIP/2.0 486 Busy Here\r\n"), "{sent}");
+    let ack = SipRequest::try_parse(
+        raw.replacen("INVITE sip", "ACK sip", 1)
+            .replace("CSeq: 1 INVITE", "CSeq: 1 ACK")
+            .as_bytes(),
+    )
+    .unwrap()
+    .unwrap()
+    .0;
+    assert_eq!(
+        ack_disposition(&ack, None, &rig.st.recent_declines, Instant::now()),
+        AckDisposition::DeclinedCall
+    );
+}

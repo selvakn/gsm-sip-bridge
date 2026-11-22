@@ -6,6 +6,7 @@
 ## Unreleased
 
 - **`url` 2.5.9 for RUSTSEC-2026-0592** -- The `url` crate, which the bridge only reaches through `reqwest` (and `wiremock` in tests), is updated past a stack overflow in `Url::origin()` on deeply nested `blob:` URLs. Neither the bridge nor `reqwest` calls `Url::origin()`, so no running bridge was exposed; the update unblocks `cargo deny`. The FFI bindings `pjsua-sys` generates with bindgen are byte-identical to before.
+- **A second call to a line whose call is still ringing gets busy at once** -- While an incoming VoWiFi or VoLTE call was ringing the phone or PBX, or answered without SDP and waiting for the carrier's ACK, an INVITE for another call to the same line was ignored without any response. Over the TCP signaling connection the network does not resend it, so the second caller heard ringback until the network's own timeout, and the call never reached the busy check. It is now refused `486 Busy Here` straight away, the same as a call offered during a connected call, recorded in the call history as not answered, and the ringing call is not affected. On T2 the network itself returns busy to a second caller and never sends the bridge the INVITE, so this is covered by unit tests only (#224).
 
 ## v8.26.0
 

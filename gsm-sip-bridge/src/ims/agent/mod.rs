@@ -3427,14 +3427,7 @@ impl LoopState {
             .or(self.origination.as_ref().map(|o| &o.lifecycle));
         if Admission::for_current(occupant) == Admission::RejectBusy {
             tracing::info!("declining inbound call: another VoWiFi call is already active");
-            let _ = sink.send(&build_486_busy_here(req, &random_hex(4)));
-            self.recent_declines.record(req, Instant::now());
-            p.obs.report_call_not_answered(
-                CallStatus::Failed,
-                BridgeFailureReason::BridgeSetupFailed,
-                &extract_caller(req),
-                Timestamp::now(),
-            );
+            self.decline_busy(p.obs, req, sink);
             return;
         }
         // If the telephone-side half has no PBX registration, the outbound leg
@@ -3533,6 +3526,28 @@ impl LoopState {
         // Setup is over either way. A connected call already counts through
         // `set_active_calls(1)` above, so the line never reads free between.
         p.obs.set_inbound_setup(false);
+    }
+
+    /// Refuses a new inbound call `486 Busy Here` because this line already
+    /// has one, leaving that call untouched. The one way a busy line declines,
+    /// whether the loop meets the INVITE itself or a wait that parks the loop
+    /// (an inbound call ringing, or awaiting its ACK) meets it instead
+    /// (`inbound::decline_second_call`): the decline is remembered so its ACK
+    /// is recognised, and the caller is reported as a call not answered.
+    fn decline_busy(
+        &mut self,
+        obs: &observability::AgentObservability,
+        req: &SipRequest,
+        sink: &SipSink,
+    ) {
+        let _ = sink.send(&build_486_busy_here(req, &random_hex(4)));
+        self.recent_declines.record(req, Instant::now());
+        obs.report_call_not_answered(
+            CallStatus::Failed,
+            BridgeFailureReason::BridgeSetupFailed,
+            &extract_caller(req),
+            Timestamp::now(),
+        );
     }
 
     fn handle_carrier_bye(&mut self, p: &DispatchParams, req: &SipRequest, sink: &SipSink) {
