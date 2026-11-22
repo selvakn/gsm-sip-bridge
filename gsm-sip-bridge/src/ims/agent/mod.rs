@@ -577,6 +577,33 @@ impl RecentDeclines {
     }
 }
 
+/// Where to answer a request the network sent: the socket it arrived on, or,
+/// with `vowifi.respond_on_client`, this session's client leg (see the
+/// dispatch loop, which explains why Jio needs it). The one choice for every
+/// request answered while the loop runs and while a wait parks it
+/// (`inbound::HeldMessages::take_response`), so no answer bypasses it.
+fn request_answer_sink(
+    respond_on_client: bool,
+    session: &crate::ims::RegisteredSession,
+    arrival: SipSink,
+) -> SipSink {
+    if !respond_on_client {
+        return arrival;
+    }
+    match session.transport().and_then(|t| t.sink()) {
+        Ok(client_sink) => {
+            tracing::debug!(
+                "respond_on_client: answering on the client leg, not the arrival socket"
+            );
+            client_sink
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "respond_on_client is set but there is no client sink; using the arrival socket");
+            arrival
+        }
+    }
+}
+
 /// Which call an inbound ACK belongs to, for `LoopState::log_ack`.
 #[derive(Debug, PartialEq, Eq)]
 enum AckDisposition {
@@ -2029,6 +2056,7 @@ impl DispatchParams<'_> {
             obs: self.obs,
             access_network_info: &self.reg_cfg.access_network_info,
             respect_caller_privacy: self.respect_caller_privacy,
+            respond_on_client: self.respond_on_client,
             amr_passthrough: self.amr_passthrough,
             rtp_reorder_wait: self.rtp_reorder_wait,
             amr_mode_set: self.amr_mode_set,
@@ -2764,19 +2792,8 @@ fn dispatch_loop(
             None => inbound.rx.recv_timeout(poll),
         };
         let received = match queued {
-            Ok((msg, sink)) if respond_on_client && matches!(msg, SipMessage::Request(_)) => {
-                match session.transport().and_then(|t| t.sink()) {
-                    Ok(client_sink) => {
-                        tracing::debug!(
-                            "respond_on_client: answering on the client leg, not the arrival socket"
-                        );
-                        Ok((msg, client_sink))
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "respond_on_client is set but there is no client sink; using the arrival socket");
-                        Ok((msg, sink))
-                    }
-                }
+            Ok((msg, sink)) if matches!(msg, SipMessage::Request(_)) => {
+                Ok((msg, request_answer_sink(respond_on_client, session, sink)))
             }
             other => other,
         };
@@ -3427,14 +3444,7 @@ impl LoopState {
             .or(self.origination.as_ref().map(|o| &o.lifecycle));
         if Admission::for_current(occupant) == Admission::RejectBusy {
             tracing::info!("declining inbound call: another VoWiFi call is already active");
-            let _ = sink.send(&build_486_busy_here(req, &random_hex(4)));
-            self.recent_declines.record(req, Instant::now());
-            p.obs.report_call_not_answered(
-                CallStatus::Failed,
-                BridgeFailureReason::BridgeSetupFailed,
-                &extract_caller(req),
-                Timestamp::now(),
-            );
+            self.decline_busy(p.obs, req, sink);
             return;
         }
         // If the telephone-side half has no PBX registration, the outbound leg
@@ -3533,6 +3543,28 @@ impl LoopState {
         // Setup is over either way. A connected call already counts through
         // `set_active_calls(1)` above, so the line never reads free between.
         p.obs.set_inbound_setup(false);
+    }
+
+    /// Refuses a new inbound call `486 Busy Here` because this line already
+    /// has one, leaving that call untouched. The one way a busy line declines,
+    /// whether the loop meets the INVITE itself or a wait that parks the loop
+    /// (an inbound call ringing, or awaiting its ACK) meets it instead
+    /// (`inbound::decline_second_call`): the decline is remembered so its ACK
+    /// is recognised, and the caller is reported as a call not answered.
+    fn decline_busy(
+        &mut self,
+        obs: &observability::AgentObservability,
+        req: &SipRequest,
+        sink: &SipSink,
+    ) {
+        let _ = sink.send(&build_486_busy_here(req, &random_hex(4)));
+        self.recent_declines.record(req, Instant::now());
+        obs.report_call_not_answered(
+            CallStatus::Failed,
+            BridgeFailureReason::BridgeSetupFailed,
+            &extract_caller(req),
+            Timestamp::now(),
+        );
     }
 
     fn handle_carrier_bye(&mut self, p: &DispatchParams, req: &SipRequest, sink: &SipSink) {
