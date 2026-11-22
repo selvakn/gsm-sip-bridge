@@ -338,6 +338,18 @@ pub trait CommandRunner: Send + Sync {
     /// that was already there before it started.
     fn path_identity(&self, path: &Path) -> Option<(u64, u64)>;
 
+    /// Keeps one PC/SC context open on the pcscd behind the control socket
+    /// for the rest of this process, re-establishing it whenever that
+    /// pcscd goes away. Used while the host's pcscd serves the bridge: a
+    /// pcscd started by systemd's socket activation runs with
+    /// `--auto-exit` and exits about a minute after its last context
+    /// closes. Every PC/SC client the bridge runs opens a context only for
+    /// one operation, so without this one the host's pcscd would come and
+    /// go between registrations, taking the vpcd reader (and every
+    /// `vowifi-usim-bridge` session on it) and the enumerated USB readers
+    /// with it. Idempotent: later calls in the same process do nothing.
+    fn hold_pcsc_context(&self);
+
     /// Fetch a URL over plain HTTP/1.0.
     ///
     /// Exists so the container healthcheck can read the daemon's own
@@ -692,6 +704,18 @@ impl CommandRunner for RealCommandRunner {
         socket.set_nonblocking(true).is_ok() && socket.connect(&addr).is_ok()
     }
 
+    fn hold_pcsc_context(&self) {
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        STARTED.call_once(|| {
+            let spawned = std::thread::Builder::new()
+                .name("pcsc-context".into())
+                .spawn(hold_pcsc_context_forever);
+            if let Err(e) = spawned {
+                println!("[supervise] could not start the PC/SC context holder: {e}");
+            }
+        });
+    }
+
     fn path_identity(&self, path: &Path) -> Option<(u64, u64)> {
         use std::os::unix::fs::MetadataExt;
         std::fs::symlink_metadata(path)
@@ -711,6 +735,54 @@ impl CommandRunner for RealCommandRunner {
                 IpAddr::V6(_) => None,
             })
             .collect())
+    }
+}
+
+/// How often the held PC/SC context checks that its pcscd is still there.
+const PCSC_CONTEXT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long to wait before trying again when no context can be opened.
+const PCSC_CONTEXT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The body of [`RealCommandRunner::hold_pcsc_context`]'s thread. Each
+/// check lists the readers, a round trip to pcscd: a context whose pcscd
+/// has exited fails it (`SCardIsValidContext` would not, it checks only
+/// the client side) and is replaced by a new one, which also brings a
+/// socket-activated pcscd back. "No readers" is a valid answer from a live
+/// pcscd.
+fn hold_pcsc_context_forever() {
+    let mut logged_failure = false;
+    loop {
+        match pcsc::Context::establish(pcsc::Scope::System) {
+            Ok(ctx) => {
+                if logged_failure {
+                    println!("[supervise] PC/SC context to the host's pcscd open again");
+                    logged_failure = false;
+                }
+                loop {
+                    std::thread::sleep(PCSC_CONTEXT_CHECK_INTERVAL);
+                    match ctx.list_readers_len() {
+                        Ok(_) | Err(pcsc::Error::NoReadersAvailable) => {}
+                        Err(e) => {
+                            println!(
+                                "[supervise] PC/SC context to the host's pcscd lost ({e}); \
+                                 opening a new one"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if !logged_failure {
+                    println!(
+                        "[supervise] cannot open a PC/SC context to the host's pcscd ({e}); \
+                         retrying every {PCSC_CONTEXT_RETRY_DELAY:?}"
+                    );
+                    logged_failure = true;
+                }
+                std::thread::sleep(PCSC_CONTEXT_RETRY_DELAY);
+            }
+        }
     }
 }
 
@@ -1196,6 +1268,11 @@ mod mock {
         /// front entry while more than one is queued, then keeps returning
         /// the last. Unseeded paths have no identity (nothing there).
         pub path_identities: Mutex<Map<String, PathIdentityQueue>>,
+        /// See [`Self::set_tcp_connect_ok_after_run`]: `(trigger key,
+        /// "host:port")`, applied when the trigger command runs.
+        tcp_effects: Mutex<Vec<(String, String)>>,
+        /// How many times `hold_pcsc_context` was called.
+        pub pcsc_context_holds: AtomicU64,
         /// Overrides `resolve_host`'s return value for a given host;
         /// unseeded hosts resolve to an empty address list (no real DNS in
         /// tests).
@@ -1319,6 +1396,14 @@ mod mock {
 
         /// Applies every seeded effect whose trigger key is `key`.
         fn apply_effects(&self, key: &str) {
+            for (trigger, hostport) in self.tcp_effects.lock().unwrap().iter() {
+                if trigger == key {
+                    self.tcp_connect_results
+                        .lock()
+                        .unwrap()
+                        .insert(hostport.clone(), true);
+                }
+            }
             for (trigger, seeded, out) in self.netns_effects.lock().unwrap().iter() {
                 if trigger == key {
                     self.run_outputs
@@ -1335,6 +1420,16 @@ mod mock {
                 .lock()
                 .unwrap()
                 .insert(format!("{host}:{port}"), ok);
+        }
+
+        /// Makes `tcp_connect_ok(host, port)` succeed once the host command
+        /// `trigger` has run — e.g. `pcscd --hotplug` making a pcscd load
+        /// the vpcd reader that then listens on that port.
+        pub fn set_tcp_connect_ok_after_run(&self, trigger: &[&str], host: &str, port: u16) {
+            self.tcp_effects
+                .lock()
+                .unwrap()
+                .push((trigger.join(" "), format!("{host}:{port}")));
         }
 
         /// Seeds `unix_connect_ok(path)`'s return value.
@@ -1698,6 +1793,10 @@ mod mock {
                 .get(&key)
                 .copied()
                 .unwrap_or(false)
+        }
+
+        fn hold_pcsc_context(&self) {
+            self.pcsc_context_holds.fetch_add(1, Ordering::SeqCst);
         }
 
         fn path_identity(&self, path: &Path) -> Option<(u64, u64)> {

@@ -203,22 +203,37 @@ pcscd can use that path and a USB reader at a time.
 
 `[vowifi].pcscd` decides who runs it:
 
-- `auto` (default): if every line is a card-reader line and something already
-  accepts connections on `/run/pcscd/pcscd.comm`, the bridge uses that pcscd
-  and logs `using the host's pcscd on /run/pcscd/pcscd.comm`; otherwise it
-  starts its own, as before.
-- `external`: always use the host's pcscd. Card-reader lines only; startup
-  fails if nothing answers on the socket within about 10 s.
+- `auto` (default): if something already accepts connections on
+  `/run/pcscd/pcscd.comm`, the bridge uses that pcscd and logs `using the
+  host's pcscd on /run/pcscd/pcscd.comm`; otherwise it starts its own, as
+  before.
+- `external`: always use the host's pcscd; startup fails if nothing answers
+  on the socket within about 10 s.
 - `managed`: always start the bridge's own pcscd. With a host
   `pcscd.socket` still enabled, stop it (`systemctl disable --now
-  pcscd.socket`), or a later PC/SC client on the host can activate the
-  host's pcscd and take the reader away.
+  pcscd.socket`): pcscd refuses to start while the host's is running
+  (`Another pcscd (pid: N) seems to be running.` in `/tmp/pcscd.log`), and
+  a later PC/SC client on the host can activate the host's pcscd and take
+  the reader away.
+
+The host's pcscd serves modem-backed lines too. Their SIM reaches pcscd
+through the vpcd virtual reader, which pcscd loads from
+`/etc/reader.conf.d/vpcd`; the bridge writes that file before it first
+contacts the host's pcscd, so a pcscd that socket activation starts then
+loads the reader. A host pcscd that was already running without it is asked
+once to re-read its reader configuration (`pcscd --hotplug`, what `systemctl
+reload pcscd.service` runs); the readers it already has are not touched. If
+the vpcd port still does not answer, startup fails and names the port. The
+file stays after the bridge stops, so the host's pcscd keeps listening on
+`[vowifi].vpcd_port` and the ports after it.
 
 The bridge never stops a pcscd it did not start. A distribution pcscd started
-by socket activation usually runs with `--auto-exit` and exits after a minute
-without clients; the next client starts it again, and it then has to
-enumerate the reader before it can serve it. This is not yet verified live
-with a VoWiFi line.
+by socket activation usually runs with `--auto-exit` and exits about a
+minute after its last client closes its PC/SC context. Every PC/SC client the
+bridge runs opens a context only for one operation, so while the bridge uses
+the host's pcscd it holds one context open itself (and opens a new one if
+that pcscd restarts); otherwise pcscd would exit between registrations and
+take the vpcd reader and the enumerated USB readers with it.
 
 An earlier run that started the bridge's own pcscd on such a host (any
 release before this setting, or `managed`) leaves systemd's socket
