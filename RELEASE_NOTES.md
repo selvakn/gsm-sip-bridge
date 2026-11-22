@@ -1,5 +1,12 @@
 # Release Notes
 
+<!-- Rename this "## Unreleased" heading to the real "## vX.Y.Z" at release
+     time — publish.yml's notes extractor matches ^## v${TAG}$ exactly, so an
+     "Unreleased" heading is not picked up for the GitHub release. -->
+## Unreleased
+
+- **`url` 2.5.9 for RUSTSEC-2026-0592** -- The `url` crate, which the bridge only reaches through `reqwest` (and `wiremock` in tests), is updated past a stack overflow in `Url::origin()` on deeply nested `blob:` URLs. Neither the bridge nor `reqwest` calls `Url::origin()`, so no running bridge was exposed; the update unblocks `cargo deny`. The FFI bindings `pjsua-sys` generates with bindgen are byte-identical to before.
+
 ## v8.26.0
 
 - **Carrier hold and resume are followed on bridged calls** -- When the far party puts a VoWiFi or VoLTE call on hold or takes it off hold, the bridge now accepts the carrier's re-INVITE instead of declining it `488`: while held it sends no audio to the carrier, and after the resume the far party is heard again, even when the carrier goes back to the RTP stream it used before the hold. The phone or PBX is not told about the hold. A hold no longer counts as thousands of lost packets in the call's figures and RTCP reports. Still declined: a re-INVITE that moves the media address or drops the running codec, a hold sent as `UPDATE`, and any change on a forwarded AMR call. Verified live on T2 VoWiFi, outbound and inbound (#221).

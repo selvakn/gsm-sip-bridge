@@ -6,5 +6,12 @@ license.workspace = true
 build = "build.rs"
 
 [build-dependencies]
-bindgen = "0.73"
+# `prettyplease` (a bindgen default feature) is dropped on purpose. build.rs
+# never selects `Formatter::Prettyplease` — bindgen's default formatter is
+# rustfmt either way — so it was compiled but unused. Worse, bindgen declares
+# `syn >=2,<4` and `prettyplease >=0.2.7,<0.4` as independent ranges, and any
+# lockfile re-resolve (e.g. `cargo update -p url`) can pair syn 2 with
+# prettyplease 0.3 (built on syn 3), which fails to compile with E0277 in
+# bindgen's lib.rs.
+bindgen = { version = "0.73", default-features = false, features = ["logging", "runtime"] }
 pkg-config = "0.3"
