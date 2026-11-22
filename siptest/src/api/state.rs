@@ -278,6 +278,16 @@ impl SharedState {
         CallId(format!("c-{n}"))
     }
 
+    /// What every reader of SIP requests answers through: this socket, the
+    /// bridge as the only trusted source, and the record of ended dialogs.
+    pub fn request_ctx(&self) -> crate::sip::inbound::RequestCtx<'_> {
+        crate::sip::inbound::RequestCtx {
+            socket: &self.sip_socket,
+            trusted: self.bridge_registrar.ip(),
+            hangups: &self.recent_hangups,
+        }
+    }
+
     /// Remembers that `sip_call_id`'s dialog has ended, so a `BYE` for it is
     /// still answered after the call has gone.
     pub fn note_hangup(&self, sip_call_id: &str) {

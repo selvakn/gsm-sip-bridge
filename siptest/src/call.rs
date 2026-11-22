@@ -409,11 +409,20 @@ fn drive_outbound(
         .take()
         .expect("the dialog route's receiver is taken exactly once");
     let (media_result, remote_bye) = crate::sip::dialog::watch_while(
-        &state.sip_socket,
+        &state.request_ctx(),
         &dialog.call_id,
         &stop,
-        &state.recent_hangups,
-        move |wait: Duration| route_rx.recv_timeout(wait).ok(),
+        move |wait: Duration| match route_rx.recv_timeout(wait) {
+            Ok(item) => Some(item),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            // The route's sender is gone: nothing more will arrive, but
+            // returning at once would make the watcher spin until the call
+            // ends. Wait out the interval as an idle queue would.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(wait);
+                None
+            }
+        },
         || {
             crate::media::session::run(
                 crate::media::session::MediaSessionConfig {
@@ -640,8 +649,7 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
     let decision = match policy.mode {
         InboundMode::Reject => Decision::Reject(policy.reject_status),
         InboundMode::Answer => match crate::sip::inbound::wait_or_cancel(
-            &state.sip_socket,
-            state.bridge_registrar.ip(),
+            &state.request_ctx(),
             &call_id_hdr,
             Duration::from_millis(policy.answer_delay_ms as u64),
         ) {
@@ -666,8 +674,7 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
                 break Decision::RingTimeout;
             }
             match crate::sip::inbound::wait_or_cancel(
-                &state.sip_socket,
-                state.bridge_registrar.ip(),
+                &state.request_ctx(),
                 &call_id_hdr,
                 Duration::from_millis(200),
             ) {
@@ -744,12 +751,8 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
             send_200();
             let invite_to_200_ms = start.elapsed().as_millis() as u64;
 
-            let acked = crate::sip::inbound::wait_for_ack(
-                &state.sip_socket,
-                state.bridge_registrar.ip(),
-                &call_id_hdr,
-                send_200,
-            );
+            let acked =
+                crate::sip::inbound::wait_for_ack(&state.request_ctx(), &call_id_hdr, send_200);
             if !acked {
                 call.state = CallState::Ended;
                 call.end_reason = Some(EndReason::Failed {
@@ -781,18 +784,12 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
             // This thread is the listener, so nothing else reads the
             // socket's request queue: the watcher does, and answers a `BYE`
             // (ending the media early), re-INVITEs and keepalives.
+            let request_ctx = state.request_ctx();
             let (media_result, remote_bye) = crate::sip::dialog::watch_while(
-                &state.sip_socket,
+                &request_ctx,
                 &call_id_hdr,
                 &stop,
-                &state.recent_hangups,
-                |wait: Duration| {
-                    state
-                        .sip_socket
-                        .recv_request_from(state.bridge_registrar.ip(), wait)
-                        .ok()
-                        .flatten()
-                },
+                |wait: Duration| request_ctx.recv(wait),
                 || {
                     crate::media::session::run(
                         crate::media::session::MediaSessionConfig {

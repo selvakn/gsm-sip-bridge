@@ -404,7 +404,7 @@ mod tests {
             .unwrap()
             .is_none());
 
-        // Now b sends a response; a should see it via recv_response, not recv_request.
+        // Now b sends a response; a should see it via recv_response, not recv_request_from.
         b.send(
             a.local_addr(),
             "SIP/2.0 200 OK\r\nCall-ID: call1\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n",

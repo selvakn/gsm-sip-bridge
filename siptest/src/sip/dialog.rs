@@ -24,15 +24,13 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use gsm_sip_bridge::ims::sip_client::{build_uas_response, SipRequest};
 
-use crate::api::state::RecentHangups;
-use crate::sip::inbound::{build_405, build_options_ok, handle_stray};
-use crate::sip::socket::SipSocket;
+use crate::sip::inbound::{build_405, handle_stray, has_to_tag, RequestCtx};
 
 /// How often the watcher re-checks that the call is still running when no
 /// request arrives. Bounds how long the call's end waits on the watcher.
@@ -47,9 +45,11 @@ pub enum Disposition {
     Handled,
 }
 
-/// Answers one request that reached a connected dialog.
+/// Answers one request that reached a connected dialog. Whatever is not
+/// specifically about this dialog is the shared stray handling's
+/// ([`handle_stray`]).
 pub fn respond(
-    socket: &SipSocket,
+    ctx: &RequestCtx<'_>,
     req: &SipRequest,
     peer: SocketAddr,
     call_id: &str,
@@ -57,24 +57,24 @@ pub fn respond(
     let in_dialog = req.header("Call-ID") == Some(call_id);
     match (req.method.as_str(), in_dialog) {
         ("BYE", true) => {
-            let _ = socket.send(peer, &build_uas_response(200, "OK", req, None, None, None));
+            let _ = ctx
+                .socket
+                .send(peer, &build_uas_response(200, "OK", req, None, None, None));
             Disposition::RemoteBye
         }
+        // An INVITE with no `To` tag is the INVITE that set this very call up,
+        // late or duplicated on the wire: nothing to refuse, and a `488` for
+        // it would read as the call having failed.
+        ("INVITE", true) if !has_to_tag(req) => Disposition::Handled,
         ("INVITE" | "UPDATE", true) => {
             tracing::warn!(
                 method = %req.method,
                 "refusing a mid-call media renegotiation with 488"
             );
-            let _ = socket.send(
+            let _ = ctx.socket.send(
                 peer,
                 &build_uas_response(488, "Not Acceptable Here", req, None, None, None),
             );
-            Disposition::Handled
-        }
-        // A keepalive is answered whether or not it names this dialog's
-        // Call-ID: a peer may probe within the dialog as well as outside it.
-        ("OPTIONS", _) => {
-            let _ = socket.send(peer, &build_options_ok(req));
             Disposition::Handled
         }
         // A retransmitted ACK for our 2xx, or a CANCEL for a transaction
@@ -82,13 +82,15 @@ pub fn respond(
         ("ACK" | "CANCEL", true) => Disposition::Handled,
         // Any other in-dialog request (INFO, NOTIFY, MESSAGE...): siptest
         // implements none of them, and says so rather than going silent, so
-        // the peer does not retransmit it into the void.
-        (_, true) => {
-            let _ = socket.send(peer, &build_405(req));
+        // the peer does not retransmit it into the void. (`OPTIONS` is a
+        // keepalive and is answered by the stray handling, in or out of the
+        // dialog.)
+        (method, true) if method != "OPTIONS" => {
+            let _ = ctx.socket.send(peer, &build_405(req));
             Disposition::Handled
         }
         _ => {
-            handle_stray(socket, req, peer, call_id);
+            handle_stray(ctx, req, peer, call_id);
             Disposition::Handled
         }
     }
@@ -110,10 +112,9 @@ impl Drop for FinishOnDrop<'_> {
 /// already returned early. A `BYE` for the dialog is recorded in `hangups`
 /// before it is answered.
 pub fn watch_while<T>(
-    socket: &SipSocket,
+    ctx: &RequestCtx<'_>,
     call_id: &str,
     stop: &Arc<AtomicBool>,
-    hangups: &Mutex<RecentHangups>,
     mut next_request: impl FnMut(Duration) -> Option<(SipRequest, SocketAddr)> + Send,
     body: impl FnOnce() -> T,
 ) -> (T, bool) {
@@ -130,14 +131,14 @@ pub fn watch_while<T>(
                 // retransmission of its `BYE` would find nobody to answer it
                 // once this call is gone.
                 if req.method == "BYE" && req.header("Call-ID") == Some(call_id) {
-                    hangups
+                    ctx.hangups
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .record(call_id, Instant::now());
                 }
                 // Keeps answering after the first BYE so a retransmission of
                 // it still gets its `200` while the call winds down.
-                if respond(socket, &req, peer, call_id) == Disposition::RemoteBye {
+                if respond(ctx, &req, peer, call_id) == Disposition::RemoteBye {
                     remote_bye = true;
                     stop.store(true, Ordering::Relaxed);
                 }
@@ -148,7 +149,13 @@ pub fn watch_while<T>(
             let _finish = FinishOnDrop(&finished);
             body()
         };
-        let remote_bye = watcher.join().unwrap_or(false);
+        // A panicking watcher must not take the call (or, for an inbound
+        // call, the listener thread running it) down with it — but it must
+        // not vanish either: no request was serviced after it died.
+        let remote_bye = watcher.join().unwrap_or_else(|_| {
+            tracing::error!("the dialog watcher panicked; in-dialog requests went unserviced");
+            false
+        });
         (out, remote_bye)
     })
 }
@@ -156,10 +163,20 @@ pub fn watch_while<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::state::RecentHangups;
+    use crate::sip::socket::SipSocket;
+    use std::sync::Mutex;
 
     const CALL: &str = "dialog-call-1";
 
-    fn request(method: &str, call_id: &str) -> SipRequest {
+    /// A request carrying `call_id`; with or without a `To` tag (a dialog's
+    /// own requests have one, the INVITE that starts it does not).
+    fn request_with(method: &str, call_id: &str, to_tag: bool) -> SipRequest {
+        let to = if to_tag {
+            "<sip:1002@127.0.0.1>;tag=ourtag"
+        } else {
+            "<sip:1002@127.0.0.1>"
+        };
         SipRequest {
             method: method.to_string(),
             request_uri: "sip:1002@127.0.0.1:5065".to_string(),
@@ -172,10 +189,7 @@ mod tests {
                     "From".to_string(),
                     "<sip:peer@127.0.0.1>;tag=peertag".to_string(),
                 ),
-                (
-                    "To".to_string(),
-                    "<sip:1002@127.0.0.1>;tag=ourtag".to_string(),
-                ),
+                ("To".to_string(), to.to_string()),
                 ("Call-ID".to_string(), call_id.to_string()),
                 ("CSeq".to_string(), format!("7 {method}")),
                 ("Content-Length".to_string(), "0".to_string()),
@@ -185,65 +199,111 @@ mod tests {
         }
     }
 
-    /// Two sockets on loopback: `ours` answers, `theirs` is the peer.
-    fn pair() -> (SipSocket, SipSocket) {
-        let bind = || {
-            SipSocket::bind(
-                Some("127.0.0.1".parse().unwrap()),
-                0,
-                "127.0.0.1:1".parse().unwrap(),
-            )
-            .unwrap()
-        };
-        (bind(), bind())
+    fn request(method: &str, call_id: &str) -> SipRequest {
+        request_with(method, call_id, true)
     }
 
-    fn reply_to(theirs: &SipSocket, method: &str, wait: Duration) -> Option<u16> {
-        theirs
-            .recv_response(CALL, 7, method, wait)
-            .unwrap()
-            .map(|r| r.status)
+    /// Two sockets on loopback — `ours` answers, `theirs` is the peer — and
+    /// the record of ended dialogs the answering side consults.
+    struct Rig {
+        ours: SipSocket,
+        theirs: SipSocket,
+        hangups: Mutex<RecentHangups>,
     }
+
+    impl Rig {
+        fn new() -> Self {
+            let bind = || {
+                SipSocket::bind(
+                    Some("127.0.0.1".parse().unwrap()),
+                    0,
+                    "127.0.0.1:1".parse().unwrap(),
+                )
+                .unwrap()
+            };
+            Self {
+                ours: bind(),
+                theirs: bind(),
+                hangups: Mutex::new(RecentHangups::default()),
+            }
+        }
+
+        fn ctx(&self) -> RequestCtx<'_> {
+            RequestCtx {
+                socket: &self.ours,
+                trusted: "127.0.0.1".parse().unwrap(),
+                hangups: &self.hangups,
+            }
+        }
+
+        fn peer(&self) -> SocketAddr {
+            self.theirs.local_addr()
+        }
+
+        /// Feeds `req` to [`respond`] for the call [`CALL`].
+        fn respond(&self, req: &SipRequest) -> Disposition {
+            respond(&self.ctx(), req, self.peer(), CALL)
+        }
+
+        /// The status the peer received for its `method` request on `call_id`.
+        fn reply(&self, call_id: &str, method: &str, wait: Duration) -> Option<u16> {
+            self.theirs
+                .recv_response(call_id, 7, method, wait)
+                .unwrap()
+                .map(|r| r.status)
+        }
+    }
+
+    const WAIT: Duration = Duration::from_secs(2);
+    const NO_REPLY: Duration = Duration::from_millis(300);
 
     #[test]
     fn a_bye_is_answered_200_and_reported_as_a_hang_up() {
-        let (ours, theirs) = pair();
-        let d = respond(&ours, &request("BYE", CALL), theirs.local_addr(), CALL);
-        assert_eq!(d, Disposition::RemoteBye);
-        assert_eq!(reply_to(&theirs, "BYE", Duration::from_secs(2)), Some(200));
+        let rig = Rig::new();
+        assert_eq!(rig.respond(&request("BYE", CALL)), Disposition::RemoteBye);
+        assert_eq!(rig.reply(CALL, "BYE", WAIT), Some(200));
     }
 
     #[test]
     fn a_re_invite_or_update_is_refused_with_488_and_the_call_carries_on() {
         for method in ["INVITE", "UPDATE"] {
-            let (ours, theirs) = pair();
-            let d = respond(&ours, &request(method, CALL), theirs.local_addr(), CALL);
-            assert_eq!(d, Disposition::Handled, "{method} must not end the call");
+            let rig = Rig::new();
             assert_eq!(
-                reply_to(&theirs, method, Duration::from_secs(2)),
-                Some(488),
-                "{method}"
+                rig.respond(&request(method, CALL)),
+                Disposition::Handled,
+                "{method} must not end the call"
             );
+            assert_eq!(rig.reply(CALL, method, WAIT), Some(488), "{method}");
         }
+    }
+
+    /// An INVITE with no `To` tag and this dialog's Call-ID is the one that
+    /// set the call up, late or duplicated on the wire — not a renegotiation.
+    /// A `488` for it would read to the peer as the call having failed.
+    #[test]
+    fn a_duplicate_of_the_initial_invite_is_ignored_not_refused() {
+        let rig = Rig::new();
+        assert_eq!(
+            rig.respond(&request_with("INVITE", CALL, false)),
+            Disposition::Handled
+        );
+        assert_eq!(rig.reply(CALL, "INVITE", NO_REPLY), None);
     }
 
     /// The dialog's own Call-ID must not turn a keepalive into silence.
     #[test]
     fn options_is_answered_whether_or_not_it_names_the_dialog() {
         for call_id in [CALL, "some-other-call"] {
-            let (ours, theirs) = pair();
-            let d = respond(
-                &ours,
-                &request("OPTIONS", call_id),
-                theirs.local_addr(),
-                CALL,
+            let rig = Rig::new();
+            assert_eq!(
+                rig.respond(&request("OPTIONS", call_id)),
+                Disposition::Handled
             );
-            assert_eq!(d, Disposition::Handled);
-            let resp = theirs
-                .recv_response(call_id, 7, "OPTIONS", Duration::from_secs(2))
-                .unwrap()
-                .unwrap_or_else(|| panic!("OPTIONS with Call-ID {call_id} got no reply"));
-            assert_eq!(resp.status, 200);
+            assert_eq!(
+                rig.reply(call_id, "OPTIONS", WAIT),
+                Some(200),
+                "OPTIONS with Call-ID {call_id} got no reply"
+            );
         }
     }
 
@@ -252,66 +312,89 @@ mod tests {
     #[test]
     fn any_other_in_dialog_method_is_refused_with_405() {
         for method in ["INFO", "NOTIFY", "MESSAGE"] {
-            let (ours, theirs) = pair();
-            let d = respond(&ours, &request(method, CALL), theirs.local_addr(), CALL);
-            assert_eq!(d, Disposition::Handled, "{method} must not end the call");
+            let rig = Rig::new();
             assert_eq!(
-                reply_to(&theirs, method, Duration::from_secs(2)),
-                Some(405),
-                "{method}"
+                rig.respond(&request(method, CALL)),
+                Disposition::Handled,
+                "{method} must not end the call"
             );
+            assert_eq!(rig.reply(CALL, method, WAIT), Some(405), "{method}");
         }
     }
 
     #[test]
-    fn a_bye_for_some_other_dialog_does_not_end_this_call() {
-        let (ours, theirs) = pair();
-        let d = respond(
-            &ours,
-            &request("BYE", "someone-elses-call"),
-            theirs.local_addr(),
-            CALL,
+    fn a_bye_for_an_unknown_dialog_does_not_end_this_call() {
+        let rig = Rig::new();
+        assert_eq!(
+            rig.respond(&request("BYE", "someone-elses-call")),
+            Disposition::Handled
         );
-        assert_eq!(d, Disposition::Handled);
+        assert_eq!(rig.reply("someone-elses-call", "BYE", NO_REPLY), None);
+    }
+
+    /// A call is in progress when the far end of an *earlier* one retransmits
+    /// its BYE (our `200` was lost). The reader serving the new call is the
+    /// only one listening, so it must answer for the old one too — without
+    /// ending its own.
+    #[test]
+    fn a_bye_for_a_dialog_that_just_ended_is_answered_during_another_call() {
+        let rig = Rig::new();
+        rig.hangups
+            .lock()
+            .unwrap()
+            .record("earlier-call", Instant::now());
+
+        assert_eq!(
+            rig.respond(&request("BYE", "earlier-call")),
+            Disposition::Handled,
+            "a BYE for another dialog must not end this call"
+        );
+        assert_eq!(rig.reply("earlier-call", "BYE", WAIT), Some(200));
     }
 
     #[test]
     fn an_ack_for_the_dialog_is_absorbed_without_a_reply() {
-        let (ours, theirs) = pair();
-        let d = respond(&ours, &request("ACK", CALL), theirs.local_addr(), CALL);
-        assert_eq!(d, Disposition::Handled);
-        assert_eq!(reply_to(&theirs, "ACK", Duration::from_millis(300)), None);
+        let rig = Rig::new();
+        assert_eq!(rig.respond(&request("ACK", CALL)), Disposition::Handled);
+        assert_eq!(rig.reply(CALL, "ACK", NO_REPLY), None);
     }
 
     #[test]
     fn a_different_calls_invite_is_still_busied_out() {
-        let (ours, theirs) = pair();
-        respond(
-            &ours,
-            &request("INVITE", "another-call"),
-            theirs.local_addr(),
-            CALL,
-        );
-        let busy = theirs
-            .recv_response("another-call", 7, "INVITE", Duration::from_secs(2))
-            .unwrap()
-            .expect("a second concurrent call is busied out");
-        assert_eq!(busy.status, 486);
+        let rig = Rig::new();
+        rig.respond(&request_with("INVITE", "another-call", false));
+        assert_eq!(rig.reply("another-call", "INVITE", WAIT), Some(486));
+    }
+
+    /// An INVITE that names a dialog we do not have is a re-INVITE that
+    /// crossed a hang-up, not a new call; `481` says so.
+    #[test]
+    fn an_invite_for_a_dialog_we_no_longer_have_is_481_not_busy() {
+        let rig = Rig::new();
+        rig.respond(&request("INVITE", "ended-call"));
+        assert_eq!(rig.reply("ended-call", "INVITE", WAIT), Some(481));
+    }
+
+    /// Whichever reader meets an unknown method gets the same answer as the
+    /// listener always gave it.
+    #[test]
+    fn an_unknown_method_from_outside_the_dialog_is_405_for_every_reader() {
+        let rig = Rig::new();
+        rig.respond(&request("MESSAGE", "unrelated"));
+        assert_eq!(rig.reply("unrelated", "MESSAGE", WAIT), Some(405));
     }
 
     #[test]
     fn a_bye_raises_stop_and_is_reported_to_the_caller() {
-        let (ours, theirs) = pair();
+        let rig = Rig::new();
         let stop = Arc::new(AtomicBool::new(false));
-        let mut queued = Some((request("BYE", CALL), theirs.local_addr()));
+        let mut queued = Some((request("BYE", CALL), rig.peer()));
 
-        let started = std::time::Instant::now();
-        let hangups = Mutex::new(RecentHangups::default());
+        let started = Instant::now();
         let ((), hung_up) = watch_while(
-            &ours,
+            &rig.ctx(),
             CALL,
             &stop,
-            &hangups,
             |wait| {
                 // Delivers the BYE once, then behaves like an idle queue.
                 queued.take().or_else(|| {
@@ -328,23 +411,21 @@ mod tests {
             },
         );
         assert!(hung_up);
-        assert_eq!(reply_to(&theirs, "BYE", Duration::from_secs(2)), Some(200));
+        assert_eq!(rig.reply(CALL, "BYE", WAIT), Some(200));
         assert!(
-            hangups.lock().unwrap().contains(CALL, Instant::now()),
+            rig.hangups.lock().unwrap().contains(CALL, Instant::now()),
             "the hang-up must be remembered for a retransmitted BYE"
         );
     }
 
     #[test]
     fn with_no_request_the_body_runs_to_completion_and_no_hang_up_is_reported() {
-        let (ours, _theirs) = pair();
+        let rig = Rig::new();
         let stop = Arc::new(AtomicBool::new(false));
-        let hangups = Mutex::new(RecentHangups::default());
         let (value, hung_up) = watch_while(
-            &ours,
+            &rig.ctx(),
             CALL,
             &stop,
-            &hangups,
             |wait| {
                 thread::sleep(wait);
                 None
@@ -363,15 +444,14 @@ mod tests {
     /// `thread::scope` would then wait for it forever.
     #[test]
     fn a_panicking_body_does_not_hang_the_watcher() {
-        let (ours, _theirs) = pair();
+        let rig = Rig::new();
         let stop = Arc::new(AtomicBool::new(false));
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             watch_while(
-                &ours,
+                &rig.ctx(),
                 CALL,
                 &stop,
-                &Mutex::new(RecentHangups::default()),
                 |wait| {
                     thread::sleep(wait);
                     None
@@ -384,5 +464,25 @@ mod tests {
             started.elapsed() < Duration::from_secs(3),
             "the watcher outlived its call"
         );
+    }
+
+    /// A watcher that panics is logged and reported as "no hang-up", not
+    /// propagated: for an inbound call it runs on the listener thread.
+    #[test]
+    fn a_panicking_watcher_does_not_take_the_call_down_with_it() {
+        let rig = Rig::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (value, hung_up) = watch_while(
+            &rig.ctx(),
+            CALL,
+            &stop,
+            |_wait| -> Option<(SipRequest, SocketAddr)> { panic!("source blew up") },
+            || {
+                thread::sleep(Duration::from_millis(200));
+                7
+            },
+        );
+        assert_eq!(value, 7);
+        assert!(!hung_up);
     }
 }

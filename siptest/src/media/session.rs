@@ -223,13 +223,22 @@ pub fn run(
     // `stop` being raised from outside (the far end hanging up) instead of
     // sleeping through it.
     let started = Instant::now();
-    let deadline = started + config.duration;
+    // `None` when the duration is too large to add to an `Instant` (the API
+    // takes any `u64` of seconds): no deadline, only `stop` ends the call,
+    // which is what sleeping for that long amounted to.
+    let deadline = started.checked_add(config.duration);
     while !stop.load(Ordering::Relaxed) {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        thread::sleep((deadline - now).min(STOP_POLL));
+        let nap = match deadline {
+            Some(deadline) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                (deadline - now).min(STOP_POLL)
+            }
+            None => STOP_POLL,
+        };
+        thread::sleep(nap);
     }
     stop.store(true, Ordering::Relaxed);
     // How long media really ran: shorter than `config.duration` when `stop`
@@ -552,6 +561,39 @@ mod tests {
             result.receive_stats.received_packets > 0,
             "expected the loopback echo to produce received packets"
         );
+    }
+
+    /// `POST /calls` accepts any `u64` of seconds. Adding that to an `Instant`
+    /// overflows and panics; the call must instead just run until stopped.
+    #[test]
+    fn an_absurdly_long_duration_does_not_panic_and_still_honours_stop() {
+        use std::net::UdpSocket as StdUdp;
+
+        let far = StdUdp::bind("127.0.0.1:0").unwrap();
+        let config = MediaSessionConfig {
+            local_rtp: "127.0.0.1:0".parse().unwrap(),
+            remote_rtp: far.local_addr().unwrap(),
+            codec: PCMU,
+            duration: Duration::from_secs(u64::MAX),
+            sent_wav_path: None,
+            received_wav_path: None,
+            tone_enabled: false,
+            play: None,
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopper = {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(200));
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+        let started = Instant::now();
+        let result = run(config, stop);
+        let _ = stopper.join();
+
+        assert!(result.is_ok());
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     /// A call the far end ends early can only have sent — and so only be

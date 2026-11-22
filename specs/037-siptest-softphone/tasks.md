@@ -83,7 +83,7 @@ note for exactly what was and wasn't in scope.
    an inbound INVITE meant for the call handler or a response meant for an
    in-flight transaction. The reader demultiplexes into a response queue
    (consumed by `recv_response`, used by registration/outbound) and a
-   request queue (consumed by `recv_request`, used by inbound). Fixed a real
+   request queue (consumed by `recv_request_from`, used by inbound). Fixed a real
    bug found while building this: `SipSocket::bind` with `local_port = 0`
    (any ephemeral-port bind, including every outbound call's RTP-adjacent
    signalling socket in tests) was reporting port 0 from its own

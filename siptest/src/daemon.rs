@@ -143,22 +143,19 @@ fn run_with_config(config: Config) -> SipTestResult<()> {
     Ok(())
 }
 
-/// Owns nothing but the read side of `recv_request` (via `SipSocket`, which
+/// Owns nothing but the read side of the request queue (via `SipSocket`, which
 /// already demultiplexes responses away from it — `sip/socket.rs`'s module
-/// doc). Answers `OPTIONS` immediately, busies out a second concurrent
-/// INVITE, refuses anything else with `405`, and hands a fresh INVITE to
-/// `call::execute_inbound_call`, which runs to completion before this loop
-/// reads again — correct for `max_concurrent = 1`.
+/// doc). Hands a fresh INVITE to `call::execute_inbound_call`, which runs to
+/// completion before this loop reads again — correct for `max_concurrent = 1`
+/// — and gives everything else to `sip::inbound::handle_stray`.
 /// `pub` so integration tests can drive it directly against a hand-built
 /// `SharedState`, without needing the full HTTP daemon up.
 pub fn inbound_listener_loop(state: Arc<SharedState>, stop: Arc<AtomicBool>) {
+    let ctx = state.request_ctx();
     while !stop.load(Ordering::Relaxed) {
         // Requests from any address but the bridge's are dropped inside
         // `recv_request_from`, with no reply — see its doc for why.
-        let Ok(Some((req, peer))) = state
-            .sip_socket
-            .recv_request_from(state.bridge_registrar.ip(), Duration::from_millis(500))
-        else {
+        let Some((req, peer)) = ctx.recv(Duration::from_millis(500)) else {
             continue;
         };
         // A request belonging to the outbound call in flight goes to that
@@ -166,56 +163,21 @@ pub fn inbound_listener_loop(state: Arc<SharedState>, stop: Arc<AtomicBool>) {
         if forward_to_dialog(&state, &req, peer) {
             continue;
         }
-        match req.method.as_str() {
-            "OPTIONS" => {
-                let _ = state
-                    .sip_socket
-                    .send(peer, &crate::sip::inbound::build_options_ok(&req));
-            }
-            "INVITE" => {
-                if state
-                    .calls
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .active()
-                    .is_some()
-                {
-                    let _ = state
-                        .sip_socket
-                        .send(peer, &crate::sip::inbound::build_busy(&req));
-                    continue;
-                }
-                crate::call::execute_inbound_call(&state, req, peer);
-            }
-            // A BYE for a dialog that has just ended — retransmitted because
-            // our `200` was lost, or crossing our own hang-up. The call is
-            // over, so only this can answer it.
-            "BYE"
-                if req.header("Call-ID").is_some_and(|id| {
-                    state
-                        .recent_hangups
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .contains(id, std::time::Instant::now())
-                }) =>
-            {
-                let _ = state.sip_socket.send(
-                    peer,
-                    &gsm_sip_bridge::ims::sip_client::build_uas_response(
-                        200, "OK", &req, None, None, None,
-                    ),
-                );
-            }
-            "ACK" | "BYE" | "CANCEL" => {
-                // Stray — the dialog these belong to is handled entirely
-                // inside `execute_inbound_call`'s own read loop while it
-                // runs; anything reaching here has no matching call.
-            }
-            _ => {
-                let _ = state
-                    .sip_socket
-                    .send(peer, &crate::sip::inbound::build_405(&req));
-            }
+        // Only an INVITE that starts a dialog (no `To` tag) can be a new call,
+        // and only when none is active; everything else is the shared stray
+        // handling's, the same as for every other reader.
+        if req.method == "INVITE"
+            && !crate::sip::inbound::has_to_tag(&req)
+            && state
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .active()
+                .is_none()
+        {
+            crate::call::execute_inbound_call(&state, req, peer);
+        } else {
+            crate::sip::inbound::handle_stray(&ctx, &req, peer, "");
         }
     }
 }

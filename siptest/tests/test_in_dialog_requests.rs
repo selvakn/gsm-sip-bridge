@@ -157,6 +157,9 @@ enum PeerAction {
     Options,
     /// An `OPTIONS` carrying the dialog's own Call-ID — a probe within it.
     DialogOptions,
+    /// The INVITE that set the call up, delivered again: a duplicate on the
+    /// wire, with no `To` tag. Inbound only.
+    DuplicateInvite,
     /// Nothing while the call runs; then, once siptest has hung up and the
     /// call is over, a `BYE` for the dialog — one that crossed siptest's own.
     LateBye,
@@ -166,7 +169,7 @@ impl PeerAction {
     fn method(self) -> &'static str {
         match self {
             PeerAction::Bye | PeerAction::LateBye => "BYE",
-            PeerAction::ReInvite => "INVITE",
+            PeerAction::ReInvite | PeerAction::DuplicateInvite => "INVITE",
             PeerAction::Update => "UPDATE",
             PeerAction::Options | PeerAction::DialogOptions => "OPTIONS",
         }
@@ -556,7 +559,9 @@ fn run_inbound_with(
                     2,
                     media_port,
                 );
-                if action != PeerAction::LateBye {
+                if action == PeerAction::DuplicateInvite {
+                    caller.send_to(invite.as_bytes(), siptest_addr).unwrap();
+                } else if action != PeerAction::LateBye {
                     caller.send_to(msg.as_bytes(), siptest_addr).unwrap();
                     bye_msg = Some(msg);
                 }
@@ -907,4 +912,82 @@ fn inbound_bye_after_our_own_hang_up_is_answered() {
         f.log.all()
     );
     assert_nothing_left_registered(&f);
+}
+
+/// A late or duplicated copy of the INVITE that set the call up is not a
+/// renegotiation. Refusing it with `488` would read to the peer as a failure
+/// of the call it duplicates; it is ignored, and the call carries on.
+#[test]
+fn inbound_duplicate_of_the_initial_invite_is_ignored_not_refused() {
+    let f = run_inbound(PeerAction::DuplicateInvite, PEER_ACTS_AFTER, 42600);
+
+    assert_eq!(f.call.end_reason, Some(EndReason::DurationElapsed));
+    assert!(f.elapsed >= Duration::from_secs(CALL_SECS - 1));
+    let failures: Vec<String> = f
+        .log
+        .all()
+        .into_iter()
+        .filter(|t| t.starts_with("SIP/2.0 4") || t.starts_with("SIP/2.0 5"))
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "a duplicate INVITE was refused: {failures:#?}"
+    );
+    assert_nothing_left_registered(&f);
+}
+
+/// An INVITE that names a dialog siptest no longer has — a re-INVITE that
+/// crossed its hang-up — is not a new call: it must be refused with `481`,
+/// not answered, rung, and given a whole inbound call's worth of listener.
+#[test]
+fn an_invite_for_an_ended_dialog_is_481_not_a_new_inbound_call() {
+    let config = test_config(42700, CALL_SECS as u32);
+    let caller = UdpSocket::bind("127.0.0.1:0").unwrap();
+    caller
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let caller_addr = caller.local_addr().unwrap();
+    let sip_socket =
+        Arc::new(SipSocket::bind(Some("127.0.0.1".parse().unwrap()), 0, caller_addr).unwrap());
+    let siptest_addr = sip_socket.local_addr();
+    let state = build_state(config, sip_socket, caller_addr);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let listener = {
+        let state = state.clone();
+        let stop = stop.clone();
+        thread::spawn(move || siptest::daemon::inbound_listener_loop(state, stop))
+    };
+
+    let sdp = PEER_SDP.replace("{PORT}", "42000");
+    let invite = format!(
+        "INVITE sip:1002@{siptest_addr} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP {caller_addr};branch=z9hG4bKcrossed\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:+919000000000@127.0.0.1:5060>;tag=callertag\r\n\
+         To: <sip:1002@{siptest_addr}>;tag=gone\r\n\
+         Call-ID: an-ended-dialog\r\n\
+         CSeq: 2 INVITE\r\n\
+         Contact: <sip:agent@{caller_addr}>\r\n\
+         Content-Type: application/sdp\r\n\
+         Content-Length: {}\r\n\r\n\
+         {sdp}",
+        sdp.len(),
+    );
+    caller.send_to(invite.as_bytes(), siptest_addr).unwrap();
+
+    let mut buf = [0u8; 4096];
+    let (n, _) = caller.recv_from(&mut buf).expect("a reply");
+    let reply = String::from_utf8_lossy(&buf[..n]).to_string();
+    assert!(
+        reply.starts_with("SIP/2.0 481"),
+        "expected 481, got: {reply}"
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = listener.join();
+    assert!(
+        state.calls.lock().unwrap().recent(5).is_empty(),
+        "an INVITE for an ended dialog started a call"
+    );
 }
