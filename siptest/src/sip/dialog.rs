@@ -24,12 +24,13 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gsm_sip_bridge::ims::sip_client::{build_uas_response, SipRequest};
 
+use crate::api::state::RecentHangups;
 use crate::sip::inbound::{build_405, build_options_ok, handle_stray};
 use crate::sip::socket::SipSocket;
 
@@ -106,11 +107,13 @@ impl Drop for FinishOnDrop<'_> {
 /// Runs `body` (the media session) while a watcher thread answers requests
 /// from `next_request`. Returns `body`'s result and whether the far end hung
 /// up — in which case `stop` has been raised, so a well-behaved `body` has
-/// already returned early.
+/// already returned early. A `BYE` for the dialog is recorded in `hangups`
+/// before it is answered.
 pub fn watch_while<T>(
     socket: &SipSocket,
     call_id: &str,
     stop: &Arc<AtomicBool>,
+    hangups: &Mutex<RecentHangups>,
     mut next_request: impl FnMut(Duration) -> Option<(SipRequest, SocketAddr)> + Send,
     body: impl FnOnce() -> T,
 ) -> (T, bool) {
@@ -122,6 +125,16 @@ pub fn watch_while<T>(
                 let Some((req, peer)) = next_request(POLL) else {
                     continue;
                 };
+                // Recorded *before* the `200` leaves, so there is no moment
+                // at which the peer has been told the dialog is over but a
+                // retransmission of its `BYE` would find nobody to answer it
+                // once this call is gone.
+                if req.method == "BYE" && req.header("Call-ID") == Some(call_id) {
+                    hangups
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record(call_id, Instant::now());
+                }
                 // Keeps answering after the first BYE so a retransmission of
                 // it still gets its `200` while the call winds down.
                 if respond(socket, &req, peer, call_id) == Disposition::RemoteBye {
@@ -293,10 +306,12 @@ mod tests {
         let mut queued = Some((request("BYE", CALL), theirs.local_addr()));
 
         let started = std::time::Instant::now();
+        let hangups = Mutex::new(RecentHangups::default());
         let ((), hung_up) = watch_while(
             &ours,
             CALL,
             &stop,
+            &hangups,
             |wait| {
                 // Delivers the BYE once, then behaves like an idle queue.
                 queued.take().or_else(|| {
@@ -314,16 +329,22 @@ mod tests {
         );
         assert!(hung_up);
         assert_eq!(reply_to(&theirs, "BYE", Duration::from_secs(2)), Some(200));
+        assert!(
+            hangups.lock().unwrap().contains(CALL, Instant::now()),
+            "the hang-up must be remembered for a retransmitted BYE"
+        );
     }
 
     #[test]
     fn with_no_request_the_body_runs_to_completion_and_no_hang_up_is_reported() {
         let (ours, _theirs) = pair();
         let stop = Arc::new(AtomicBool::new(false));
+        let hangups = Mutex::new(RecentHangups::default());
         let (value, hung_up) = watch_while(
             &ours,
             CALL,
             &stop,
+            &hangups,
             |wait| {
                 thread::sleep(wait);
                 None
@@ -350,6 +371,7 @@ mod tests {
                 &ours,
                 CALL,
                 &stop,
+                &Mutex::new(RecentHangups::default()),
                 |wait| {
                     thread::sleep(wait);
                     None

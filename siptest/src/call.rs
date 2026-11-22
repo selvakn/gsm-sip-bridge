@@ -412,6 +412,7 @@ fn drive_outbound(
         &state.sip_socket,
         &dialog.call_id,
         &stop,
+        &state.recent_hangups,
         move |wait: Duration| route_rx.recv_timeout(wait).ok(),
         || {
             crate::media::session::run(
@@ -429,11 +430,13 @@ fn drive_outbound(
             )
         },
     );
+    // Whoever ends it, a BYE for this dialog is answered for a while after
+    // the call is gone (a retransmission, or one crossing ours).
+    state.note_hangup(&dialog.call_id);
     if remote_bye {
         // The far end ended the dialog; a BYE of ours — now or from the
         // failure guard — would go to a dialog that no longer exists.
         run.dialog = None;
-        state.note_remote_bye(&dialog.call_id);
     }
     let media_result = media_result?;
 
@@ -782,6 +785,7 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
                 &state.sip_socket,
                 &call_id_hdr,
                 &stop,
+                &state.recent_hangups,
                 |wait: Duration| {
                     state
                         .sip_socket
@@ -808,9 +812,8 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
 
             // We initiate the BYE at the end of the configured duration —
             // unless the far end already ended the dialog.
-            if remote_bye {
-                state.note_remote_bye(&call_id_hdr);
-            } else {
+            state.note_hangup(&call_id_hdr);
+            if !remote_bye {
                 send_our_bye(state, &to_tag, &call_id_hdr, peer, &caller_id);
             }
 

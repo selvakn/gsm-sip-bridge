@@ -195,6 +195,14 @@ impl SipSocket {
                 Some((req, peer)) if peer.ip() == trusted => return Ok(Some((req, peer))),
                 Some((_, peer)) => {
                     tracing::warn!(%peer, "dropping SIP request from an unexpected source IP");
+                    // `next_request` returns anything already queued before it
+                    // looks at the clock, so a sender that keeps the queue
+                    // non-empty would hold this loop — and a connected call's
+                    // watcher, which must keep checking whether the call is
+                    // over — past its deadline for as long as it keeps sending.
+                    if Instant::now() >= deadline {
+                        return Ok(None);
+                    }
                 }
             }
         }
@@ -570,5 +578,50 @@ mod tests {
             .expect("the trusted request");
         assert_eq!(req.header("Call-ID"), Some("friend"));
         assert_eq!(peer.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+    }
+
+    /// A sender that keeps the queue non-empty must not hold the caller past
+    /// its deadline: the clock is checked after every request dropped, not
+    /// only when the queue runs dry. With the deadline already reached, one
+    /// untrusted request is consumed and the call returns — it does not keep
+    /// draining, and so would not keep going while a flood refills the queue.
+    #[test]
+    fn untrusted_traffic_cannot_hold_the_reader_past_its_deadline() {
+        let a = SipSocket::bind(
+            Some("127.0.0.1".parse().unwrap()),
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .unwrap();
+        let msg = |call: &str| {
+            format!("OPTIONS sip:1002@127.0.0.1 SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:5072;branch=z9hG4bK1\r\nCall-ID: {call}\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n")
+        };
+        let intruder = std::net::UdpSocket::bind("127.0.0.2:0").unwrap();
+        for n in 0..40 {
+            intruder
+                .send_to(msg(&format!("flood-{n}")).as_bytes(), a.local_addr())
+                .unwrap();
+        }
+        thread::sleep(Duration::from_millis(150));
+        let friend = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        friend
+            .send_to(msg("friend").as_bytes(), a.local_addr())
+            .unwrap();
+        thread::sleep(Duration::from_millis(150));
+
+        let trusted: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(
+            a.recv_request_from(trusted, Duration::ZERO)
+                .unwrap()
+                .is_none(),
+            "the reader drained a whole queue of untrusted requests past its deadline"
+        );
+        // Nothing is lost by returning early: the trusted request is still
+        // there for the next read.
+        let (req, _) = a
+            .recv_request_from(trusted, Duration::from_secs(2))
+            .unwrap()
+            .expect("the trusted request is still queued");
+        assert_eq!(req.header("Call-ID"), Some("friend"));
     }
 }

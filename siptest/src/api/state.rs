@@ -174,20 +174,20 @@ pub struct SharedState {
     /// UPDATE...) for the outbound call currently in flight. `None` whenever
     /// no outbound call is registered — see [`DialogRoute`].
     pub dialog_route: Mutex<Option<DialogRoute>>,
-    /// Dialogs the far end ended with a `BYE` we answered, so a retransmitted
-    /// `BYE` (our `200` was lost) still gets its `200` after the call is over.
+    /// Dialogs that have just ended, so a `BYE` for one — retransmitted, or
+    /// crossing our own — still gets its `200` after the call is over.
     pub recent_hangups: Mutex<RecentHangups>,
 }
 
-/// Call-IDs of dialogs the far end ended, kept briefly after the call.
+/// Call-IDs of dialogs that have just ended — hung up by the far end *or* by
+/// us — kept briefly after the call.
 ///
-/// siptest has no SIP transaction layer, so nothing else would answer a
-/// retransmission of a `BYE` once its call is gone — and a peer that never
-/// sees our `200` retransmits for about 32 s (64 × T1, RFC 3261 §17.2.2).
-/// The call's own watcher answers retransmissions while the call lasts, and
-/// a remote hang-up now ends it within milliseconds, well inside the peer's
-/// first retry at 500 ms. This covers the rest of that window. Bounded in
-/// both time and size.
+/// siptest has no SIP transaction layer, so nothing else would answer a `BYE`
+/// for a dialog once its call is gone: not a retransmission of one we already
+/// answered (our `200` was lost), and not one that crossed our own hang-up.
+/// A peer that never sees a `200` retransmits for about 32 s (64 × T1, RFC
+/// 3261 §17.2.2). The call's own watcher answers while the call lasts; this
+/// covers the rest of that window. Bounded in both time and size.
 #[derive(Debug, Default)]
 pub struct RecentHangups {
     entries: VecDeque<(String, Instant)>,
@@ -278,9 +278,9 @@ impl SharedState {
         CallId(format!("c-{n}"))
     }
 
-    /// Remembers that the far end hung up `sip_call_id`'s dialog, so a
-    /// retransmitted `BYE` is still answered after the call has gone.
-    pub fn note_remote_bye(&self, sip_call_id: &str) {
+    /// Remembers that `sip_call_id`'s dialog has ended, so a `BYE` for it is
+    /// still answered after the call has gone.
+    pub fn note_hangup(&self, sip_call_id: &str) {
         self.recent_hangups
             .lock()
             .unwrap_or_else(|e| e.into_inner())

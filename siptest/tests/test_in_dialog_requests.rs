@@ -157,12 +157,15 @@ enum PeerAction {
     Options,
     /// An `OPTIONS` carrying the dialog's own Call-ID — a probe within it.
     DialogOptions,
+    /// Nothing while the call runs; then, once siptest has hung up and the
+    /// call is over, a `BYE` for the dialog — one that crossed siptest's own.
+    LateBye,
 }
 
 impl PeerAction {
     fn method(self) -> &'static str {
         match self {
-            PeerAction::Bye => "BYE",
+            PeerAction::Bye | PeerAction::LateBye => "BYE",
             PeerAction::ReInvite => "INVITE",
             PeerAction::Update => "UPDATE",
             PeerAction::Options | PeerAction::DialogOptions => "OPTIONS",
@@ -306,6 +309,20 @@ fn run_outbound(action: PeerAction, act_after: Duration, rtp_min: u16) -> Finish
             let mut acted = false;
             while !stop.load(Ordering::Relaxed) {
                 if resend.swap(false, Ordering::Relaxed) {
+                    if let (None, Some((invite, src))) = (&sent, dialog.as_ref()) {
+                        // A late BYE is composed now, once the call is over.
+                        let msg = peer_request(
+                            action,
+                            *src,
+                            peer_addr,
+                            invite.header("Call-ID").unwrap(),
+                            &format!("{};tag=callee", invite.header("To").unwrap()),
+                            invite.header("From").unwrap(),
+                            1,
+                            media_port,
+                        );
+                        sent = Some((msg, *src));
+                    }
                     if let Some((msg, dst)) = &sent {
                         let _ = peer.send_to(msg.as_bytes(), dst);
                     }
@@ -325,8 +342,10 @@ fn run_outbound(action: PeerAction, act_after: Duration, rtp_min: u16) -> Finish
                             1,
                             media_port,
                         );
-                        let _ = peer.send_to(msg.as_bytes(), src);
-                        sent = Some((msg, *src));
+                        if action != PeerAction::LateBye {
+                            let _ = peer.send_to(msg.as_bytes(), src);
+                            sent = Some((msg, *src));
+                        }
                     }
                 }
                 let Ok((n, src)) = peer.recv_from(&mut buf) else {
@@ -378,7 +397,7 @@ fn run_outbound(action: PeerAction, act_after: Duration, rtp_min: u16) -> Finish
     )
     .expect("the outbound call should complete");
     let elapsed = started.elapsed();
-    if action == PeerAction::Bye {
+    if matches!(action, PeerAction::Bye | PeerAction::LateBye) {
         resend.store(true, Ordering::Relaxed);
     }
 
@@ -537,8 +556,10 @@ fn run_inbound_with(
                     2,
                     media_port,
                 );
-                caller.send_to(msg.as_bytes(), siptest_addr).unwrap();
-                bye_msg = Some(msg);
+                if action != PeerAction::LateBye {
+                    caller.send_to(msg.as_bytes(), siptest_addr).unwrap();
+                    bye_msg = Some(msg);
+                }
             }
         }
         if let Some(sock) = &intruder_sock {
@@ -564,11 +585,21 @@ fn run_inbound_with(
         if let Some(t) = ended_at {
             // The peer retransmits its BYE once the call is over, as it would
             // had siptest's `200` been lost.
-            if action == PeerAction::Bye && !resent {
-                if let Some(msg) = &bye_msg {
-                    caller.send_to(msg.as_bytes(), siptest_addr).unwrap();
-                    resent = true;
-                }
+            if matches!(action, PeerAction::Bye | PeerAction::LateBye) && !resent {
+                let msg = bye_msg.clone().unwrap_or_else(|| {
+                    peer_request(
+                        action,
+                        siptest_addr,
+                        caller_addr,
+                        call_id,
+                        &from,
+                        &to,
+                        2,
+                        media_port,
+                    )
+                });
+                caller.send_to(msg.as_bytes(), siptest_addr).unwrap();
+                resent = true;
             }
             if t.elapsed() > Duration::from_millis(500) {
                 break;
@@ -843,5 +874,37 @@ fn an_untrusted_sender_cannot_hang_up_or_probe_an_answered_inbound_call() {
         f.intruder_log.all()
     );
     assert_eq!(f.log.requests("BYE"), 1, "we hang up at the end ourselves");
+    assert_nothing_left_registered(&f);
+}
+
+/// A BYE that crosses siptest's own hang-up — or simply arrives after it — is
+/// for a dialog that has just ended, and is answered like a retransmission.
+/// Nothing but the recent-hang-up record can answer it: the call is over and
+/// its watcher gone.
+#[test]
+fn outbound_bye_after_our_own_hang_up_is_answered() {
+    let f = run_outbound(PeerAction::LateBye, PEER_ACTS_AFTER, 42400);
+
+    assert_eq!(f.call.end_reason, Some(EndReason::DurationElapsed));
+    assert_eq!(f.log.requests("BYE"), 1, "we hung up ourselves");
+    assert!(
+        f.log.answered(200, "BYE"),
+        "a BYE for a dialog that had just ended went unanswered: {:#?}",
+        f.log.all()
+    );
+    assert_nothing_left_registered(&f);
+}
+
+#[test]
+fn inbound_bye_after_our_own_hang_up_is_answered() {
+    let f = run_inbound(PeerAction::LateBye, PEER_ACTS_AFTER, 42500);
+
+    assert_eq!(f.call.end_reason, Some(EndReason::DurationElapsed));
+    assert_eq!(f.log.requests("BYE"), 1, "we hung up ourselves");
+    assert!(
+        f.log.answered(200, "BYE"),
+        "a BYE for a dialog that had just ended went unanswered: {:#?}",
+        f.log.all()
+    );
     assert_nothing_left_registered(&f);
 }

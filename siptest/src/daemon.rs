@@ -187,8 +187,9 @@ pub fn inbound_listener_loop(state: Arc<SharedState>, stop: Arc<AtomicBool>) {
                 }
                 crate::call::execute_inbound_call(&state, req, peer);
             }
-            // A retransmitted BYE for a call the far end already ended: our
-            // `200` was lost and the call is over, so only this can answer it.
+            // A BYE for a dialog that has just ended — retransmitted because
+            // our `200` was lost, or crossing our own hang-up. The call is
+            // over, so only this can answer it.
             "BYE"
                 if req.header("Call-ID").is_some_and(|id| {
                     state
