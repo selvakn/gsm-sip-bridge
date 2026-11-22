@@ -112,6 +112,9 @@ pub(super) struct InviteContext<'a> {
     pub(super) access_network_info: &'a str,
     /// See `config::VowifiConfig::respect_caller_privacy`.
     pub(super) respect_caller_privacy: bool,
+    /// See `config::VowifiConfig::respond_on_client`: also where the waits
+    /// below answer the requests they take (`HeldMessages`).
+    pub(super) respond_on_client: bool,
     /// See `config::VowifiConfig::amr_passthrough`.
     pub(super) amr_passthrough: bool,
     /// See `config::AudioConfig::rtp_reorder_wait_ms`.
@@ -558,7 +561,7 @@ pub(super) fn handle_invite(
                 control: &mut control,
                 pending: None,
             };
-            let mut held = HeldMessages::new(&inbound.tx);
+            let mut held = HeldMessages::new(&inbound.tx, ctx.respond_on_client);
             let ringing = await_pbx_answer(
                 &call_id,
                 &ctrl_rx,
@@ -970,7 +973,7 @@ fn handle_offerless_invite(
     let our_offer =
         super::origination::bridged_call_offer(session.local_addr.ip(), ims_rtp_port, ctx.wideband);
 
-    let mut held = HeldMessages::new(&inbound.tx);
+    let mut held = HeldMessages::new(&inbound.tx, ctx.respond_on_client);
     let ring_outcome = await_pbx_answer(
         call_id,
         &ctrl_rx,
@@ -1027,67 +1030,25 @@ fn handle_offerless_invite(
     );
     sink.send(&response)?;
 
-    // specs/047-offerless-invite-sms-reassembly, research.md Decision 3:
-    // the same drain-loop shape `await_pbx_answer` already uses, watching
-    // for the one thing this wait cares about — the caller's `ACK` naming
-    // this exact dialog (RFC 3261 §12.2.2: Call-ID plus both tags —
-    // `names_active_dialog`, reused from `agent::mod` unchanged) — and
-    // ignoring everything else, same posture `await_pbx_answer` already
-    // has for an irrelevant method. Except a new call: the line is occupied,
-    // so its INVITE is declined busy (`decline_second_call`), not ignored.
-    //
-    // A `BYE` naming this dialog is *not* one of the things safely ignored,
-    // unlike an unrelated method: RFC 3261 §12.1.1 confirms this dialog the
-    // moment we sent the `2xx` above, before the caller's own `ACK` — so a
-    // caller that answers and immediately hangs up (or never actually
-    // intended to complete the offer/answer) can legitimately `BYE` it
-    // before its `ACK` ever arrives. Left unanswered, that `BYE` is simply
-    // retransmitted by the network until this wait times out and this
-    // bridge sends its *own*, redundant `BYE` for a dialog already ended
-    // from the other side (code review finding, 2026-08-28).
-    let mut held = HeldMessages::new(&inbound.tx);
-    let deadline = Instant::now() + OFFERLESS_ACK_TIMEOUT;
+    let mut held = HeldMessages::new(&inbound.tx, ctx.respond_on_client);
+    let waited = await_offerless_ack(
+        req,
+        call_id,
+        to_tag,
+        &inbound.rx,
+        &mut held,
+        session,
+        ring_service,
+        OFFERLESS_ACK_TIMEOUT,
+    );
+    drop(held);
     // Outer `Some`: the ACK arrived. Inner: the SDP answer it carried, if
     // its body had a usable one (`ack_answer`).
-    let mut ack: Option<Option<String>> = None;
-    let mut caller_bye = false;
-    'wait_for_ack: while Instant::now() < deadline {
-        while let Ok((msg, req_sink)) = inbound.rx.try_recv() {
-            let Some((candidate, req_sink)) = held.take_response(msg, req_sink) else {
-                continue;
-            };
-            let this_dialog = super::names_active_dialog(
-                &candidate,
-                call_id,
-                to_tag,
-                req.header("From").unwrap_or_default(),
-            );
-            if candidate.method == "ACK" && this_dialog {
-                // A body that cannot be read as SDP (`body::extract_sdp`
-                // has logged why) fails this call exactly as a missing
-                // answer does, below: there is no call yet to keep.
-                ack = Some(ack_answer(&candidate).unwrap_or(None));
-                break 'wait_for_ack;
-            }
-            if candidate.method == "BYE" && this_dialog {
-                tracing::info!(call_id = %call_id, "caller ended the offerless call before its ACK arrived");
-                respond(
-                    &req_sink,
-                    "200 OK (BYE, offerless pre-ACK)",
-                    &build_uas_response(200, "OK", &candidate, Some(to_tag), None, None),
-                );
-                caller_bye = true;
-                break 'wait_for_ack;
-            }
-            if decline_second_call(&candidate, &req_sink, call_id, ring_service.as_deref_mut()) {
-                continue;
-            }
-            tracing::debug!(method = %candidate.method, "ignoring inbound request while awaiting the offerless call's ACK");
-        }
-        std::thread::sleep(RING_POLL_INTERVAL);
-    }
-
-    drop(held);
+    let (ack, caller_bye) = match waited {
+        AckWait::Ack(answer) => (Some(answer), false),
+        AckWait::CallerBye => (None, true),
+        AckWait::TimedOut => (None, false),
+    };
     if caller_bye {
         // The far end already ended this dialog — echoing our own `BYE`
         // back at it would be answering a call that no longer exists from
@@ -1451,21 +1412,44 @@ pub(super) struct RingWork<'a> {
 pub(super) struct HeldMessages<'a> {
     tx: &'a mpsc::Sender<(SipMessage, SipSink)>,
     items: Vec<(SipMessage, SipSink)>,
+    /// `vowifi.respond_on_client`, for the requests handed back to the wait.
+    respond_on_client: bool,
 }
 
 impl<'a> HeldMessages<'a> {
-    pub(super) fn new(tx: &'a mpsc::Sender<(SipMessage, SipSink)>) -> Self {
+    pub(super) fn new(
+        tx: &'a mpsc::Sender<(SipMessage, SipSink)>,
+        respond_on_client: bool,
+    ) -> Self {
         Self {
             tx,
             items: Vec::new(),
+            respond_on_client,
         }
     }
 
     /// Takes `msg` if it is not a request, handing a request back for the
-    /// wait to deal with.
-    fn take_response(&mut self, msg: SipMessage, sink: SipSink) -> Option<(SipRequest, SipSink)> {
+    /// wait to deal with, with the sink to answer it on: the one the
+    /// dispatch loop would have chosen (`super::request_answer_sink`), so a
+    /// wait's `200 OK` to a `CANCEL` or `BYE`, its resent `180` and its busy
+    /// decline go where the loop's own answers go. Without `session` (a
+    /// wait run without one, in tests) it is the arrival socket.
+    fn take_response(
+        &mut self,
+        msg: SipMessage,
+        sink: SipSink,
+        session: Option<&crate::ims::RegisteredSession>,
+    ) -> Option<(SipRequest, SipSink)> {
         match msg {
-            SipMessage::Request(req) => Some((req, sink)),
+            SipMessage::Request(req) => {
+                let sink = match session {
+                    Some(session) => {
+                        super::request_answer_sink(self.respond_on_client, session, sink)
+                    }
+                    None => sink,
+                };
+                Some((req, sink))
+            }
             response => {
                 self.items.push((response, sink));
                 None
@@ -1480,6 +1464,88 @@ impl Drop for HeldMessages<'_> {
             let _ = self.tx.send(item);
         }
     }
+}
+
+/// How an offerless call's wait for its `ACK` ended.
+#[derive(Debug, PartialEq)]
+enum AckWait {
+    /// The caller's `ACK` for this dialog arrived, with the SDP answer it
+    /// carried if its body had a usable one (`ack_answer`).
+    Ack(Option<String>),
+    /// The caller ended the dialog with a `BYE` before its `ACK`; the `BYE`
+    /// has been answered `200 OK`.
+    CallerBye,
+    /// Neither arrived in time.
+    TimedOut,
+}
+
+/// After answering an offerless INVITE (`invite`) with our own offer, waits
+/// up to `timeout` for the caller's `ACK` carrying its answer.
+///
+/// specs/047-offerless-invite-sms-reassembly, research.md Decision 3: the
+/// same drain-loop shape `await_pbx_answer` uses, watching for the one thing
+/// this wait cares about — the caller's `ACK` naming this exact dialog
+/// (RFC 3261 §12.2.2: Call-ID plus both tags — `names_active_dialog`) — and
+/// ignoring everything else, as `await_pbx_answer` does with an irrelevant
+/// method. Except a new call: the line is occupied, so its INVITE is
+/// declined busy (`decline_second_call`), not ignored.
+///
+/// A `BYE` naming this dialog is *not* one of the things safely ignored,
+/// unlike an unrelated method: RFC 3261 §12.1.1 confirms this dialog the
+/// moment we sent the `2xx`, before the caller's own `ACK` — so a caller
+/// that answers and immediately hangs up (or never actually intended to
+/// complete the offer/answer) can legitimately `BYE` it before its `ACK`
+/// ever arrives. Left unanswered, that `BYE` is simply retransmitted by the
+/// network until this wait times out and this bridge sends its *own*,
+/// redundant `BYE` for a dialog already ended from the other side (code
+/// review finding, 2026-08-28).
+#[allow(clippy::too_many_arguments)]
+fn await_offerless_ack(
+    invite: &SipRequest,
+    call_id: &str,
+    to_tag: &str,
+    sip_rx: &mpsc::Receiver<(SipMessage, SipSink)>,
+    held: &mut HeldMessages<'_>,
+    session: &crate::ims::RegisteredSession,
+    mut service: Option<&mut (dyn RingService + '_)>,
+    timeout: Duration,
+) -> AckWait {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        while let Ok((msg, req_sink)) = sip_rx.try_recv() {
+            let Some((candidate, req_sink)) = held.take_response(msg, req_sink, Some(session))
+            else {
+                continue;
+            };
+            let this_dialog = super::names_active_dialog(
+                &candidate,
+                call_id,
+                to_tag,
+                invite.header("From").unwrap_or_default(),
+            );
+            if candidate.method == "ACK" && this_dialog {
+                // A body that cannot be read as SDP (`body::extract_sdp`
+                // has logged why) fails this call exactly as a missing
+                // answer does: there is no call yet to keep.
+                return AckWait::Ack(ack_answer(&candidate).unwrap_or(None));
+            }
+            if candidate.method == "BYE" && this_dialog {
+                tracing::info!(call_id = %call_id, "caller ended the offerless call before its ACK arrived");
+                respond(
+                    &req_sink,
+                    "200 OK (BYE, offerless pre-ACK)",
+                    &build_uas_response(200, "OK", &candidate, Some(to_tag), None, None),
+                );
+                return AckWait::CallerBye;
+            }
+            if decline_second_call(&candidate, &req_sink, call_id, service.as_deref_mut()) {
+                continue;
+            }
+            tracing::debug!(method = %candidate.method, "ignoring inbound request while awaiting the offerless call's ACK");
+        }
+        std::thread::sleep(RING_POLL_INTERVAL);
+    }
+    AckWait::TimedOut
 }
 
 /// Hold the carrier in the ringing state until Agent B reports the PBX
@@ -1523,7 +1589,8 @@ fn await_pbx_answer(
                     continue;
                 }
             }
-            let Some((req, req_sink)) = held.take_response(msg, req_sink) else {
+            let session = work.as_ref().map(|w| &*w.session);
+            let Some((req, req_sink)) = held.take_response(msg, req_sink, session) else {
                 continue;
             };
             if req.method == "CANCEL" && req.header("Call-ID") == Some(call_id) {
@@ -1699,7 +1766,7 @@ mod tests {
                 "From: <sip:+919000000000@ims.example>;tag=abc\r\nTo: <sip:me@ims.example>\r\n",
             );
 
-            let mut held = HeldMessages::new(&sip_tx);
+            let mut held = HeldMessages::new(&sip_tx, false);
             let outcome = await_pbx_answer(
                 "c1",
                 &ctrl_rx,
@@ -1792,7 +1859,7 @@ mod tests {
             answers_before_first_tick: None,
         };
 
-        let mut held = HeldMessages::new(&sip_tx);
+        let mut held = HeldMessages::new(&sip_tx, false);
         let outcome = await_pbx_answer(
             "c1",
             &ctrl_rx,
@@ -1856,7 +1923,7 @@ mod tests {
             .unwrap();
         let req = invite_with_headers("From: <sip:+919000000000@ims.example>;tag=abc\r\n");
 
-        let mut held = HeldMessages::new(&sip_tx);
+        let mut held = HeldMessages::new(&sip_tx, false);
         let outcome = await_pbx_answer(
             "c1",
             &ctrl_rx,
@@ -1976,7 +2043,7 @@ mod tests {
         let mut session =
             crate::ims::test_session_with_sa(None, carrier.local_addr().unwrap(), None);
         let mut busy = BusyLoop::default();
-        let mut held = HeldMessages::new(&sip_tx);
+        let mut held = HeldMessages::new(&sip_tx, false);
         let outcome = await_pbx_answer(
             "c1",
             &ctrl_rx,
@@ -2013,7 +2080,7 @@ mod tests {
                 call_id: "c1".into(),
             })
             .unwrap();
-        let mut held = HeldMessages::new(&sip_tx);
+        let mut held = HeldMessages::new(&sip_tx, false);
         let outcome = await_pbx_answer(
             "c1",
             &ctrl_rx,
@@ -2036,6 +2103,129 @@ mod tests {
         assert!(sent.contains("Call-ID: c3\r\n"), "{sent}");
     }
 
+    /// The first call's `ACK`: its Call-ID, our `To` tag, the caller's tag.
+    fn ack_for_first_call(to_tag: &str) -> SipRequest {
+        let raw = format!(
+            "ACK sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKack\r\n\
+             From: <sip:+919000000000@ims.example>;tag=abc\r\n\
+             To: <sip:me@ims.example>;tag={to_tag}\r\n\
+             Call-ID: c1\r\nCSeq: 1 ACK\r\nContent-Length: 0\r\n\r\n"
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// A UDP "carrier" socket and a sink sending to it.
+    fn carrier_with_sink() -> (UdpSocket, SipSink) {
+        let carrier = UdpSocket::bind("127.0.0.1:0").unwrap();
+        carrier
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let sink =
+            crate::ims::sip_client::SipTransport::connect(carrier.local_addr().unwrap(), false)
+                .unwrap()
+                .sink()
+                .unwrap();
+        (carrier, sink)
+    }
+
+    /// After an offerless call's `200 OK`, a second call offered before the
+    /// first call's `ACK` is handed to the loop's busy decline, and the `ACK`
+    /// that follows still completes the first call.
+    #[test]
+    fn a_second_call_offered_while_the_offerless_call_awaits_its_ack_is_declined_busy() {
+        let (carrier, sink) = carrier_with_sink();
+        let (sip_tx, sip_rx) = mpsc::channel::<(SipMessage, SipSink)>();
+        sip_tx
+            .send((SipMessage::Request(second_invite("c2")), sink.clone()))
+            .unwrap();
+        sip_tx
+            .send((SipMessage::Request(ack_for_first_call("tag")), sink.clone()))
+            .unwrap();
+        let invite = invite_with_headers("From: <sip:+919000000000@ims.example>;tag=abc\r\n");
+        let session = crate::ims::test_session_with_sa(None, carrier.local_addr().unwrap(), None);
+        let mut busy = BusyLoop::default();
+
+        let mut held = HeldMessages::new(&sip_tx, false);
+        let waited = await_offerless_ack(
+            &invite,
+            "c1",
+            "tag",
+            &sip_rx,
+            &mut held,
+            &session,
+            Some(&mut busy),
+            Duration::from_secs(2),
+        );
+        drop(held);
+
+        assert_eq!(
+            waited,
+            AckWait::Ack(None),
+            "the first call's ACK completes it"
+        );
+        assert_eq!(busy.declined, ["c2"], "the loop declines the second call");
+        assert!(sip_rx.try_recv().is_err(), "nothing is left over");
+    }
+
+    /// With `vowifi.respond_on_client`, a wait answers a request on the
+    /// session's client leg, as the dispatch loop does; without it, on the
+    /// socket the request arrived on.
+    #[test]
+    fn a_wait_answers_on_the_connection_the_loop_would_choose() {
+        for respond_on_client in [false, true] {
+            let (arrival, arrival_sink) = carrier_with_sink();
+            let (client, _) = carrier_with_sink();
+            let transport =
+                crate::ims::sip_client::SipTransport::connect(client.local_addr().unwrap(), false)
+                    .unwrap();
+            let session = crate::ims::test_session_with_sa(
+                Some(transport),
+                client.local_addr().unwrap(),
+                None,
+            );
+            let (sip_tx, sip_rx) = mpsc::channel::<(SipMessage, SipSink)>();
+            sip_tx
+                .send((SipMessage::Request(second_invite("c2")), arrival_sink))
+                .unwrap();
+            let invite = invite_with_headers("From: <sip:+919000000000@ims.example>;tag=abc\r\n");
+
+            let mut held = HeldMessages::new(&sip_tx, respond_on_client);
+            let waited = await_offerless_ack(
+                &invite,
+                "c1",
+                "tag",
+                &sip_rx,
+                &mut held,
+                &session,
+                None,
+                Duration::from_millis(100),
+            );
+            drop(held);
+            assert_eq!(waited, AckWait::TimedOut);
+
+            let (answered, silent) = if respond_on_client {
+                (&client, &arrival)
+            } else {
+                (&arrival, &client)
+            };
+            let mut buf = [0u8; 4096];
+            let n = answered.recv(&mut buf).unwrap();
+            let sent = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                sent.starts_with("SIP/2.0 486 Busy Here\r\n"),
+                "respond_on_client={respond_on_client}: {sent}"
+            );
+            silent
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            assert!(
+                silent.recv(&mut buf).is_err(),
+                "respond_on_client={respond_on_client}: answered on one connection only"
+            );
+        }
+    }
+
     #[test]
     fn a_request_is_not_held_it_is_the_waits_to_handle() {
         let carrier = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -2045,9 +2235,11 @@ mod tests {
                 .sink()
                 .unwrap();
         let (tx, rx) = mpsc::channel::<(SipMessage, SipSink)>();
-        let mut held = HeldMessages::new(&tx);
+        let mut held = HeldMessages::new(&tx, false);
         let req = invite_with_headers("From: <sip:+919000000000@ims.example>;tag=abc\r\n");
-        assert!(held.take_response(SipMessage::Request(req), sink).is_some());
+        assert!(held
+            .take_response(SipMessage::Request(req), sink, None)
+            .is_some());
         drop(held);
         assert!(rx.try_recv().is_err());
     }
@@ -2635,7 +2827,7 @@ mod tests {
             control: &mut a_end,
             pending: None,
         };
-        let mut held = HeldMessages::new(&sip_tx);
+        let mut held = HeldMessages::new(&sip_tx, false);
         let outcome = await_pbx_answer(
             "c1",
             &ctrl_rx,

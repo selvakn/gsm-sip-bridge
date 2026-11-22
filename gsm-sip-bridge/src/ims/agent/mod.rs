@@ -577,6 +577,33 @@ impl RecentDeclines {
     }
 }
 
+/// Where to answer a request the network sent: the socket it arrived on, or,
+/// with `vowifi.respond_on_client`, this session's client leg (see the
+/// dispatch loop, which explains why Jio needs it). The one choice for every
+/// request answered while the loop runs and while a wait parks it
+/// (`inbound::HeldMessages::take_response`), so no answer bypasses it.
+fn request_answer_sink(
+    respond_on_client: bool,
+    session: &crate::ims::RegisteredSession,
+    arrival: SipSink,
+) -> SipSink {
+    if !respond_on_client {
+        return arrival;
+    }
+    match session.transport().and_then(|t| t.sink()) {
+        Ok(client_sink) => {
+            tracing::debug!(
+                "respond_on_client: answering on the client leg, not the arrival socket"
+            );
+            client_sink
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "respond_on_client is set but there is no client sink; using the arrival socket");
+            arrival
+        }
+    }
+}
+
 /// Which call an inbound ACK belongs to, for `LoopState::log_ack`.
 #[derive(Debug, PartialEq, Eq)]
 enum AckDisposition {
@@ -2029,6 +2056,7 @@ impl DispatchParams<'_> {
             obs: self.obs,
             access_network_info: &self.reg_cfg.access_network_info,
             respect_caller_privacy: self.respect_caller_privacy,
+            respond_on_client: self.respond_on_client,
             amr_passthrough: self.amr_passthrough,
             rtp_reorder_wait: self.rtp_reorder_wait,
             amr_mode_set: self.amr_mode_set,
@@ -2764,19 +2792,8 @@ fn dispatch_loop(
             None => inbound.rx.recv_timeout(poll),
         };
         let received = match queued {
-            Ok((msg, sink)) if respond_on_client && matches!(msg, SipMessage::Request(_)) => {
-                match session.transport().and_then(|t| t.sink()) {
-                    Ok(client_sink) => {
-                        tracing::debug!(
-                            "respond_on_client: answering on the client leg, not the arrival socket"
-                        );
-                        Ok((msg, client_sink))
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "respond_on_client is set but there is no client sink; using the arrival socket");
-                        Ok((msg, sink))
-                    }
-                }
+            Ok((msg, sink)) if matches!(msg, SipMessage::Request(_)) => {
+                Ok((msg, request_answer_sink(respond_on_client, session, sink)))
             }
             other => other,
         };
