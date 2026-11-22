@@ -358,7 +358,13 @@ fn rx_loop(
                     if parsed.payload_type == codec.pt {
                         let arrival = start.elapsed();
                         if let Ok(mut t) = tracker.lock() {
-                            t.on_packet(parsed.seq, parsed.timestamp, arrival, codec.rtp_clock_hz);
+                            t.on_packet(
+                                parsed.ssrc,
+                                parsed.seq,
+                                parsed.timestamp,
+                                arrival,
+                                codec.rtp_clock_hz,
+                            );
                         }
                         let samples = coder.decode(parsed.payload);
                         if let Some(w) = &received_wav {

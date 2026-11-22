@@ -114,6 +114,12 @@ pub struct ChosenCodec {
     /// whose event clocks differ rescales each event's duration. `Some`
     /// exactly when `dtmf_payload_type` is.
     pub dtmf_clock_rate: Option<u32>,
+    /// The AMR modes this leg agreed on (RFC 4867 §8.1 `mode-set`), bit `n`
+    /// for mode `n`: the offer's own on a leg we answered, which the answer
+    /// echoes, or the far end's answer's on a leg we offered. `None` when no
+    /// `mode-set` was stated, or it could not be read, and for PCMU and L16.
+    /// The transcoder encodes only in a mode this set includes.
+    pub mode_set: Option<u16>,
 }
 
 impl ChosenCodec {
@@ -263,6 +269,10 @@ pub struct SdpAnswer {
     /// `None` when the answer lists none, which it always does to an offer
     /// built without DTMF.
     pub dtmf_payload_type: Option<u8>,
+    /// The `mode-set` the answer states for `codec` ([`amr_mode_set`]). An
+    /// answerer may restrict the modes when the offer left them open, as
+    /// `build_offer` does (RFC 4867 §8.3.1).
+    pub mode_set: Option<u16>,
 }
 
 /// Parse an SDP answer body down to just what's needed to send/receive
@@ -281,6 +291,7 @@ pub fn parse_answer(body: &str) -> BridgeResult<SdpAnswer> {
     // `a=rtpmap` encoding names — only for telling which is DTMF.
     let mut other_pts: Vec<u8> = Vec::new();
     let mut rtpmap_names: std::collections::HashMap<u8, String> = std::collections::HashMap::new();
+    let mut fmtps: std::collections::HashMap<u8, String> = std::collections::HashMap::new();
     let mut in_audio = false;
 
     for line in body.lines() {
@@ -306,6 +317,7 @@ pub fn parse_answer(body: &str) -> BridgeResult<SdpAnswer> {
             payload_type = fields.nth(1).and_then(|pt| pt.parse().ok());
             other_pts = fields.filter_map(|pt| pt.parse().ok()).collect();
             rtpmap_names.clear();
+            fmtps.clear();
             in_audio = true;
         } else if line.starts_with("m=") {
             in_audio = false;
@@ -317,6 +329,13 @@ pub fn parse_answer(body: &str) -> BridgeResult<SdpAnswer> {
                 parts.next().and_then(|nr| nr.split('/').next()),
             ) {
                 rtpmap_names.insert(pt, name.trim().to_ascii_uppercase());
+            }
+        } else if let (true, Some(rest)) = (in_audio, line.strip_prefix("a=fmtp:")) {
+            // "<pt> <parameters>"
+            if let Some((pt, parameters)) = rest.split_once(' ') {
+                if let Ok(pt) = pt.parse::<u8>() {
+                    fmtps.insert(pt, parameters.trim().to_string());
+                }
             }
         }
     }
@@ -359,6 +378,9 @@ pub fn parse_answer(body: &str) -> BridgeResult<SdpAnswer> {
         remote_rtp: SocketAddr::new(conn_ip, rtp_port),
         codec,
         dtmf_payload_type,
+        mode_set: fmtps
+            .get(&payload_type)
+            .and_then(|fmtp| amr_mode_set(codec, fmtp)),
     })
 }
 
@@ -387,6 +409,22 @@ pub fn first_audio_payload_type(body: &str) -> Option<u8> {
         .and_then(|pt| pt.parse().ok())
 }
 
+/// Every payload type on the first `m=audio` line, recognised or not, in
+/// order. [`SdpOffer::offered`] keeps only the codecs this bridge knows, so it
+/// cannot tell a number the offer left out from one it gave to, say, EVS.
+pub fn audio_payload_types(body: &str) -> Vec<u8> {
+    body.lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("m=audio "))
+        .map(|rest| {
+            rest.split_whitespace()
+                .skip(2)
+                .filter_map(|pt| pt.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The `ChosenCodec` for an answer to `build_offer`'s offer that selected
 /// `codec` and accepted `dtmf_payload_type` (an [`SdpAnswer`]'s two fields),
 /// when `codec` is one `build_offer` actually offers (PCMU or AMR-WB) — `None`
@@ -404,6 +442,7 @@ pub fn first_audio_payload_type(body: &str) -> Option<u8> {
 pub(crate) fn offered_chosen_codec(
     codec: NegotiatedCodec,
     dtmf_payload_type: Option<u8>,
+    mode_set: Option<u16>,
 ) -> Option<ChosenCodec> {
     let (payload_type, octet_aligned) = match codec {
         NegotiatedCodec::Pcmu => (PCMU_PAYLOAD_TYPE, false),
@@ -419,6 +458,7 @@ pub(crate) fn offered_chosen_codec(
         octet_aligned,
         dtmf_payload_type: dtmf.map(|(pt, _)| pt),
         dtmf_clock_rate: dtmf.map(|(_, rate)| rate),
+        mode_set,
     })
 }
 
@@ -445,6 +485,33 @@ pub struct OfferedCodec {
     /// gets the call torn down immediately (observed on Airtel: BYE ~250ms
     /// after our 200 OK).
     pub fmtp: String,
+}
+
+/// The `mode-set` an AMR `a=fmtp` states for `codec` (RFC 4867 §8.1), as a
+/// bit per mode: `None` when there is none, `codec` is not AMR, or it names
+/// no mode, or one the codec does not have (AMR has modes 0 to 7, AMR-WB 0 to
+/// 8), which leaves nothing this side could keep to.
+pub fn amr_mode_set(codec: NegotiatedCodec, fmtp: &str) -> Option<u16> {
+    let modes = match codec {
+        NegotiatedCodec::AmrNb => 8,
+        NegotiatedCodec::AmrWb => 9,
+        NegotiatedCodec::Pcmu | NegotiatedCodec::L16 => return None,
+    };
+    let value = fmtp.split(';').find_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("mode-set")
+            .then_some(value)
+    })?;
+    value
+        .split(',')
+        .try_fold(0u16, |set, mode| {
+            let mode: u16 = mode.trim().parse().ok()?;
+            // `then`, not `then_some`: the shift must wait for the range
+            // check, as `1 << 16` on a `u16` panics in a debug build.
+            (mode < modes).then(|| set | 1 << mode)
+        })
+        .filter(|&set| set != 0)
 }
 
 impl OfferedCodec {
@@ -510,6 +577,42 @@ pub enum MediaDirection {
     SendOnly,
     RecvOnly,
     Inactive,
+}
+
+impl MediaDirection {
+    /// What an answer that is willing to send and receive states for a
+    /// stream offered with this direction (RFC 3264 §6.1): a `sendonly`
+    /// offer is answered `recvonly`, a `recvonly` one `sendonly`, and the
+    /// others in kind.
+    pub fn answered(self) -> Self {
+        match self {
+            Self::SendOnly => Self::RecvOnly,
+            Self::RecvOnly => Self::SendOnly,
+            Self::Inactive => Self::Inactive,
+            Self::SendRecv => Self::SendRecv,
+        }
+    }
+
+    /// The SDP attribute stating this direction (RFC 4566 §6), without its
+    /// line ending.
+    pub fn attribute(self) -> &'static str {
+        match self {
+            Self::SendRecv => "a=sendrecv",
+            Self::SendOnly => "a=sendonly",
+            Self::RecvOnly => "a=recvonly",
+            Self::Inactive => "a=inactive",
+        }
+    }
+
+    /// Whether the party whose SDP states this direction sends media.
+    pub fn sends(self) -> bool {
+        matches!(self, Self::SendRecv | Self::SendOnly)
+    }
+
+    /// Whether the party whose SDP states this direction receives media.
+    pub fn receives(self) -> bool {
+        matches!(self, Self::SendRecv | Self::RecvOnly)
+    }
 }
 
 /// One `m=` section from the offer this bridge will not negotiate — a
@@ -1352,6 +1455,126 @@ pub fn build_veth_answer(
     ))
 }
 
+/// The answer to a carrier's re-offer on a call that is already up (RFC 3264
+/// §8), accepting `chosen` from `offer`. It is rendered as [`build_answer`]
+/// renders one, but as the next version of `previous`, the SDP this side last
+/// sent the carrier: the same `o=` line with its version incremented by one
+/// (§8: "the version in the origin field MUST increment by one from the
+/// previous SDP"), and the same `s=` line, connection address, media port and
+/// `a=rtcp`, since this side's media endpoint does not move. `Err` when
+/// `previous` lacks any of them.
+pub fn build_reanswer(
+    previous: &str,
+    chosen: &OfferedCodec,
+    offer: &SdpOffer,
+) -> BridgeResult<(String, ChosenCodec)> {
+    let origin = origin_line(previous)
+        .ok_or_else(|| BridgeError::Ims("our previous SDP has no o= line".into()))?;
+    let next_origin = next_origin_version(origin)?;
+    let session_name = previous
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("s="))
+        .ok_or_else(|| BridgeError::Ims("our previous SDP has no s= line".into()))?;
+    let ours = parse_offer(previous)?;
+    let (body, chosen) = build_answer_for(
+        ours.remote_rtp.ip(),
+        ours.remote_rtp.port(),
+        0,
+        chosen,
+        offer,
+        ours.rtcp,
+    );
+    let body = body
+        .split_inclusive("\r\n")
+        .map(|line| {
+            if line.starts_with("o=") {
+                format!("{next_origin}\r\n")
+            } else if line.starts_with("s=") {
+                format!("{session_name}\r\n")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    Ok((body, chosen))
+}
+
+/// `previous`, an SDP this side sent, as its next version stating
+/// `direction` for its audio and nothing else changed: the `o=` version plus
+/// one (RFC 3264 §8), every direction attribute dropped, and `direction`
+/// stated once in the audio section, where the old one stood or else at its
+/// end.
+///
+/// For a same-version offer the SDP this side last sent does not answer. An
+/// offerless refresh's `200 OK` carries this side's offer; when the carrier's
+/// answer in the `ACK` holds the call (`sendonly`), that offer still says
+/// `sendrecv`, and the carrier's next refresh re-offers its `sendonly` SDP
+/// unchanged. RFC 3264 §8 allows the previous SDP to be resent only when it
+/// is a valid answer, and §6.1 answers `sendonly` with `recvonly` or
+/// `inactive`.
+pub fn restate_direction(previous: &str, direction: MediaDirection) -> BridgeResult<String> {
+    let origin = origin_line(previous)
+        .ok_or_else(|| BridgeError::Ims("our previous SDP has no o= line".into()))?;
+    let next_origin = next_origin_version(origin)?;
+    let is_direction = |line: &str| {
+        [
+            MediaDirection::SendRecv,
+            MediaDirection::SendOnly,
+            MediaDirection::RecvOnly,
+            MediaDirection::Inactive,
+        ]
+        .iter()
+        .any(|d| d.attribute() == line)
+    };
+    let mut out = String::new();
+    let mut in_audio = false;
+    let mut seen_audio = false;
+    let mut stated = false;
+    for line in previous.lines().map(str::trim_end) {
+        if line.starts_with("m=") {
+            if in_audio && !stated {
+                out.push_str(&format!("{}\r\n", direction.attribute()));
+                stated = true;
+            }
+            in_audio = line.starts_with("m=audio");
+            seen_audio |= in_audio;
+        }
+        if line.starts_with("o=") {
+            out.push_str(&format!("{next_origin}\r\n"));
+        } else if is_direction(line) {
+            if in_audio && !stated {
+                out.push_str(&format!("{}\r\n", direction.attribute()));
+                stated = true;
+            }
+        } else if !line.is_empty() {
+            out.push_str(&format!("{line}\r\n"));
+        }
+    }
+    if in_audio && !stated {
+        out.push_str(&format!("{}\r\n", direction.attribute()));
+    } else if !seen_audio {
+        return Err(BridgeError::Ims(
+            "our previous SDP has no audio section".into(),
+        ));
+    }
+    Ok(out)
+}
+
+/// `origin` (an `o=` line) with its `<sess-version>` field incremented by one.
+fn next_origin_version(origin: &str) -> BridgeResult<String> {
+    // "o=<username> <sess-id> <sess-version> <nettype> <addrtype> <address>"
+    let mut fields: Vec<String> = origin.split_whitespace().map(str::to_string).collect();
+    let next = fields
+        .get(2)
+        .filter(|_| fields.len() == 6)
+        .and_then(|version| version.parse::<u64>().ok())
+        .and_then(|version| version.checked_add(1))
+        .ok_or_else(|| BridgeError::Ims(format!("cannot version the o= line {origin:?}")))?;
+    fields[2] = next.to_string();
+    Ok(fields.join(" "))
+}
+
 /// Render an answer that accepts exactly `chosen`, echoing the offer's own
 /// payload-type number (RFC 3264 §6.1) and — for AMR — its own `a=fmtp`
 /// parameters verbatim rather than asserting our own: they describe how the
@@ -1395,17 +1618,20 @@ fn build_answer_for(
         ),
         None => (String::new(), String::new()),
     };
+    // An offer may list AMR with no `a=fmtp` at all (T2's hold re-INVITE did,
+    // 2026-11-21), and RFC 4566 §9 gives `a=fmtp` no empty form, so the line
+    // is left out rather than sent as `a=fmtp:<pt> `. Without one, RFC 4867
+    // §8.1's defaults apply on both sides, as the offer already meant.
+    let fmtp_line = if chosen.fmtp.trim().is_empty() {
+        String::new()
+    } else {
+        format!("a=fmtp:{pt} {fmtp}\r\n", fmtp = chosen.fmtp)
+    };
     let rtpmap_line = match chosen.codec {
         NegotiatedCodec::Pcmu => format!("a=rtpmap:{pt} PCMU/8000\r\n"),
         NegotiatedCodec::L16 => format!("a=rtpmap:{pt} L16/16000\r\n"),
-        NegotiatedCodec::AmrNb => format!(
-            "a=rtpmap:{pt} AMR/8000\r\na=fmtp:{pt} {fmtp}\r\n",
-            fmtp = chosen.fmtp,
-        ),
-        NegotiatedCodec::AmrWb => format!(
-            "a=rtpmap:{pt} AMR-WB/16000\r\na=fmtp:{pt} {fmtp}\r\n",
-            fmtp = chosen.fmtp,
-        ),
+        NegotiatedCodec::AmrNb => format!("a=rtpmap:{pt} AMR/8000\r\n{fmtp_line}"),
+        NegotiatedCodec::AmrWb => format!("a=rtpmap:{pt} AMR-WB/16000\r\n{fmtp_line}"),
     };
 
     let maxptime_line = match maxptime {
@@ -1453,12 +1679,7 @@ fn build_answer_for(
     // direction (RFC 3264 §6.1) instead of always claiming two-way media
     // (specs/043 SDP-02). The relay's own send/receive behavior is
     // unchanged either way — this only affects what the answer says.
-    let direction_line = match offer.direction {
-        MediaDirection::SendOnly => "a=recvonly\r\n",
-        MediaDirection::RecvOnly => "a=sendonly\r\n",
-        MediaDirection::Inactive => "a=inactive\r\n",
-        MediaDirection::SendRecv => "a=sendrecv\r\n",
-    };
+    let direction_line = format!("{}\r\n", offer.direction.answered().attribute());
 
     let rtcp_line = match declared_rtcp_port {
         Some(port) => format!("a=rtcp:{port}\r\n"),
@@ -1521,6 +1742,9 @@ fn build_answer_for(
             octet_aligned: chosen.is_octet_aligned(),
             dtmf_payload_type: dtmf_pick.map(|(dpt, _)| *dpt),
             dtmf_clock_rate: dtmf_pick.map(|(_, drate)| *drate),
+            // The answer echoes the offer's `a=fmtp`, so both sides keep to
+            // the offer's `mode-set`.
+            mode_set: amr_mode_set(chosen.codec, &chosen.fmtp),
         },
     )
 }
@@ -1627,6 +1851,21 @@ mod tests {
             first_audio_payload_type("v=0\r\nm=audio 4000 RTP/AVP\r\n"),
             None
         );
+    }
+
+    /// Every number on the first `m=audio` line counts, codecs this bridge
+    /// does not know included; a `m=` line of another kind does not.
+    #[test]
+    fn audio_payload_types_lists_the_whole_m_line() {
+        assert_eq!(
+            audio_payload_types(
+                "v=0\r\nm=audio 4000 RTP/AVP 96 101 102 112\r\na=rtpmap:96 telephone-event/8000\r\n\
+                 m=audio 4002 RTP/AVP 97\r\n"
+            ),
+            vec![96, 101, 102, 112]
+        );
+        assert!(audio_payload_types("v=0\r\nm=video 4000 RTP/AVP 96\r\n").is_empty());
+        assert!(audio_payload_types("v=0\r\nm=audio 4000 RTP/AVP\r\n").is_empty());
     }
 
     /// specs/088 (#103): the SDP part of T2's multipart INVITE parses as the
@@ -1757,6 +1996,7 @@ mod tests {
             octet_aligned: false,
             dtmf_payload_type: None,
             dtmf_clock_rate: None,
+            mode_set: None,
         };
         assert!(offer.amr_leg_params(&pcmu).is_none());
     }
@@ -2077,7 +2317,7 @@ mod tests {
 
     #[test]
     fn offered_chosen_codec_maps_pcmu_to_the_fixed_payload_type_build_offer_uses() {
-        let chosen = offered_chosen_codec(NegotiatedCodec::Pcmu, None).unwrap();
+        let chosen = offered_chosen_codec(NegotiatedCodec::Pcmu, None, None).unwrap();
         assert_eq!(chosen.codec, NegotiatedCodec::Pcmu);
         assert_eq!(chosen.payload_type, PCMU_PAYLOAD_TYPE);
         assert!(!chosen.octet_aligned);
@@ -2089,7 +2329,7 @@ mod tests {
 
     #[test]
     fn offered_chosen_codec_maps_amr_wb_to_the_fixed_payload_type_build_offer_uses() {
-        let chosen = offered_chosen_codec(NegotiatedCodec::AmrWb, None).unwrap();
+        let chosen = offered_chosen_codec(NegotiatedCodec::AmrWb, None, None).unwrap();
         assert_eq!(chosen.codec, NegotiatedCodec::AmrWb);
         assert_eq!(chosen.payload_type, AMR_WB_PAYLOAD_TYPE);
         assert!(chosen.octet_aligned);
@@ -2103,7 +2343,7 @@ mod tests {
             (NegotiatedCodec::AmrWb, DTMF_WB_PAYLOAD_TYPE),
             (NegotiatedCodec::Pcmu, DTMF_NB_PAYLOAD_TYPE),
         ] {
-            let chosen = offered_chosen_codec(codec, Some(dtmf)).unwrap();
+            let chosen = offered_chosen_codec(codec, Some(dtmf), None).unwrap();
             assert_eq!(chosen.dtmf_payload_type, Some(dtmf), "{codec:?}");
         }
     }
@@ -2118,14 +2358,14 @@ mod tests {
             (NegotiatedCodec::AmrWb, DTMF_NB_PAYLOAD_TYPE, 8000),
             (NegotiatedCodec::Pcmu, DTMF_NB_PAYLOAD_TYPE, 8000),
         ] {
-            let chosen = offered_chosen_codec(codec, Some(dtmf)).unwrap();
+            let chosen = offered_chosen_codec(codec, Some(dtmf), None).unwrap();
             assert_eq!(
                 chosen.telephone_event(),
                 Some((dtmf, clock)),
                 "{codec:?} {dtmf}"
             );
         }
-        let without = offered_chosen_codec(NegotiatedCodec::AmrWb, None).unwrap();
+        let without = offered_chosen_codec(NegotiatedCodec::AmrWb, None, None).unwrap();
         assert_eq!(
             (without.dtmf_payload_type, without.dtmf_clock_rate),
             (None, None)
@@ -2134,7 +2374,7 @@ mod tests {
 
     #[test]
     fn offered_chosen_codec_ignores_an_event_number_build_offer_never_offered() {
-        let chosen = offered_chosen_codec(NegotiatedCodec::AmrWb, Some(101)).unwrap();
+        let chosen = offered_chosen_codec(NegotiatedCodec::AmrWb, Some(101), None).unwrap();
         assert_eq!(
             (chosen.dtmf_payload_type, chosen.dtmf_clock_rate),
             (None, None)
@@ -2144,10 +2384,13 @@ mod tests {
     #[test]
     fn offered_chosen_codec_rejects_a_codec_build_offer_never_offers() {
         assert_eq!(
-            offered_chosen_codec(NegotiatedCodec::AmrNb, Some(100)),
+            offered_chosen_codec(NegotiatedCodec::AmrNb, Some(100), None),
             None
         );
-        assert_eq!(offered_chosen_codec(NegotiatedCodec::L16, Some(105)), None);
+        assert_eq!(
+            offered_chosen_codec(NegotiatedCodec::L16, Some(105), None),
+            None
+        );
     }
 
     #[test]
@@ -2175,7 +2418,8 @@ mod tests {
                            a=fmtp:105 0-15\r\n";
         let answer = parse_answer(answer_sdp).unwrap();
         assert_eq!(answer.remote_rtp, "172.16.5.5:51000".parse().unwrap());
-        let chosen = offered_chosen_codec(answer.codec, answer.dtmf_payload_type).unwrap();
+        let chosen =
+            offered_chosen_codec(answer.codec, answer.dtmf_payload_type, answer.mode_set).unwrap();
         assert_eq!(chosen.codec, NegotiatedCodec::AmrWb);
         assert_eq!(chosen.payload_type, AMR_WB_PAYLOAD_TYPE);
         assert_eq!(chosen.dtmf_payload_type, Some(DTMF_WB_PAYLOAD_TYPE));
@@ -2393,6 +2637,41 @@ mod tests {
         );
     }
 
+    /// An AMR codec offered with no `a=fmtp` at all (T2's hold re-INVITE,
+    /// 2026-11-21) is answered with none either: RFC 4566 has no empty
+    /// `a=fmtp`, and the answer used to send `a=fmtp:102 ` with nothing after
+    /// it. Both AMR rates take the same path.
+    #[test]
+    fn build_answer_sends_no_empty_fmtp_for_an_amr_offer_without_one() {
+        for (rtpmap, codec) in [
+            ("AMR-WB/16000", NegotiatedCodec::AmrWb),
+            ("AMR/8000", NegotiatedCodec::AmrNb),
+        ] {
+            let body = format!(
+                "v=0\r\nc=IN IP4 198.51.100.49\r\n\
+                 m=audio 57116 RTP/AVP 102 98\r\n\
+                 a=rtpmap:102 {rtpmap}\r\n\
+                 a=rtpmap:98 telephone-event/16000\r\n"
+            );
+            let offer = parse_offer(&body).unwrap();
+            let (sdp, chosen) = build_answer(
+                "192.0.2.67".parse().unwrap(),
+                40000,
+                1,
+                &offer,
+                true,
+                true,
+                AnswerPreference::legacy(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(chosen.codec, codec);
+            assert!(sdp.contains(&format!("a=rtpmap:102 {rtpmap}\r\n")), "{sdp}");
+            assert!(!sdp.contains("a=fmtp:102"), "no empty fmtp in\n{sdp}");
+            assert!(sdp.contains("a=fmtp:98 0-15\r\n"), "{sdp}");
+        }
+    }
+
     /// The real Airtel narrowband-only offer: `AMR/8000` and nothing else, no
     /// PCMU, no AMR-WB, and bandwidth-efficient on every payload type. This is
     /// the offer that was being declined outright.
@@ -2428,6 +2707,123 @@ mod tests {
         assert!(sdp.contains("a=fmtp:116 0-15\r\n"));
         // The offer's own parameters, echoed.
         assert!(sdp.contains("a=fmtp:108 mode-set=0,2,4,7; mode-change-period=2; max-red=0\r\n"));
+    }
+
+    #[test]
+    fn amr_mode_set_reads_the_modes_an_fmtp_allows() {
+        use NegotiatedCodec::{AmrNb, AmrWb, Pcmu};
+        assert_eq!(
+            amr_mode_set(AmrWb, "octet-align=1;mode-set=0,1,2"),
+            Some(0b111)
+        );
+        assert_eq!(
+            amr_mode_set(AmrWb, "mode-set=0, 1; octet-align=1"),
+            Some(0b11)
+        );
+        assert_eq!(amr_mode_set(AmrWb, " Mode-Set = 8"), Some(1 << 8));
+        assert_eq!(
+            amr_mode_set(AmrNb, "mode-set=0,2,4,7; max-red=0"),
+            Some(0b1001_0101)
+        );
+        // Nothing stated, nothing readable, or a mode the codec lacks.
+        assert_eq!(amr_mode_set(AmrWb, "octet-align=1"), None);
+        assert_eq!(amr_mode_set(AmrWb, ""), None);
+        assert_eq!(amr_mode_set(AmrWb, "mode-set=x"), None);
+        assert_eq!(amr_mode_set(AmrNb, "mode-set=8"), None);
+        assert_eq!(amr_mode_set(Pcmu, "mode-set=0"), None);
+        // Modes no `u16` bit can hold are refused before any shift, not
+        // shifted out of range (code review finding).
+        for set in ["16", "0,16", "65535", "2,15", "9"] {
+            assert_eq!(
+                amr_mode_set(AmrWb, &format!("mode-set={set}")),
+                None,
+                "{set}"
+            );
+        }
+    }
+
+    /// The answer echoes the offer's `a=fmtp`, so the chosen codec keeps to
+    /// its `mode-set`, at setup and in a re-offer's answer alike.
+    #[test]
+    fn the_chosen_codec_carries_the_offers_mode_set() {
+        let body = "v=0\r\no=- 1 1 IN IP4 198.51.100.36\r\ns=-\r\nc=IN IP4 198.51.100.36\r\n\
+                    t=0 0\r\nm=audio 14592 RTP/AVP 96\r\n\
+                    a=rtpmap:96 AMR-WB/16000\r\n\
+                    a=fmtp:96 octet-align=1;mode-set=0,1\r\n";
+        let offer = parse_offer(body).unwrap();
+        let (_, chosen) = build_answer(
+            "192.0.2.67".parse().unwrap(),
+            40000,
+            1,
+            &offer,
+            true,
+            true,
+            AnswerPreference::legacy(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(chosen.mode_set, Some(0b11));
+        let ours = "v=0\r\no=- 7 7 IN IP4 192.0.2.67\r\ns=ours\r\nc=IN IP4 192.0.2.67\r\n\
+                    t=0 0\r\nm=audio 40000 RTP/AVP 96\r\na=rtpmap:96 AMR-WB/16000\r\n";
+        let (_, chosen) = build_reanswer(ours, &offer.offered[0], &offer).unwrap();
+        assert_eq!(chosen.mode_set, Some(0b11));
+    }
+
+    /// An answer to our offer may restrict the modes our offer left open.
+    #[test]
+    fn parse_answer_reads_the_answers_mode_set() {
+        let answer = "v=0\r\nc=IN IP4 198.51.100.36\r\n\
+                      m=audio 14592 RTP/AVP 96 105\r\n\
+                      a=rtpmap:96 AMR-WB/16000\r\n\
+                      a=fmtp:96 octet-align=1; mode-set=0,1,2\r\n\
+                      a=rtpmap:105 telephone-event/16000\r\n\
+                      a=fmtp:105 0-15\r\n";
+        let parsed = parse_answer(answer).unwrap();
+        assert_eq!(parsed.mode_set, Some(0b111));
+        let chosen =
+            offered_chosen_codec(parsed.codec, parsed.dtmf_payload_type, parsed.mode_set).unwrap();
+        assert_eq!(chosen.mode_set, Some(0b111));
+        let open = answer.replace("; mode-set=0,1,2", "");
+        assert_eq!(parse_answer(&open).unwrap().mode_set, None);
+    }
+
+    #[test]
+    fn restate_direction_versions_the_sdp_and_replaces_only_the_direction() {
+        let ours = "v=0\r\n\
+                    o=- 2357052722 2357052722 IN IP4 192.0.2.67\r\n\
+                    s=gsm-sip-bridge test call\r\n\
+                    c=IN IP4 192.0.2.67\r\n\
+                    t=0 0\r\n\
+                    m=audio 36185 RTP/AVP 96 105\r\n\
+                    a=rtpmap:96 AMR-WB/16000\r\n\
+                    a=fmtp:96 octet-align=1\r\n\
+                    a=sendrecv\r\n\
+                    a=rtpmap:105 telephone-event/16000\r\n";
+        let restated = restate_direction(ours, MediaDirection::RecvOnly).unwrap();
+        assert_eq!(
+            restated,
+            ours.replace("2357052722 2357052722", "2357052722 2357052723")
+                .replace("a=sendrecv", "a=recvonly")
+        );
+        // No direction stated (sendrecv by default): one is added to the
+        // audio section, and a session-level one is dropped in its favour.
+        let implicit = ours.replace("a=sendrecv\r\n", "");
+        let restated = restate_direction(&implicit, MediaDirection::Inactive).unwrap();
+        assert!(restated.ends_with("a=rtpmap:105 telephone-event/16000\r\na=inactive\r\n"));
+        let session_level = implicit.replace("t=0 0\r\n", "t=0 0\r\na=sendonly\r\n");
+        let restated = restate_direction(&session_level, MediaDirection::RecvOnly).unwrap();
+        assert_eq!(restated.matches("a=").count(), 4, "{restated}");
+        assert!(!restated.contains("a=sendonly"));
+        assert_eq!(
+            parse_offer(&restated).unwrap().direction,
+            MediaDirection::RecvOnly
+        );
+        // A later media section gets nothing: the direction is the audio's.
+        let with_video = format!("{ours}m=video 0 RTP/AVP 31\r\n");
+        let restated = restate_direction(&with_video, MediaDirection::RecvOnly).unwrap();
+        assert!(restated.contains("a=recvonly\r\na=rtpmap:105"));
+        assert!(restated.ends_with("m=video 0 RTP/AVP 31\r\n"));
+        assert!(restate_direction("v=0\r\ns=x\r\n", MediaDirection::RecvOnly).is_err());
     }
 
     #[test]
@@ -3652,6 +4048,112 @@ mod tests {
              b=RS:800\r\nb=RR:2400\r\na=rtpmap:100 L16/16000\r\n\
              a=rtpmap:120 telephone-event/8000\r\na=fmtp:120 0-15\r\na=ptime:20\r\n\
              a=sendrecv\r\nm=text 0 RTP/AVP 100 98\r\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reanswer_tests {
+    use super::*;
+
+    /// This side's SDP as a call placed it.
+    const OURS: &str = "v=0\r\n\
+        o=- 2357052722 2357052722 IN IP4 192.0.2.67\r\n\
+        s=gsm-sip-bridge test call\r\n\
+        c=IN IP4 192.0.2.67\r\n\
+        t=0 0\r\n\
+        m=audio 36185 RTP/AVP 96 0\r\n\
+        a=rtpmap:96 AMR-WB/16000\r\n\
+        a=fmtp:96 octet-align=1\r\n\
+        a=rtpmap:0 PCMU/8000\r\n\
+        a=sendrecv\r\n";
+
+    /// A carrier's hold re-offer: AMR-WB bandwidth-efficient at 102.
+    const HOLD: &str = "v=0\r\n\
+        o=- 73193688 73193689 IN IP4 198.51.100.48\r\n\
+        s=SBC call\r\n\
+        c=IN IP4 198.51.100.48\r\n\
+        t=0 0\r\n\
+        m=audio 33694 RTP/AVP 100 102 103\r\n\
+        a=rtpmap:100 telephone-event/8000\r\n\
+        a=sendonly\r\n\
+        a=rtpmap:102 AMR-WB/16000\r\n\
+        a=fmtp:102 mode-change-capability=2;max-red=0\r\n\
+        a=rtpmap:103 telephone-event/16000\r\n\
+        a=fmtp:103 0-15\r\n";
+
+    fn reanswer(previous: &str) -> BridgeResult<(String, ChosenCodec)> {
+        let offer = parse_offer(HOLD).unwrap();
+        let entry = offer.offered[0].clone();
+        build_reanswer(previous, &entry, &offer)
+    }
+
+    #[test]
+    fn a_reanswer_is_the_next_version_of_this_sides_sdp() {
+        let (answer, chosen) = reanswer(OURS).unwrap();
+        let lines: Vec<&str> = answer.split("\r\n").collect();
+        assert_eq!(lines[0], "v=0");
+        assert_eq!(lines[1], "o=- 2357052722 2357052723 IN IP4 192.0.2.67");
+        assert_eq!(lines[2], "s=gsm-sip-bridge test call");
+        assert_eq!(lines[3], "c=IN IP4 192.0.2.67");
+        assert!(
+            answer.contains("m=audio 36185 RTP/AVP 102 103\r\n"),
+            "{answer}"
+        );
+        assert!(answer.contains("a=fmtp:102 mode-change-capability=2;max-red=0\r\n"));
+        assert!(answer.contains("a=recvonly\r\n"));
+        assert!(!answer.contains("a=rtcp:"), "none was declared before");
+        assert_eq!(
+            chosen,
+            ChosenCodec {
+                codec: NegotiatedCodec::AmrWb,
+                payload_type: 102,
+                octet_aligned: false,
+                dtmf_payload_type: Some(103),
+                dtmf_clock_rate: Some(16000),
+                mode_set: None,
+            }
+        );
+        // The answer is itself a valid previous SDP for the next one.
+        let (next, _) = reanswer(&answer).unwrap();
+        assert!(next.contains("o=- 2357052722 2357052724 IN IP4 192.0.2.67\r\n"));
+    }
+
+    /// An explicit RTCP port this side declared stays declared.
+    #[test]
+    fn a_reanswer_keeps_the_declared_rtcp_port() {
+        let previous = OURS.replace("a=sendrecv\r\n", "a=rtcp:40001\r\na=sendrecv\r\n");
+        let (answer, _) = reanswer(&previous).unwrap();
+        assert!(answer.contains("a=rtcp:40001\r\n"), "{answer}");
+    }
+
+    #[test]
+    fn a_previous_sdp_without_a_versionable_origin_has_no_reanswer() {
+        for previous in [
+            OURS.replace("o=- 2357052722 2357052722 IN IP4 192.0.2.67\r\n", ""),
+            OURS.replace("2357052722 2357052722", "2357052722 next"),
+            OURS.replace("2357052722 2357052722", &format!("2357052722 {}", u64::MAX)),
+            OURS.replace(" IN IP4 192.0.2.67\r\ns=", " IN IP4\r\ns="),
+            OURS.replace("s=gsm-sip-bridge test call\r\n", ""),
+        ] {
+            assert!(reanswer(&previous).is_err(), "{previous}");
+        }
+    }
+
+    #[test]
+    fn directions_answer_and_flow_as_rfc_3264_has_them() {
+        use MediaDirection::{Inactive, RecvOnly, SendOnly, SendRecv};
+        assert_eq!(SendOnly.answered(), RecvOnly);
+        assert_eq!(RecvOnly.answered(), SendOnly);
+        assert_eq!(Inactive.answered(), Inactive);
+        assert_eq!(SendRecv.answered(), SendRecv);
+        assert_eq!(
+            [SendRecv, SendOnly, RecvOnly, Inactive].map(MediaDirection::sends),
+            [true, true, false, false]
+        );
+        assert_eq!(
+            [SendRecv, SendOnly, RecvOnly, Inactive].map(MediaDirection::receives),
+            [true, false, true, false]
         );
     }
 }

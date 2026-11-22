@@ -3019,8 +3019,9 @@ impl LoopState {
     /// body carrying an SDP offer, or arriving while this bridge itself
     /// holds the refresher role) falls through to the same decline this
     /// bridge has always sent an `UPDATE` (FR-007). A refresh that arrives
-    /// as a re-INVITE instead is `answer_reinvite`'s, under the same rule:
-    /// only a refresh that leaves the media unchanged is accepted.
+    /// as a re-INVITE instead is `answer_reinvite`'s, which also follows a
+    /// hold or a resume; one sent as an `UPDATE` with an offer is still
+    /// declined here.
     fn handle_carrier_update(&mut self, req: &SipRequest, sink: &SipSink) {
         // Call-ID alone does not establish dialog membership (greptile PR
         // #74 review) — `names_active_dialog` additionally requires both
@@ -3066,9 +3067,12 @@ impl LoopState {
     /// A session refresh — the same session description the carrier sent at
     /// setup, `agent::reinvite` — is answered `200 OK` with the SDP this
     /// bridge already sent, so the media path is untouched; the RFC 4028
-    /// terms it carries replace the call's refresh duty. Anything else is a
-    /// real modification, which this bridge does not implement: declined
-    /// `488`, but not `486 Busy Here`, since the line is not busy
+    /// terms it carries replace the call's refresh duty. A hold or a resume
+    /// the running relay can follow is answered `200 OK` with the next
+    /// version of this bridge's SDP, and the relay switches to it once that
+    /// is sent; the RFC 4028 terms apply the same way. Any other
+    /// modification is declined `488`, but not `486 Busy Here`, since the
+    /// line is not busy
     /// (specs/042-dialog-transaction-identity, MT-02). A body that cannot be
     /// read as SDP is refused `415`/`400`, as on a new call
     /// (`inbound::invite_body_decision`), never taken for an offerless
@@ -3090,7 +3094,7 @@ impl LoopState {
             return;
         };
         let decline = |why: &str| {
-            tracing::info!(call_id = %call.call_id, why, "declining re-INVITE: in-call session modification is not supported");
+            tracing::info!(call_id = %call.call_id, why, "declining re-INVITE; the session is unchanged");
             let _ = sink.send(&build_488_not_acceptable(req, &call.to_tag, agent));
         };
         if !names_active_dialog(req, &call.call_id, &call.to_tag, &call.dialog.to) {
@@ -3117,9 +3121,10 @@ impl LoopState {
             return;
         };
         // An offerless refresh's answer is brought by its `ACK`.
-        let offerless = match media.classify(offer.as_deref()) {
-            reinvite::ReinviteVerdict::Refresh => false,
-            reinvite::ReinviteVerdict::OfferlessRefresh => true,
+        let (offerless, modification) = match media.classify(offer.as_deref()) {
+            reinvite::ReinviteVerdict::Refresh => (false, None),
+            reinvite::ReinviteVerdict::OfferlessRefresh => (true, None),
+            reinvite::ReinviteVerdict::Modify(modification) => (false, Some(modification)),
             reinvite::ReinviteVerdict::Decline(why) => {
                 decline(why);
                 return;
@@ -3158,31 +3163,55 @@ impl LoopState {
                 .iter()
                 .map(|(name, value)| (*name, value.as_str())),
         );
+        let answer = modification
+            .as_ref()
+            .map_or(media.local_sdp(), |modification| modification.answer());
         let response = build_uas_response_with_headers(
             200,
             "OK",
             req,
             Some(&call.to_tag),
             Some(contact),
-            Some(media.local_sdp()),
+            Some(answer),
             &headers,
         );
         if let Err(e) = sink.send(&response) {
             // Nothing changes: the carrier will retry or end the call itself.
-            tracing::warn!(call_id = %call.call_id, error = %e, "could not answer the carrier's session-refresh re-INVITE");
+            tracing::warn!(call_id = %call.call_id, error = %e, "could not answer the carrier's re-INVITE");
             return;
+        }
+        // RFC 3264 §8.3.2: the answer is in force once it is sent, so the
+        // relay switches to it now.
+        if let Some(modification) = &modification {
+            media.apply(modification);
         }
         // Either way the `200 OK` is owed an `ACK`, which `handle_ack`
         // settles and `handle_refresh_ack_timeout` bounds the wait for; an
         // offerless refresh's also brings the carrier's answer. This one
         // supersedes any still due.
         media.await_ack(reinvite::cseq_number(req), offerless, Instant::now());
-        tracing::info!(
-            call_id = %call.call_id,
-            session_expires = terms.session_expires.as_deref().unwrap_or("none"),
-            offerless,
-            "accepted the carrier's session-refresh re-INVITE; media unchanged"
-        );
+        let session_expires = terms.session_expires.as_deref().unwrap_or("none");
+        match &modification {
+            Some(modification) => {
+                let leg = modification.leg();
+                tracing::info!(
+                    call_id = %call.call_id,
+                    session_expires,
+                    answer_direction = ?modification.local_direction(),
+                    sending_to_carrier = leg.sending,
+                    carrier_payload_type = leg.labels.payload_type,
+                    carrier_octet_aligned = leg.labels.octet_aligned,
+                    carrier_dtmf_payload_type = ?leg.labels.dtmf_payload_type,
+                    "accepted the carrier's re-INVITE modifying the session (hold or resume)"
+                );
+            }
+            None => tracing::info!(
+                call_id = %call.call_id,
+                session_expires,
+                offerless,
+                "accepted the carrier's session-refresh re-INVITE; media unchanged"
+            ),
+        }
         call.session_refresh = terms.state;
         // RFC 3261 §12.2.2: a re-INVITE is a target refresh request — once it
         // is answered `2xx`, the dialog's remote target is its `Contact`, and
@@ -3621,8 +3650,7 @@ impl LoopState {
             tracing::warn!(
                 call_id = %call.call_id,
                 waited_secs = reinvite::REFRESH_ACK_TIMEOUT.as_secs(),
-                "ending call: the carrier never acknowledged the 200 OK to its \
-                 session-refresh re-INVITE"
+                "ending call: the carrier never acknowledged the 200 OK to its re-INVITE"
             );
         }
         self.end_call_on_failed_peer_refresh(session, inbound, p);
@@ -3657,14 +3685,14 @@ impl LoopState {
         }
         let media = call.established_media.as_mut()?;
         if !media.take_ack(reinvite::cseq_number(req))? {
-            tracing::debug!(call_id = %call.call_id, "session-refresh re-INVITE acknowledged");
+            tracing::debug!(call_id = %call.call_id, "re-INVITE acknowledged");
             return Some(Ok(()));
         }
         let no_answer = match inbound::ack_answer(req) {
             Ok(Some(answer)) => {
                 let outcome = media.take_answer(&answer);
                 if outcome.is_ok() {
-                    tracing::info!(call_id = %call.call_id, "offerless session refresh completed; media unchanged");
+                    tracing::info!(call_id = %call.call_id, "offerless session refresh completed");
                 }
                 return Some(outcome);
             }
@@ -5937,8 +5965,10 @@ mod tests {
         );
     }
 
+    /// This test call has no relay handle on its carrier leg, as an AMR call
+    /// forwarded without transcoding has none: a modification is declined.
     #[test]
-    fn a_re_invite_that_changes_the_session_is_still_declined() {
+    fn a_re_invite_that_changes_the_session_is_declined_when_the_relay_cannot_follow_it() {
         let mut st = LoopState::new();
         st.active_call = Some(call_with_established_media());
         let deadline_before = st
@@ -6046,6 +6076,60 @@ mod tests {
             body.len()
         );
         SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// The live hold and resume (T2, 2026-11-18) through the dispatch loop:
+    /// each is answered `200 OK` with the next version of this side's SDP,
+    /// the relay follows once it is sent, its `ACK` settles it, and the
+    /// session timer and target are refreshed as by any re-INVITE.
+    #[test]
+    fn the_live_hold_and_resume_are_answered_and_followed() {
+        let mut st = LoopState::new();
+        let mut call = active_call_with_refresh("uas");
+        let (media, leg) = reinvite::tests::live_established(crate::ims::carrier_leg::Relabel::Any);
+        call.established_media = Some(media);
+        st.active_call = Some(call);
+
+        let hold = in_dialog_with_body("INVITE", 8, Some(reinvite::tests::LIVE_HOLD_OFFER));
+        let resp = answer(&mut st, &hold);
+        assert!(resp.starts_with("SIP/2.0 200 OK\r\n"), "{resp}");
+        assert!(
+            resp.contains("Session-Expires: 1800;refresher=uac\r\n"),
+            "{resp}"
+        );
+        assert!(
+            resp.contains("o=- 2357052722 2357052723 IN IP4 192.0.2.67\r\n"),
+            "{resp}"
+        );
+        assert!(resp.contains("m=audio 36185 RTP/AVP 102 103\r\n"), "{resp}");
+        assert!(resp.ends_with("a=recvonly\r\n"), "{resp}");
+        let held = leg.state();
+        assert!(!held.sending);
+        assert_eq!(
+            (held.labels.payload_type, held.labels.octet_aligned),
+            (102, false)
+        );
+        let call = st.active_call.as_ref().unwrap();
+        assert_eq!(
+            call.session_refresh.as_ref().unwrap().refresher(),
+            Refresher::Uas
+        );
+        assert_eq!(call.dialog.remote_target, "sip:10.1.1.1:9900");
+        // Its ACK brings no answer and settles it.
+        let ack = in_dialog_with_body("ACK", 8, None);
+        assert_eq!(st.take_refresh_answer(&ack), Some(Ok(())));
+        assert!(!st.refresh_ack_overdue(Instant::now() + Duration::from_secs(3600)));
+
+        let resume = reinvite::tests::live_resume_offer();
+        let resp = answer(&mut st, &in_dialog_with_body("INVITE", 9, Some(&resume)));
+        assert!(resp.starts_with("SIP/2.0 200 OK\r\n"), "{resp}");
+        assert!(
+            resp.contains("o=- 2357052722 2357052724 IN IP4 192.0.2.67\r\n"),
+            "{resp}"
+        );
+        assert!(resp.ends_with("a=sendrecv\r\n"), "{resp}");
+        assert!(leg.state().sending);
+        assert_eq!(leg.state().labels, held.labels);
     }
 
     /// An offerless refresh is answered with the SDP already sent, now as an

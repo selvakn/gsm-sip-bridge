@@ -28,6 +28,7 @@ pub(crate) mod amr_rtp;
 /// body may be `multipart/*` (RFC 5621 §4.2), never assume bare SDP.
 pub(crate) mod body;
 pub mod call;
+pub(crate) mod carrier_leg;
 /// `pub` rather than `pub(crate)`: `sip::server`'s registrar verifies inbound
 /// REGISTER credentials with the same RFC 2617 math this module computes
 /// outbound IMS-AKA responses with — a second MD5 digest implementation in the

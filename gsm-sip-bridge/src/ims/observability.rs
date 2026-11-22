@@ -698,6 +698,7 @@ mod tests {
             let mut t = tracker.lock().unwrap();
             for (seq, ts) in [(1u16, 160u32), (2, 320), (4, 640)] {
                 t.on_packet(
+                    0x1234,
                     seq,
                     ts,
                     std::time::Duration::from_millis(u64::from(ts) / 8),

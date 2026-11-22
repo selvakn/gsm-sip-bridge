@@ -8,6 +8,7 @@
 //! and outbound `finish_origination`) use it identically.
 
 use crate::error::{BridgeError, BridgeResult};
+use crate::ims::carrier_leg::{CarrierEnd, CarrierLeg, Relabel};
 use crate::ims::sdp;
 use crate::ims::sip_client::{build_200_ok_invite, random_hex, SipRequest};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -129,29 +130,30 @@ fn accept_veth_invite(
     Ok(VethUasResult { rtp_socket, codec })
 }
 
+/// Starts [`relay_rtp`] on its own thread. `carrier_codec` is what the carrier
+/// leg's SDP selected. Returns the carrier leg's handle, through which a
+/// carrier re-INVITE moves that leg's `telephone-event` payload type or holds
+/// it while the relay runs; the audio payload type cannot move, since audio
+/// crosses unchanged.
 pub(super) fn spawn_relay(
     carrier: UdpSocket,
     veth: UdpSocket,
     stop: Arc<AtomicBool>,
     meter: &crate::ims::media_stats::MediaMeter,
-    carrier_dtmf: Option<(u8, u32)>,
+    carrier_codec: sdp::ChosenCodec,
     veth_dtmf: Option<(u8, u32)>,
     rtcp: Option<crate::ims::rtcp::CarrierRtcpBundle>,
-) {
+) -> Arc<CarrierLeg> {
     let carrier_rx = meter.carrier_rx_counter();
     let pbx_rx = meter.pbx_rx_counter();
+    let carrier_leg = CarrierLeg::new(&carrier_codec, Relabel::DtmfOnly);
+    let leg = carrier_leg.clone();
     std::thread::spawn(move || {
         relay_rtp(
-            carrier,
-            veth,
-            stop,
-            carrier_rx,
-            pbx_rx,
-            carrier_dtmf,
-            veth_dtmf,
-            rtcp,
+            carrier, veth, stop, carrier_rx, pbx_rx, leg, veth_dtmf, rtcp,
         )
     });
+    carrier_leg
 }
 
 /// Relays raw UDP payloads bidirectionally between `a` and `b` (both
@@ -166,9 +168,12 @@ pub(super) fn spawn_relay(
 /// The one exception is DTMF (specs/044 RTP-03): each leg's own SDP answer
 /// picks its `telephone-event` independently, so "both legs agree" never
 /// held for it the way it does for the audio codec — see `forward`'s own
-/// relabeling and duration rescaling. `carrier_dtmf` and `veth_dtmf` are
-/// each leg's `(payload type, clock rate)`, from
+/// relabeling and duration rescaling. `veth_dtmf` is the veth leg's
+/// `(payload type, clock rate)`, from
 /// [`ChosenCodec::telephone_event`](crate::ims::sdp::ChosenCodec::telephone_event).
+/// The carrier's is read from `carrier_leg` for every packet, as is whether
+/// this side may send toward the carrier at all (`ims::carrier_leg`: a
+/// carrier re-INVITE can change both).
 #[allow(clippy::too_many_arguments)]
 pub fn relay_rtp(
     carrier: UdpSocket,
@@ -176,7 +181,7 @@ pub fn relay_rtp(
     stop: Arc<AtomicBool>,
     carrier_rx: Arc<std::sync::atomic::AtomicU64>,
     pbx_rx: Arc<std::sync::atomic::AtomicU64>,
-    carrier_dtmf: Option<(u8, u32)>,
+    carrier_leg: Arc<CarrierLeg>,
     veth_dtmf: Option<(u8, u32)>,
     rtcp: Option<crate::ims::rtcp::CarrierRtcpBundle>,
 ) {
@@ -201,13 +206,14 @@ pub fn relay_rtp(
     // thread counts downlink from the carrier, the veth→carrier thread counts
     // uplink from the telephone leg. Read together at teardown, they are the
     // FR-017 both-ways verdict.
+    let from_carrier = CarrierEnd::Source(carrier_leg.clone());
     let h1 = std::thread::spawn(move || {
         forward(
             carrier,
             veth2,
             stop,
             carrier_rx,
-            carrier_dtmf,
+            from_carrier,
             veth_dtmf,
             "carrier->veth",
             receiver_role,
@@ -219,8 +225,8 @@ pub fn relay_rtp(
             carrier2,
             stop2,
             pbx_rx,
+            CarrierEnd::Destination(carrier_leg),
             veth_dtmf,
-            carrier_dtmf,
             "veth->carrier",
             sender_role,
         )
@@ -245,14 +251,16 @@ fn relabel_dtmf_payload_type(buf: &mut [u8], dst_dtmf_pt: u8) {
     }
 }
 
+/// One direction of [`relay_rtp`]. `carrier` says which end is the carrier
+/// leg; nothing goes toward it while it is held.
 #[allow(clippy::too_many_arguments)]
 fn forward(
     src: UdpSocket,
     dst: UdpSocket,
     stop: Arc<AtomicBool>,
     counter: Arc<std::sync::atomic::AtomicU64>,
-    src_dtmf: Option<(u8, u32)>,
-    dst_dtmf: Option<(u8, u32)>,
+    carrier: CarrierEnd,
+    veth_dtmf: Option<(u8, u32)>,
     direction: &'static str,
     rtcp: Option<crate::ims::rtcp::RelayRtcpRole>,
 ) {
@@ -273,6 +281,15 @@ fn forward(
         match src.recv(&mut buf) {
             Ok(n) => {
                 crate::ims::media_stats::bump(&counter);
+                let leg = carrier.state();
+                if !carrier.may_send(&leg) {
+                    // Held: this side agreed not to send toward the carrier.
+                    continue;
+                }
+                let (src_dtmf, dst_dtmf) = match &carrier {
+                    CarrierEnd::Source(_) => (leg.labels.telephone_event(), veth_dtmf),
+                    CarrierEnd::Destination(_) => (veth_dtmf, leg.labels.telephone_event()),
+                };
                 if let Some(pkt) = crate::ims::rtp::parse_packet(&buf[..n]) {
                     let ssrc = pkt.ssrc;
                     let payload_type = pkt.payload_type;
@@ -345,7 +362,14 @@ mod tests {
         let pbx_rx = meter.pbx_rx_counter();
         let handle = std::thread::spawn(move || {
             relay_rtp(
-                ims_side, veth_side, stop_clone, carrier_rx, pbx_rx, None, None, None,
+                ims_side,
+                veth_side,
+                stop_clone,
+                carrier_rx,
+                pbx_rx,
+                pcmu_leg(None),
+                None,
+                None,
             )
         });
 
@@ -390,6 +414,24 @@ mod tests {
         (a, b)
     }
 
+    /// A PCMU carrier leg, `telephone-event` at `dtmf` (payload type, clock).
+    fn pcmu_leg(dtmf: Option<(u8, u32)>) -> Arc<CarrierLeg> {
+        CarrierLeg::new(
+            &sdp::ChosenCodec {
+                codec: sdp::NegotiatedCodec::Pcmu,
+                payload_type: 0,
+                octet_aligned: false,
+                dtmf_payload_type: dtmf.map(|(pt, _)| pt),
+                dtmf_clock_rate: dtmf.map(|(_, clock)| clock),
+                mode_set: None,
+            },
+            Relabel::DtmfOnly,
+        )
+    }
+
+    /// One packet through the carrier→veth direction, the carrier's
+    /// `telephone-event` at `src_dtmf` and the veth leg's at `dst_dtmf`, each
+    /// `(payload type, clock rate)`.
     fn run_forward_once(
         src_dtmf: Option<(u8, u32)>,
         dst_dtmf: Option<(u8, u32)>,
@@ -409,7 +451,14 @@ mod tests {
         let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let handle = std::thread::spawn(move || {
             forward(
-                src_recv, dst_send, stop_clone, counter, src_dtmf, dst_dtmf, "test", None,
+                src_recv,
+                dst_send,
+                stop_clone,
+                counter,
+                CarrierEnd::Source(pcmu_leg(src_dtmf)),
+                dst_dtmf,
+                "test",
+                None,
             )
         });
         src_send.send(packet).unwrap();
@@ -496,7 +545,14 @@ mod tests {
         let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let handle = std::thread::spawn(move || {
             forward(
-                src_recv, dst_send, stop_clone, counter, None, None, "test", None,
+                src_recv,
+                dst_send,
+                stop_clone,
+                counter,
+                CarrierEnd::Source(pcmu_leg(None)),
+                None,
+                "test",
+                None,
             )
         });
 
@@ -513,5 +569,117 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
+    }
+
+    /// The relay of a PCMU call, with the loopback peers standing in for the
+    /// carrier and Agent B, and the carrier leg's handle.
+    struct PassThrough {
+        carrier: UdpSocket,
+        pbx: UdpSocket,
+        leg: Arc<CarrierLeg>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl PassThrough {
+        fn start(carrier_dtmf: Option<(u8, u32)>, veth_dtmf: Option<(u8, u32)>) -> Self {
+            let (ims_side, carrier) = connected_pair();
+            let (veth_side, pbx) = connected_pair();
+            for peer in [&carrier, &pbx] {
+                peer.set_read_timeout(Some(Duration::from_millis(500)))
+                    .unwrap();
+            }
+            let stop = Arc::new(AtomicBool::new(false));
+            let meter = crate::ims::media_stats::MediaMeter::new();
+            let leg = spawn_relay(
+                ims_side,
+                veth_side,
+                stop.clone(),
+                &meter,
+                sdp::ChosenCodec {
+                    codec: sdp::NegotiatedCodec::Pcmu,
+                    payload_type: 0,
+                    octet_aligned: false,
+                    dtmf_payload_type: carrier_dtmf.map(|(pt, _)| pt),
+                    dtmf_clock_rate: carrier_dtmf.map(|(_, clock)| clock),
+                    mode_set: None,
+                },
+                veth_dtmf,
+                None,
+            );
+            Self {
+                carrier,
+                pbx,
+                leg,
+                stop,
+            }
+        }
+
+        fn received(socket: &UdpSocket) -> Option<Vec<u8>> {
+            let mut buf = [0u8; 2048];
+            socket.recv(&mut buf).ok().map(|n| buf[..n].to_vec())
+        }
+    }
+
+    impl Drop for PassThrough {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// A carrier hold (this side answered `recvonly` or `inactive`): nothing
+    /// goes toward the carrier, what it sends still reaches the telephone leg,
+    /// and sending resumes with the hold.
+    #[test]
+    fn a_held_carrier_leg_gets_nothing_but_is_still_heard() {
+        let relay = PassThrough::start(None, None);
+        let audio = crate::ims::rtp::build_packet(1, 160, 0xAAAA, 0, &[0u8; 160]);
+
+        let held = crate::ims::carrier_leg::CarrierLegState {
+            sending: false,
+            ..relay.leg.state()
+        };
+        assert!(relay.leg.set(held));
+        relay.pbx.send(&audio).unwrap();
+        assert_eq!(PassThrough::received(&relay.carrier), None, "held");
+        relay.carrier.send(&audio).unwrap();
+        assert_eq!(PassThrough::received(&relay.pbx), Some(audio.clone()));
+
+        let resumed = crate::ims::carrier_leg::CarrierLegState {
+            sending: true,
+            ..held
+        };
+        assert!(relay.leg.set(resumed));
+        relay.pbx.send(&audio).unwrap();
+        assert_eq!(PassThrough::received(&relay.carrier), Some(audio));
+    }
+
+    /// A carrier re-INVITE that moves `telephone-event` to another payload
+    /// type and clock rate: digits cross under the new number both ways from
+    /// then on, their durations re-counted in the new clock.
+    #[test]
+    fn a_relabelled_carrier_dtmf_payload_type_is_followed_both_ways() {
+        let relay = PassThrough::start(Some((101, 8000)), Some((96, 8000)));
+        let relabelled = crate::ims::carrier_leg::CarrierLegState {
+            labels: crate::ims::carrier_leg::CarrierLabels {
+                dtmf_payload_type: Some(100),
+                dtmf_clock_rate: Some(16000),
+                ..relay.leg.state().labels
+            },
+            sending: true,
+            previous_audio: None,
+        };
+        assert!(relay.leg.set(relabelled));
+
+        let from_phone = crate::ims::rtp::build_packet(1, 160, 0xAAAA, 96, &[5, 0, 0, 160]);
+        relay.pbx.send(&from_phone).unwrap();
+        let to_carrier = PassThrough::received(&relay.carrier).unwrap();
+        assert_eq!(to_carrier[1] & 0x7f, 100);
+        assert_eq!(&to_carrier[12..], &[5, 0, 1, 64], "320 at 16 kHz");
+
+        let from_carrier = crate::ims::rtp::build_packet(1, 160, 0xBBBB, 100, &[7, 0, 1, 64]);
+        relay.carrier.send(&from_carrier).unwrap();
+        let to_phone = PassThrough::received(&relay.pbx).unwrap();
+        assert_eq!(to_phone[1] & 0x7f, 96);
+        assert_eq!(&to_phone[12..], &[7, 0, 0, 160], "160 at 8 kHz");
     }
 }

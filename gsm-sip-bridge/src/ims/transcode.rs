@@ -28,6 +28,7 @@
 //! formats — the carrier's offer decides which, and it is not ours to choose.
 
 use super::amr_rtp::{self, AmrKind};
+use super::carrier_leg::{CarrierEnd, CarrierLabels, CarrierLeg, Relabel};
 use super::rtp;
 use super::sdp::{ChosenCodec, NegotiatedCodec};
 use crate::error::{BridgeError, BridgeResult};
@@ -40,12 +41,74 @@ use std::time::{Duration, Instant};
 /// How often a blocking `recv` wakes to re-check `stop`, bounding how
 /// quickly a hangup silences the relay. Matches `agent::RELAY_POLL_INTERVAL`.
 const RELAY_POLL_INTERVAL: Duration = Duration::from_millis(200);
-/// The rates we encode AMR at, one per flavour. Both are the usual VoLTE
-/// operating points and sit inside the `mode-set` carriers advertise. The far
-/// end signals its own mode per-frame and we decode whatever it sends, so
-/// these only govern our own encoding.
-const WB_ENCODE_MODE: amr_safe::Mode = amr_safe::Mode::R1265;
-const NB_ENCODE_MODE: amr_safe::NbMode = amr_safe::NbMode::R1220;
+/// The AMR mode we prefer to encode in, one per flavour: AMR-WB mode 2
+/// (12.65 kbit/s) and AMR mode 7 (12.2 kbit/s), the usual VoLTE operating
+/// points. A leg whose `mode-set` leaves the preferred mode out is encoded in
+/// another mode the set allows ([`encode_mode`]). The far end signals its own
+/// mode per frame and we decode whatever it sends, so these only govern our
+/// own encoding.
+const WB_PREFERRED_MODE: u8 = 2;
+const NB_PREFERRED_MODE: u8 = 7;
+
+/// The mode to encode in on a leg that agreed `mode_set` (bit `n` for mode
+/// `n`, `None` for every mode): `preferred` when the set includes it, or
+/// else the highest mode below it, or else the lowest above it. RFC 4867
+/// §8.1 has a sender keep to the agreed set; a carrier may discard frames
+/// outside it. A re-offer can narrow the set mid-call (code review finding),
+/// so the relay picks the mode again whenever the carrier leg's labels change.
+fn encode_mode(preferred: u8, mode_set: Option<u16>) -> u8 {
+    let Some(set) = mode_set.filter(|&set| set != 0) else {
+        return preferred;
+    };
+    let allowed = |mode: u8| set & (1 << mode) != 0;
+    if allowed(preferred) {
+        return preferred;
+    }
+    (0..preferred)
+        .rev()
+        .find(|&mode| allowed(mode))
+        .or_else(|| (preferred + 1..16).find(|&mode| allowed(mode)))
+        .unwrap_or(preferred)
+}
+
+/// The mode `kind` prefers to encode in.
+fn preferred_mode(kind: AmrKind) -> u8 {
+    match kind {
+        AmrKind::Nb => NB_PREFERRED_MODE,
+        AmrKind::Wb => WB_PREFERRED_MODE,
+    }
+}
+
+/// AMR-WB mode `mode` (0 to 8); anything higher is mode 8.
+fn wb_mode(mode: u8) -> amr_safe::Mode {
+    use amr_safe::Mode::*;
+    match mode {
+        0 => R660,
+        1 => R885,
+        2 => R1265,
+        3 => R1425,
+        4 => R1585,
+        5 => R1825,
+        6 => R1985,
+        7 => R2305,
+        _ => R2385,
+    }
+}
+
+/// AMR mode `mode` (0 to 7); anything higher is mode 7.
+fn nb_mode(mode: u8) -> amr_safe::NbMode {
+    use amr_safe::NbMode::*;
+    match mode {
+        0 => R475,
+        1 => R515,
+        2 => R590,
+        3 => R670,
+        4 => R740,
+        5 => R795,
+        6 => R1020,
+        _ => R1220,
+    }
+}
 /// Big enough for any payload either leg can send: the largest is one 20 ms
 /// L16/16000 frame, 320 samples × 2 bytes + RTP header.
 const RECV_BUF: usize = 2048;
@@ -149,18 +212,26 @@ enum AmrEncoder {
 
 impl AmrEncoder {
     /// Encode exactly one frame's worth of PCM (already at the codec's own
-    /// rate), returning the MIME-layout frame.
-    fn encode(&mut self, pcm: &[i16]) -> Option<Vec<u8>> {
+    /// rate) in mode `mode`, returning the MIME-layout frame.
+    fn encode(&mut self, pcm: &[i16], mode: u8) -> Option<Vec<u8>> {
         match self {
             Self::Nb(e) => {
                 let frame: [i16; amr_safe::NB_FRAME_SAMPLES] = pcm.try_into().ok()?;
-                Some(e.encode(NB_ENCODE_MODE, &frame))
+                Some(e.encode(nb_mode(mode), &frame))
             }
             Self::Wb(e) => {
                 let frame: [i16; amr_safe::FRAME_SAMPLES] = pcm.try_into().ok()?;
-                Some(e.encode(WB_ENCODE_MODE, &frame))
+                Some(e.encode(wb_mode(mode), &frame))
             }
         }
+    }
+
+    /// The mode this flavour prefers to encode in.
+    fn preferred_mode(&self) -> u8 {
+        preferred_mode(match self {
+            Self::Nb(_) => AmrKind::Nb,
+            Self::Wb(_) => AmrKind::Wb,
+        })
     }
 }
 
@@ -204,6 +275,14 @@ impl Decoder {
         })
     }
 
+    /// Reads AMR payloads in this framing from now on (a carrier re-INVITE
+    /// can change it, `ims::carrier_leg`). Nothing else has a framing.
+    fn set_octet_aligned(&mut self, framing: bool) {
+        if let Self::Amr { octet_aligned, .. } = self {
+            *octet_aligned = framing;
+        }
+    }
+
     /// `None` for a payload carrying no speech (comfort noise, AMR `NO_DATA`,
     /// or a garbled packet) — those occur routinely on a live call and are
     /// simply skipped.
@@ -240,6 +319,8 @@ enum Encoder {
         encoder: AmrEncoder,
         kind: AmrKind,
         octet_aligned: bool,
+        /// The mode every frame is encoded in ([`encode_mode`]).
+        mode: u8,
     },
 }
 
@@ -248,19 +329,46 @@ impl Encoder {
         Ok(match amr_kind(leg.codec) {
             None if leg.codec == NegotiatedCodec::L16 => Self::L16,
             None => Self::Pcmu,
-            Some(kind) => Self::Amr {
-                encoder: match kind {
+            Some(kind) => {
+                let encoder = match kind {
                     AmrKind::Nb => AmrEncoder::Nb(amr_safe::NbEncoder::new().map_err(|e| {
                         BridgeError::Ims(format!("AMR-NB encoder init failed: {e}"))
                     })?),
                     AmrKind::Wb => AmrEncoder::Wb(amr_safe::WbEncoder::new().map_err(|e| {
                         BridgeError::Ims(format!("AMR-WB encoder init failed: {e}"))
                     })?),
-                },
-                kind,
-                octet_aligned: leg.octet_aligned,
-            },
+                };
+                Self::Amr {
+                    mode: encode_mode(encoder.preferred_mode(), leg.mode_set),
+                    encoder,
+                    kind,
+                    octet_aligned: leg.octet_aligned,
+                }
+            }
         })
+    }
+
+    /// Frames AMR payloads this way from now on, as [`Decoder::set_octet_aligned`].
+    fn set_octet_aligned(&mut self, framing: bool) {
+        if let Self::Amr { octet_aligned, .. } = self {
+            *octet_aligned = framing;
+        }
+    }
+
+    /// Encodes in a mode `mode_set` allows from now on (a carrier re-INVITE
+    /// can narrow it, `ims::carrier_leg`).
+    fn set_mode_set(&mut self, mode_set: Option<u16>) {
+        if let Self::Amr { encoder, mode, .. } = self {
+            *mode = encode_mode(encoder.preferred_mode(), mode_set);
+        }
+    }
+
+    /// The AMR mode frames are encoded in; `None` for PCMU and L16.
+    fn mode(&self) -> Option<u8> {
+        match self {
+            Self::Amr { mode, .. } => Some(*mode),
+            Self::Pcmu | Self::L16 => None,
+        }
     }
 
     /// `pcm` is exactly one frame at this leg's rate.
@@ -272,8 +380,9 @@ impl Encoder {
                 encoder,
                 kind,
                 octet_aligned,
+                mode,
             } => {
-                let frame = encoder.encode(pcm)?;
+                let frame = encoder.encode(pcm, *mode)?;
                 amr_rtp::frame_to_payload(&frame, *kind, *octet_aligned)
             }
         }
@@ -314,6 +423,14 @@ impl RtpSender {
         self.seq = self.seq.wrapping_add(1);
         self.timestamp = self.timestamp.wrapping_add(samples);
         socket.send(&pkt).map(|_| ())
+    }
+
+    /// Account for `samples` of media time this side did not send (the
+    /// carrier leg is on hold): the timestamp still follows the sampling
+    /// clock (RFC 3550 §5.1), but no sequence number is used, so the far end
+    /// sees a pause rather than lost packets when sending resumes.
+    fn skip(&mut self, samples: u32) {
+        self.timestamp = self.timestamp.wrapping_add(samples);
     }
 }
 
@@ -358,6 +475,10 @@ impl SourceClock {
 /// the offers, never assumed. Sending RTP marked with a payload type or framed
 /// in a way the far end never agreed to gets the media discarded and the call
 /// torn down.
+///
+/// Returns the carrier leg's handle, through which a carrier re-INVITE
+/// relabels that leg (any payload type, framing or `telephone-event` payload
+/// type for the same codec) or holds it, while the relay runs.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_transcoding_relay(
     ims: UdpSocket,
@@ -368,7 +489,7 @@ pub fn spawn_transcoding_relay(
     meter: &super::media_stats::MediaMeter,
     rtcp: Option<super::rtcp::CarrierRtcpBundle>,
     rtp_reorder_wait: Duration,
-) -> BridgeResult<()> {
+) -> BridgeResult<Arc<CarrierLeg>> {
     if carrier.codec == NegotiatedCodec::Pcmu && veth_codec.codec == NegotiatedCodec::Pcmu {
         return Err(BridgeError::Ims(
             "both legs are PCMU; use the passthrough relay".into(),
@@ -404,6 +525,9 @@ pub fn spawn_transcoding_relay(
         carrier_codec = ?carrier.codec,
         carrier_payload_type = carrier.payload_type,
         carrier_octet_aligned = carrier.octet_aligned,
+        carrier_mode_set = ?carrier.mode_set,
+        carrier_encode_mode = ?amr_kind(carrier.codec)
+            .map(|kind| encode_mode(preferred_mode(kind), carrier.mode_set)),
         veth_codec = ?veth_codec.codec,
         veth_payload_type = veth_codec.payload_type,
         resampling = carrier_rate != veth_rate,
@@ -422,6 +546,9 @@ pub fn spawn_transcoding_relay(
     // that landed on tier 3 (no RTCP endpoint obtained).
     let receiver_role = rtcp.as_ref().map(|b| b.receiver_role());
     let sender_role = rtcp.as_ref().map(|b| b.sender_role());
+    let carrier_leg = CarrierLeg::new(&carrier, Relabel::Any);
+    let from_carrier = CarrierEnd::Source(carrier_leg.clone());
+    let to_carrier_end = CarrierEnd::Destination(carrier_leg.clone());
     let stop_a = stop.clone();
     std::thread::spawn(move || {
         relay_direction(
@@ -437,6 +564,7 @@ pub fn spawn_transcoding_relay(
             carrier_rx,
             receiver_role,
             amr_kind(carrier.codec).map(|_| rtp_reorder_wait),
+            from_carrier,
         )
     });
     std::thread::spawn(move || {
@@ -453,9 +581,10 @@ pub fn spawn_transcoding_relay(
             pbx_rx,
             sender_role,
             None,
+            to_carrier_end,
         )
     });
-    Ok(())
+    Ok(carrier_leg)
 }
 
 /// How far apart (in the *destination* leg's own event clock) two separate
@@ -483,6 +612,19 @@ const DTMF_EVENT_TIMESTAMP_GAP_DIVISOR: u32 = 4;
 /// whatever event payload type `dst_codec` negotiated (the two legs need not
 /// agree on the number), its duration rescaled when the two legs' events
 /// count in different clocks; anything else is dropped.
+///
+/// `carrier` says which end is the carrier leg. Its labels are read for every
+/// packet, so a carrier re-INVITE that moves the running codec to another
+/// payload type, framing or `telephone-event` payload type or clock rate
+/// takes effect at once (`ims::carrier_leg`). Toward the carrier, nothing is
+/// sent while the leg is held. From the carrier, the audio payload type it
+/// used before the latest relabel is still read, in its own framing, in case
+/// the carrier keeps sending it for a while, but only while the carrier's
+/// latest offer has not given that number another meaning: the agent decides
+/// that when it accepts the offer ([`CarrierLegState::previous_audio`]),
+/// because T2 does reuse it, against RFC 3264 §8.3.2.
+///
+/// [`CarrierLegState::previous_audio`]: crate::ims::carrier_leg::CarrierLegState::previous_audio
 #[allow(clippy::too_many_arguments)]
 fn relay_direction(
     src: UdpSocket,
@@ -490,13 +632,14 @@ fn relay_direction(
     mut decoder: Decoder,
     mut encoder: Encoder,
     mut resampler: Resampler,
-    src_codec: ChosenCodec,
-    dst_codec: ChosenCodec,
+    mut src_codec: ChosenCodec,
+    mut dst_codec: ChosenCodec,
     direction: &'static str,
     stop: Arc<AtomicBool>,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     rtcp: Option<super::rtcp::RelayRtcpRole>,
     source_timing: Option<Duration>,
+    carrier: CarrierEnd,
 ) {
     let frame_samples = dst_codec.codec.frame_samples();
     // Only meaningful when `rtcp` is `Receiver`.
@@ -519,7 +662,8 @@ fn relay_direction(
             .dtmf_clock_rate
             .unwrap_or_else(|| codec.codec.sample_rate())
     };
-    let (src_event_clock, dst_event_clock) = (event_clock(&src_codec), event_clock(&dst_codec));
+    let (mut src_event_clock, mut dst_event_clock) =
+        (event_clock(&src_codec), event_clock(&dst_codec));
     // The *source's* RTP timestamp of the DTMF event currently in progress,
     // so repeated packets for the same keypress (which RFC 4733 sends with a
     // fixed timestamp) reuse our own re-originated timestamp too, and only a
@@ -536,7 +680,11 @@ fn relay_direction(
     let mut reorder = source_timing.map(super::rtp_reorder::RtpReorderBuffer::new);
     let mut source_clock = SourceClock::new(clock_rate, dst_codec.codec.sample_rate());
     let mut read_timeout = RELAY_POLL_INTERVAL;
-
+    let mut applied_labels = match &carrier {
+        CarrierEnd::Source(_) => CarrierLabels::of(&src_codec),
+        CarrierEnd::Destination(_) => CarrierLabels::of(&dst_codec),
+    };
+    let mut leg = carrier.state();
     while !stop.load(Ordering::Relaxed) {
         let now = Instant::now();
         let mut ready = reorder
@@ -563,24 +711,70 @@ fn relay_direction(
             let Some(n) = recv(&src, &mut buf, direction) else {
                 continue;
             };
+            // Read after the wait, so that a change made while it blocked
+            // already applies to this packet.
+            leg = carrier.state();
+            if leg.labels != applied_labels {
+                let labels = leg.labels;
+                match &carrier {
+                    CarrierEnd::Source(_) => {
+                        src_codec.payload_type = labels.payload_type;
+                        src_codec.octet_aligned = labels.octet_aligned;
+                        src_codec.dtmf_payload_type = labels.dtmf_payload_type;
+                        src_codec.dtmf_clock_rate = labels.dtmf_clock_rate;
+                        src_codec.mode_set = labels.mode_set;
+                        src_event_clock = event_clock(&src_codec);
+                    }
+                    CarrierEnd::Destination(_) => {
+                        dst_codec.payload_type = labels.payload_type;
+                        dst_codec.octet_aligned = labels.octet_aligned;
+                        dst_codec.dtmf_payload_type = labels.dtmf_payload_type;
+                        dst_codec.dtmf_clock_rate = labels.dtmf_clock_rate;
+                        dst_event_clock = event_clock(&dst_codec);
+                        dst_codec.mode_set = labels.mode_set;
+                        sender.payload_type = labels.payload_type;
+                        encoder.set_octet_aligned(labels.octet_aligned);
+                        encoder.set_mode_set(labels.mode_set);
+                        dtmf_sender = match (dtmf_sender.take(), labels.dtmf_payload_type) {
+                            (Some(mut events), Some(payload_type)) => {
+                                events.payload_type = payload_type;
+                                Some(events)
+                            }
+                            (None, Some(payload_type)) => Some(RtpSender::new(payload_type)),
+                            (_, None) => None,
+                        };
+                    }
+                }
+                tracing::info!(
+                    direction,
+                    payload_type = labels.payload_type,
+                    octet_aligned = labels.octet_aligned,
+                    dtmf_payload_type = ?labels.dtmf_payload_type,
+                    dtmf_clock_rate = ?labels.dtmf_clock_rate,
+                    mode_set = ?labels.mode_set,
+                    encode_mode = ?encoder.mode(),
+                    "transcoding relay: the carrier leg's payload types changed"
+                );
+                applied_labels = labels;
+            }
             let Some(pkt) = rtp::parse_packet(&buf[..n]) else {
                 continue;
             };
-            // Count the packet only once it parses as RTP — a malformed datagram is
-            // not audio that flowed, and counting it would mask a one-way call.
-            super::media_stats::bump(&counter);
 
             // specs/046-rtcp-reporting: every received packet counts toward
             // sequence continuity and jitter regardless of payload type — a
             // DTMF event legitimately shares the audio stream's sequence-number
             // space (RFC 4733), so excluding it here would read as a spurious
             // gap on every keypress.
-            if let Some(super::rtcp::RelayRtcpRole::Receiver { tracker, ssrc }) = &rtcp {
+            if let Some(super::rtcp::RelayRtcpRole::Receiver { tracker }) = &rtcp {
                 if let Ok(mut t) = tracker.lock() {
-                    t.on_packet(pkt.seq, pkt.timestamp, media_start.elapsed(), clock_rate);
-                }
-                if let Ok(mut s) = ssrc.lock() {
-                    *s = Some(pkt.ssrc);
+                    t.on_packet(
+                        pkt.ssrc,
+                        pkt.seq,
+                        pkt.timestamp,
+                        media_start.elapsed(),
+                        clock_rate,
+                    );
                 }
             }
 
@@ -597,8 +791,11 @@ fn relay_direction(
             // DTMF and unknown payloads fill its sequence gaps only when they
             // share its SSRC. An independent event source must never retire
             // audio or discard its pending packets or restart probation.
+            let previous_audio = carrier.previous_audio(&leg);
             let in_audio_sequence = reorder.as_ref().is_none_or(|buffer| {
-                pkt.payload_type == src_codec.payload_type || buffer.source_ssrc() == Some(pkt.ssrc)
+                pkt.payload_type == src_codec.payload_type
+                    || previous_audio.is_some_and(|(previous, _)| previous == pkt.payload_type)
+                    || buffer.source_ssrc() == Some(pkt.ssrc)
             });
             let arrived_at = Instant::now();
             ready = match &mut reorder {
@@ -614,6 +811,7 @@ fn relay_direction(
             };
         }
 
+        let may_send = carrier.may_send(&leg);
         for packet in ready {
             if stop.load(Ordering::Relaxed) {
                 return;
@@ -621,8 +819,19 @@ fn relay_direction(
             let Some(pkt) = rtp::parse_packet(&packet) else {
                 continue;
             };
+            // Count the packet only once it parses as RTP and the reorder
+            // buffer lets it through: a malformed datagram, or a packet from a
+            // source the buffer no longer follows, is not audio that flowed,
+            // and counting it would mask a one-way call. A carrier that went
+            // back to a retired SSRC after a hold was once reported both-ways
+            // while every packet it sent was dropped (2026-11-21).
+            super::media_stats::bump(&counter);
 
             if Some(pkt.payload_type) == src_codec.dtmf_payload_type {
+                if !may_send {
+                    // Held: this side agreed not to send toward the carrier.
+                    continue;
+                }
                 let new_keypress = dtmf_event_source_ts != Some(pkt.timestamp);
                 dtmf_event_source_ts = Some(pkt.timestamp);
                 let Some(dtmf_sender) = dtmf_sender.as_mut() else {
@@ -667,16 +876,28 @@ fn relay_direction(
                 }
                 continue;
             }
-            if pkt.payload_type != src_codec.payload_type {
+            let framing = if pkt.payload_type == src_codec.payload_type {
+                src_codec.octet_aligned
+            } else if let Some((_, framing)) = carrier
+                .previous_audio(&leg)
+                .filter(|(previous, _)| *previous == pkt.payload_type)
+            {
+                framing
+            } else {
                 // Comfort noise, or a payload type neither leg's answer named —
                 // not audio this decoder was built for.
                 continue;
-            }
+            };
+            decoder.set_octet_aligned(framing);
             let Some(pcm) = decoder.decode(pkt.payload) else {
                 continue;
             };
             let pcm = resampler.process(pcm);
             if source_timing.is_some() {
+                // Only ever the carrier's downlink, which no hold stops.
+                if !may_send {
+                    continue;
+                }
                 // AMR payload parsing produces exactly one 20ms frame. Both L16
                 // and PCMU can encode the whole resampled frame without changing
                 // packet boundaries or hiding gaps from Agent B's jitter buffer.
@@ -701,6 +922,10 @@ fn relay_direction(
 
             while pending.len() >= frame_samples {
                 let frame: Vec<i16> = pending.drain(..frame_samples).collect();
+                if !may_send {
+                    sender.skip(frame_samples as u32);
+                    continue;
+                }
                 let Some(payload) = encoder.encode(&frame) else {
                     continue;
                 };
@@ -793,7 +1018,26 @@ mod tests {
             octet_aligned: true,
             dtmf_payload_type,
             dtmf_clock_rate: dtmf_payload_type.map(|_| codec.sample_rate()),
+            mode_set: None,
         }
+    }
+
+    #[test]
+    fn the_encode_mode_keeps_to_the_mode_set() {
+        // No set, or one including the preferred mode: the preferred mode.
+        assert_eq!(encode_mode(WB_PREFERRED_MODE, None), 2);
+        assert_eq!(encode_mode(WB_PREFERRED_MODE, Some(0b1_1111_1111)), 2);
+        assert_eq!(encode_mode(WB_PREFERRED_MODE, Some(0b100)), 2);
+        // Otherwise the highest below it, then the lowest above it.
+        assert_eq!(encode_mode(WB_PREFERRED_MODE, Some(0b011)), 1);
+        assert_eq!(encode_mode(WB_PREFERRED_MODE, Some(0b001)), 0);
+        assert_eq!(encode_mode(WB_PREFERRED_MODE, Some(0b1_1000_0000)), 7);
+        assert_eq!(encode_mode(WB_PREFERRED_MODE, Some(1 << 8)), 8);
+        // AMR prefers its top mode, so any set gives its highest mode.
+        assert_eq!(encode_mode(NB_PREFERRED_MODE, Some(0b1001_0101)), 7);
+        assert_eq!(encode_mode(NB_PREFERRED_MODE, Some(0b0001_0101)), 4);
+        // An empty set (never produced by `sdp::amr_mode_set`) restricts nothing.
+        assert_eq!(encode_mode(WB_PREFERRED_MODE, Some(0)), 2);
     }
 
     #[test]
@@ -1264,6 +1508,7 @@ mod tests {
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 None,
                 Some(Duration::from_millis(500)),
+                CarrierEnd::Source(CarrierLeg::new(&src_codec, Relabel::Any)),
             );
         });
         let receive = || {
@@ -1341,6 +1586,88 @@ mod tests {
         send(2, 2160, 77, 13, &[]);
         let audio = receive();
         assert_eq!((audio.0, audio.1, audio.2), (3, 4640, 77));
+
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+    }
+
+    /// The far party's stream comes back under its original SSRC after a
+    /// hold stream replaced it, as on T2's resume (2026-11-21): it is relayed
+    /// again, and only the packets the relay let through are counted toward
+    /// the call's media verdict.
+    #[test]
+    fn the_far_party_returning_to_its_ssrc_after_a_hold_is_heard_and_counted() {
+        let (ims, carrier) = connected_pair();
+        let (veth, agent_b) = connected_pair();
+        ims.set_read_timeout(Some(RELAY_POLL_INTERVAL)).unwrap();
+        agent_b
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let src_codec = codec(NegotiatedCodec::Pcmu, 0);
+        let dst_codec = codec(NegotiatedCodec::L16, 96);
+        let stop = Arc::new(AtomicBool::new(false));
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let worker = {
+            let (stop, counter) = (stop.clone(), counter.clone());
+            std::thread::spawn(move || {
+                relay_direction(
+                    ims,
+                    veth,
+                    Decoder::new(src_codec).unwrap(),
+                    Encoder::new(dst_codec).unwrap(),
+                    Resampler::between(8000, 16000).unwrap(),
+                    src_codec,
+                    dst_codec,
+                    "test returning source",
+                    stop,
+                    counter,
+                    None,
+                    Some(Duration::from_millis(40)),
+                    CarrierEnd::Source(CarrierLeg::new(&src_codec, Relabel::Any)),
+                );
+            })
+        };
+        let silence = [0xff; 160];
+        let send = |seq: u16, ssrc: u32| {
+            carrier
+                .send(&rtp::build_packet(
+                    seq,
+                    u32::from(seq) * 160,
+                    ssrc,
+                    0,
+                    &silence,
+                ))
+                .unwrap();
+        };
+        let received = || {
+            let mut buf = [0u8; RECV_BUF];
+            let n = agent_b.recv(&mut buf).expect("a relayed packet");
+            let pkt = rtp::parse_packet(&buf[..n]).unwrap();
+            (pkt.seq, pkt.ssrc)
+        };
+        let far_party = 0x0A0A_0A0A;
+        let hold = 0x0B0B_0B0B;
+
+        send(1000, far_party);
+        assert_eq!(received().0, 1000);
+        send(50, hold);
+        assert_eq!(received().0, 50);
+        // The hold stream stops; the far party resumes in sequence.
+        std::thread::sleep(Duration::from_millis(250));
+        send(1100, far_party);
+        send(1101, far_party);
+        assert_eq!(
+            received().0,
+            1101,
+            "the first returning packet only starts the run"
+        );
+        send(1102, far_party);
+        assert_eq!(received().0, 1102);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            4,
+            "1100 was dropped, not counted"
+        );
 
         stop.store(true, Ordering::Relaxed);
         worker.join().unwrap();
@@ -1429,6 +1756,148 @@ mod tests {
             "nothing should have been forwarded: {err}"
         );
 
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    /// A PCMU carrier leg (DTMF at `dtmf`) relayed to an L16 veth leg (DTMF
+    /// at 97), with the loopback peers and the carrier leg's handle. Needs no
+    /// AMR library.
+    fn pcmu_to_l16_relay(
+        dtmf: Option<u8>,
+    ) -> (UdpSocket, UdpSocket, Arc<CarrierLeg>, Arc<AtomicBool>) {
+        let (ims, carrier) = connected_pair();
+        let (veth, agent_b) = connected_pair();
+        for peer in [&carrier, &agent_b] {
+            peer.set_read_timeout(Some(Duration::from_millis(400)))
+                .unwrap();
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let leg = spawn_transcoding_relay(
+            ims,
+            veth,
+            codec_with_dtmf(NegotiatedCodec::Pcmu, 0, dtmf),
+            codec_with_dtmf(NegotiatedCodec::L16, 96, Some(97)),
+            stop.clone(),
+            &crate::ims::media_stats::MediaMeter::new(),
+            None,
+            Duration::from_millis(40),
+        )
+        .unwrap();
+        (carrier, agent_b, leg, stop)
+    }
+
+    /// One 20 ms L16 frame from Agent B (320 samples at 16 kHz).
+    fn l16_frame(seq: u16) -> Vec<u8> {
+        rtp::build_packet(seq, u32::from(seq) * 320, 0xb0b0, 96, &[0u8; 640])
+    }
+
+    fn next_packet(socket: &UdpSocket) -> Option<(u16, u32, u8, Vec<u8>)> {
+        let mut buf = [0u8; RECV_BUF];
+        let n = socket.recv(&mut buf).ok()?;
+        let pkt = rtp::parse_packet(&buf[..n]).unwrap();
+        Some((
+            pkt.seq,
+            pkt.timestamp,
+            pkt.payload_type,
+            pkt.payload.to_vec(),
+        ))
+    }
+
+    /// A carrier hold: while this side's answer is `recvonly` or `inactive`
+    /// nothing goes toward the carrier, neither audio nor digits, while the
+    /// carrier is still heard. On resume the timestamp has followed the
+    /// sampling clock through the pause (RFC 3550 §5.1) and the sequence
+    /// number has not: a pause, not lost packets.
+    #[test]
+    fn a_held_carrier_leg_gets_nothing_and_resumes_after_the_pause() {
+        let (carrier, agent_b, leg, stop) = pcmu_to_l16_relay(Some(101));
+        agent_b.send(&l16_frame(1)).unwrap();
+        let (seq, ts, pt, _) = next_packet(&carrier).expect("sending before the hold");
+        assert_eq!(pt, 0);
+
+        assert!(leg.set(crate::ims::carrier_leg::CarrierLegState {
+            sending: false,
+            ..leg.state()
+        }));
+        for n in 2..=6 {
+            agent_b.send(&l16_frame(n)).unwrap();
+        }
+        agent_b
+            .send(&rtp::build_packet(7, 7 * 320, 0xb0b0, 97, &[5, 0, 0, 160]))
+            .unwrap();
+        assert_eq!(next_packet(&carrier), None, "held");
+        let downlink: Vec<u8> = vec![0xff; 160];
+        carrier
+            .send(&rtp::build_packet(1, 0, 0xcafe, 0, &downlink))
+            .unwrap();
+        assert_eq!(
+            next_packet(&agent_b).map(|(_, _, pt, _)| pt),
+            Some(96),
+            "the carrier is still heard"
+        );
+
+        assert!(leg.set(crate::ims::carrier_leg::CarrierLegState {
+            sending: true,
+            ..leg.state()
+        }));
+        agent_b.send(&l16_frame(8)).unwrap();
+        let (resumed_seq, resumed_ts, _, _) = next_packet(&carrier).expect("resumed");
+        assert_eq!(resumed_seq, seq.wrapping_add(1));
+        assert_eq!(resumed_ts.wrapping_sub(ts), 6 * 160, "five held frames");
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    /// A carrier re-INVITE that moves the running codec to another payload
+    /// type and `telephone-event` to another, at the carrier's 8 kHz event
+    /// clock: from then on this side sends under the new numbers, reads the
+    /// carrier's audio under the new one, and still reads the old one should
+    /// the carrier keep using it.
+    #[test]
+    fn a_relabelled_carrier_leg_is_followed_both_ways() {
+        let (carrier, agent_b, leg, stop) = pcmu_to_l16_relay(None);
+        let relabelled = crate::ims::carrier_leg::CarrierLegState {
+            labels: CarrierLabels {
+                payload_type: 98,
+                octet_aligned: false,
+                dtmf_payload_type: Some(100),
+                dtmf_clock_rate: Some(8000),
+                mode_set: None,
+            },
+            sending: true,
+            previous_audio: Some((0, false)),
+        };
+        assert!(leg.set(relabelled));
+
+        agent_b.send(&l16_frame(1)).unwrap();
+        assert_eq!(next_packet(&carrier).map(|(_, _, pt, _)| pt), Some(98));
+        agent_b
+            .send(&rtp::build_packet(2, 640, 0xb0b0, 97, &[5, 0, 0, 160]))
+            .unwrap();
+        let digit = next_packet(&carrier).expect("a digit, now that DTMF exists");
+        // 160 at Agent B's 16 kHz is 80 at the carrier's 8 kHz.
+        assert_eq!((digit.2, digit.3), (100, vec![5, 0, 0, 80]));
+
+        let downlink: Vec<u8> = vec![0xff; 160];
+        for (seq, pt) in [(1, 98), (2, 0)] {
+            carrier
+                .send(&rtp::build_packet(
+                    seq,
+                    u32::from(seq) * 160,
+                    0xcafe,
+                    pt,
+                    &downlink,
+                ))
+                .unwrap();
+            assert_eq!(
+                next_packet(&agent_b).map(|(_, _, pt, _)| pt),
+                Some(96),
+                "carrier audio under {pt}"
+            );
+        }
+        carrier
+            .send(&rtp::build_packet(3, 480, 0xcafe, 99, &downlink))
+            .unwrap();
+        assert_eq!(next_packet(&agent_b), None, "a payload type never agreed");
         stop.store(true, Ordering::Relaxed);
     }
 }

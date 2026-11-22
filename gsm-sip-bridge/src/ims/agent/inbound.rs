@@ -659,6 +659,10 @@ pub(super) fn handle_invite(
             // either way.
             let forwarding;
             let transcoding;
+            // The relay's handle on the carrier leg, through which a carrier
+            // hold or resume re-INVITE is followed (`agent::reinvite`).
+            // `None` for a forwarded call, whose relay cannot follow one.
+            let carrier_leg;
             if let (Some(hop), Some(carrier)) = (forward_hop, carrier_amr.as_ref()) {
                 let leg = |socket: UdpSocket| Leg {
                     socket,
@@ -689,10 +693,11 @@ pub(super) fn handle_invite(
                 session.detach();
                 forwarding = true;
                 transcoding = false;
+                carrier_leg = None;
             } else {
                 forwarding = false;
                 transcoding = chosen.codec != veth.codec.codec;
-                if transcoding {
+                carrier_leg = Some(if transcoding {
                     // The two legs speak different codecs (or the same codec
                     // at different rates), so it has to be terminated on each
                     // side and re-encoded.
@@ -705,7 +710,7 @@ pub(super) fn handle_invite(
                         &meter,
                         rtcp_bundle.clone(),
                         ctx.rtp_reorder_wait,
-                    )?;
+                    )?
                 } else {
                     // Both legs speak PCMU: forward the payloads untouched.
                     spawn_relay(
@@ -713,11 +718,11 @@ pub(super) fn handle_invite(
                         veth.rtp_socket,
                         stop.clone(),
                         &meter,
-                        chosen.telephone_event(),
+                        chosen,
                         veth.codec.telephone_event(),
                         rtcp_bundle.clone(),
-                    );
-                }
+                    )
+                });
             }
 
             // The per-call RTCP thread itself (US1/US2/US5): sends
@@ -801,7 +806,11 @@ pub(super) fn handle_invite(
                 &offer_sdp,
                 offer.remote_rtp,
                 chosen.payload_type,
-            );
+            )
+            .map(|media| match carrier_leg {
+                Some(leg) => media.with_carrier_leg(leg),
+                None => media,
+            });
             Ok(Some(ActiveCall {
                 control,
                 ctrl_rx,
@@ -1130,7 +1139,7 @@ fn handle_offerless_invite(
     let chosen = answer
         .as_ref()
         .ok()
-        .and_then(|a| sdp::offered_chosen_codec(a.codec, a.dtmf_payload_type));
+        .and_then(|a| sdp::offered_chosen_codec(a.codec, a.dtmf_payload_type, a.mode_set));
     let (Ok(answer), Some(chosen)) = (answer, chosen) else {
         // FR-005/SC-002: the caller's device answered with something this
         // bridge cannot service — end the call explicitly, never silently.
@@ -1160,7 +1169,7 @@ fn handle_offerless_invite(
     let meter = crate::ims::media_stats::MediaMeter::new();
 
     let transcoding = chosen.codec != veth.codec.codec;
-    if transcoding {
+    let carrier_leg = if transcoding {
         crate::ims::transcode::spawn_transcoding_relay(
             ims_rtp_socket,
             veth.rtp_socket,
@@ -1170,18 +1179,18 @@ fn handle_offerless_invite(
             &meter,
             None,
             ctx.rtp_reorder_wait,
-        )?;
+        )?
     } else {
         spawn_relay(
             ims_rtp_socket,
             veth.rtp_socket,
             stop.clone(),
             &meter,
-            chosen.telephone_event(),
+            chosen,
             veth.codec.telephone_event(),
             None,
-        );
-    }
+        )
+    };
 
     tracing::info!(
         call_id = %call_id,
@@ -1209,6 +1218,7 @@ fn handle_offerless_invite(
             answer.remote_rtp,
             chosen.payload_type,
         )
+        .map(|media| media.with_carrier_leg(carrier_leg))
     });
     Ok(Some(ActiveCall {
         control,
