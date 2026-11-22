@@ -860,16 +860,23 @@ mod real_runner_tests {
         }
     }
 
+    /// Polls `is_alive` until the child is gone, failing after 5 s. A
+    /// fixed sleep before a single check failed under load: on a busy
+    /// host (load average about 5 during `make test`) `true` had not been
+    /// observed exiting 200 ms after its spawn.
+    fn assert_exits_soon(runner: &RealCommandRunner, handle: &ChildHandle, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runner.is_alive(handle) {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn a_reaped_child_is_removed_so_a_later_signal_is_a_safe_no_op() {
         let runner = RealCommandRunner::new();
         let handle = runner.spawn(ChildSpec::new(["true"])).unwrap();
-        // Give the (near-instant) child a moment to actually exit.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(
-            !runner.is_alive(&handle),
-            "`true` should have exited by now"
-        );
+        assert_exits_soon(&runner, &handle, "`true` should have exited by now");
         // Must not panic/error — and, per the fix, must not attempt to
         // signal the stale pid at all.
         runner.signal(&handle, Signal::Term);
@@ -942,8 +949,7 @@ mod real_runner_tests {
         let handle = runner.spawn(ChildSpec::new(["sleep", "30"])).unwrap();
         assert!(runner.is_alive(&handle));
         runner.signal(&handle, Signal::Kill);
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(!runner.is_alive(&handle));
+        assert_exits_soon(&runner, &handle, "a killed child should be observed dead");
     }
 
     #[test]
@@ -980,8 +986,7 @@ mod real_runner_tests {
             .expect("liveness checker thread must not panic");
         signaler.join().expect("signaler thread must not panic");
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(!runner.is_alive(&handle));
+        assert_exits_soon(&runner, &handle, "a killed child should be observed dead");
     }
 
     #[test]
