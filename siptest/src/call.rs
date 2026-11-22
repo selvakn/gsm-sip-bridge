@@ -433,6 +433,7 @@ fn drive_outbound(
         // The far end ended the dialog; a BYE of ours — now or from the
         // failure guard — would go to a dialog that no longer exists.
         run.dialog = None;
+        state.note_remote_bye(&dialog.call_id);
     }
     let media_result = media_result?;
 
@@ -637,6 +638,7 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
         InboundMode::Reject => Decision::Reject(policy.reject_status),
         InboundMode::Answer => match crate::sip::inbound::wait_or_cancel(
             &state.sip_socket,
+            state.bridge_registrar.ip(),
             &call_id_hdr,
             Duration::from_millis(policy.answer_delay_ms as u64),
         ) {
@@ -662,6 +664,7 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
             }
             match crate::sip::inbound::wait_or_cancel(
                 &state.sip_socket,
+                state.bridge_registrar.ip(),
                 &call_id_hdr,
                 Duration::from_millis(200),
             ) {
@@ -738,8 +741,12 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
             send_200();
             let invite_to_200_ms = start.elapsed().as_millis() as u64;
 
-            let acked =
-                crate::sip::inbound::wait_for_ack(&state.sip_socket, &call_id_hdr, send_200);
+            let acked = crate::sip::inbound::wait_for_ack(
+                &state.sip_socket,
+                state.bridge_registrar.ip(),
+                &call_id_hdr,
+                send_200,
+            );
             if !acked {
                 call.state = CallState::Ended;
                 call.end_reason = Some(EndReason::Failed {
@@ -775,7 +782,13 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
                 &state.sip_socket,
                 &call_id_hdr,
                 &stop,
-                |wait: Duration| state.sip_socket.recv_request(wait).ok().flatten(),
+                |wait: Duration| {
+                    state
+                        .sip_socket
+                        .recv_request_from(state.bridge_registrar.ip(), wait)
+                        .ok()
+                        .flatten()
+                },
                 || {
                     crate::media::session::run(
                         crate::media::session::MediaSessionConfig {
@@ -795,7 +808,9 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
 
             // We initiate the BYE at the end of the configured duration —
             // unless the far end already ended the dialog.
-            if !remote_bye {
+            if remote_bye {
+                state.note_remote_bye(&call_id_hdr);
+            } else {
                 send_our_bye(state, &to_tag, &call_id_hdr, peer, &caller_id);
             }
 

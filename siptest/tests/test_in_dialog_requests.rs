@@ -142,6 +142,7 @@ fn build_state(
         inbound_policy: Mutex::new(inbound_policy),
         manual_decisions: Mutex::new(std::collections::HashMap::new()),
         dialog_route: Mutex::new(None),
+        recent_hangups: Mutex::new(Default::default()),
     })
 }
 
@@ -154,6 +155,8 @@ enum PeerAction {
     /// An `OPTIONS` carrying its own Call-ID — a keepalive, not part of the
     /// dialog.
     Options,
+    /// An `OPTIONS` carrying the dialog's own Call-ID — a probe within it.
+    DialogOptions,
 }
 
 impl PeerAction {
@@ -162,7 +165,7 @@ impl PeerAction {
             PeerAction::Bye => "BYE",
             PeerAction::ReInvite => "INVITE",
             PeerAction::Update => "UPDATE",
-            PeerAction::Options => "OPTIONS",
+            PeerAction::Options | PeerAction::DialogOptions => "OPTIONS",
         }
     }
 }
@@ -188,11 +191,20 @@ impl PeerLog {
             .count()
     }
 
+    /// How many times did siptest answer the peer's `method` request with
+    /// `status`?
+    fn answered_count(&self, status: u16, method: &str) -> usize {
+        self.all()
+            .iter()
+            .filter(|t| {
+                t.starts_with(&format!("SIP/2.0 {status}")) && t.contains(&format!(" {method}\r\n"))
+            })
+            .count()
+    }
+
     /// Did siptest answer the peer's `method` request with `status`?
     fn answered(&self, status: u16, method: &str) -> bool {
-        self.all().iter().any(|t| {
-            t.starts_with(&format!("SIP/2.0 {status}")) && t.contains(&format!(" {method}\r\n"))
-        })
+        self.answered_count(status, method) > 0
     }
 }
 
@@ -247,6 +259,9 @@ struct Finished {
     /// moment it was recorded as ended.
     elapsed: Duration,
     state: Arc<SharedState>,
+    /// Everything an untrusted third party received back (inbound intruder
+    /// runs only); must stay empty.
+    intruder_log: PeerLog,
 }
 
 /// Outbound: siptest dials; the peer (standing in for the registrar *and*
@@ -274,17 +289,27 @@ fn run_outbound(action: PeerAction, act_after: Duration, rtp_min: u16) -> Finish
     };
 
     let log = PeerLog::default();
+    // Raised once the call is over: the peer retransmits its BYE then, as it
+    // would had siptest's `200` been lost.
+    let resend = Arc::new(AtomicBool::new(false));
     let peer_thread = {
         let log = log.clone();
         let stop = stop.clone();
+        let resend = resend.clone();
         thread::spawn(move || {
             let _keep_rtp_sink = rtp_sink;
+            let mut sent: Option<(String, SocketAddr)> = None;
             let contact = format!("<sip:callee@{peer_addr}>");
             let mut buf = [0u8; 4096];
             let mut dialog: Option<(SipRequest, SocketAddr)> = None;
             let mut act_at: Option<Instant> = None;
             let mut acted = false;
             while !stop.load(Ordering::Relaxed) {
+                if resend.swap(false, Ordering::Relaxed) {
+                    if let Some((msg, dst)) = &sent {
+                        let _ = peer.send_to(msg.as_bytes(), dst);
+                    }
+                }
                 if let (Some(at), false, Some((invite, src))) = (act_at, acted, dialog.as_ref()) {
                     if Instant::now() >= at {
                         acted = true;
@@ -301,6 +326,7 @@ fn run_outbound(action: PeerAction, act_after: Duration, rtp_min: u16) -> Finish
                             media_port,
                         );
                         let _ = peer.send_to(msg.as_bytes(), src);
+                        sent = Some((msg, *src));
                     }
                 }
                 let Ok((n, src)) = peer.recv_from(&mut buf) else {
@@ -352,6 +378,9 @@ fn run_outbound(action: PeerAction, act_after: Duration, rtp_min: u16) -> Finish
     )
     .expect("the outbound call should complete");
     let elapsed = started.elapsed();
+    if action == PeerAction::Bye {
+        resend.store(true, Ordering::Relaxed);
+    }
 
     // Let any late datagram (our own BYE, a retransmitted reply) arrive.
     thread::sleep(Duration::from_millis(500));
@@ -363,12 +392,25 @@ fn run_outbound(action: PeerAction, act_after: Duration, rtp_min: u16) -> Finish
         log,
         elapsed,
         state,
+        intruder_log: PeerLog::default(),
     }
 }
 
 /// Inbound: the peer (standing in for the bridge's telephony agent) rings
 /// siptest, ACKs the answer, then sends `action` shortly after.
 fn run_inbound(action: PeerAction, act_after: Duration, rtp_min: u16) -> Finished {
+    run_inbound_with(action, act_after, rtp_min, false)
+}
+
+/// [`run_inbound`], optionally with `action` (and an out-of-dialog `OPTIONS`)
+/// sent by an untrusted third party on another address instead of by the
+/// caller — who then sends nothing at all.
+fn run_inbound_with(
+    action: PeerAction,
+    act_after: Duration,
+    rtp_min: u16,
+    intruder: bool,
+) -> Finished {
     let config = test_config(rtp_min, CALL_SECS as u32);
     std::fs::create_dir_all(&config.media.recording_dir).unwrap();
 
@@ -393,6 +435,13 @@ fn run_inbound(action: PeerAction, act_after: Duration, rtp_min: u16) -> Finishe
     };
 
     let log = PeerLog::default();
+    let intruder_log = PeerLog::default();
+    let intruder_sock = intruder.then(|| {
+        let sock = UdpSocket::bind("127.0.0.2:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(1)))
+            .unwrap();
+        sock
+    });
     let call_id = "inbound-in-dialog-call";
     let from = "<sip:+919000000000@127.0.0.1:5060>;tag=callertag".to_string();
     let sdp = PEER_SDP.replace("{PORT}", &media_port.to_string());
@@ -455,22 +504,48 @@ fn run_inbound(action: PeerAction, act_after: Duration, rtp_min: u16) -> Finishe
 
     let act_at = connected + act_after;
     let mut acted = false;
+    let mut bye_msg: Option<String> = None;
+    let mut resent = false;
     let mut ended_at: Option<Instant> = None;
     let hard_stop = connected + Duration::from_secs(CALL_SECS + 4);
     loop {
         if !acted && Instant::now() >= act_at {
             acted = true;
-            let msg = peer_request(
-                action,
-                siptest_addr,
-                caller_addr,
-                call_id,
-                &from,
-                &to,
-                2,
-                media_port,
-            );
-            caller.send_to(msg.as_bytes(), siptest_addr).unwrap();
+            if let Some(sock) = &intruder_sock {
+                let from_addr = sock.local_addr().unwrap();
+                for a in [action, PeerAction::Options] {
+                    let msg = peer_request(
+                        a,
+                        siptest_addr,
+                        from_addr,
+                        call_id,
+                        &from,
+                        &to,
+                        2,
+                        media_port,
+                    );
+                    sock.send_to(msg.as_bytes(), siptest_addr).unwrap();
+                }
+            } else {
+                let msg = peer_request(
+                    action,
+                    siptest_addr,
+                    caller_addr,
+                    call_id,
+                    &from,
+                    &to,
+                    2,
+                    media_port,
+                );
+                caller.send_to(msg.as_bytes(), siptest_addr).unwrap();
+                bye_msg = Some(msg);
+            }
+        }
+        if let Some(sock) = &intruder_sock {
+            let mut ibuf = [0u8; 4096];
+            if let Ok((n, _)) = sock.recv_from(&mut ibuf) {
+                intruder_log.push(String::from_utf8_lossy(&ibuf[..n]).to_string());
+            }
         }
         if let Some(text) = recv(&log) {
             // Answer siptest's own BYE, if it sends one.
@@ -487,6 +562,14 @@ fn run_inbound(action: PeerAction, act_after: Duration, rtp_min: u16) -> Finishe
             ended_at = Some(Instant::now());
         }
         if let Some(t) = ended_at {
+            // The peer retransmits its BYE once the call is over, as it would
+            // had siptest's `200` been lost.
+            if action == PeerAction::Bye && !resent {
+                if let Some(msg) = &bye_msg {
+                    caller.send_to(msg.as_bytes(), siptest_addr).unwrap();
+                    resent = true;
+                }
+            }
             if t.elapsed() > Duration::from_millis(500) {
                 break;
             }
@@ -513,6 +596,7 @@ fn run_inbound(action: PeerAction, act_after: Duration, rtp_min: u16) -> Finishe
         log,
         elapsed,
         state,
+        intruder_log,
     }
 }
 
@@ -551,6 +635,13 @@ fn outbound_remote_bye_is_answered_and_ends_the_call_early() {
         0,
         "siptest must not BYE a dialog the far end already ended"
     );
+    assert_eq!(
+        f.log.answered_count(200, "BYE"),
+        2,
+        "a BYE retransmitted after the call ended (our 200 lost) must be \
+         answered again: {:#?}",
+        f.log.all()
+    );
     assert!(
         f.call.report.is_some(),
         "an early hang-up still reports the media it carried"
@@ -588,6 +679,13 @@ fn inbound_remote_bye_is_answered_and_ends_the_call_early() {
         f.elapsed
     );
     assert_eq!(f.log.requests("BYE"), 0);
+    assert_eq!(
+        f.log.answered_count(200, "BYE"),
+        2,
+        "a BYE retransmitted after the call ended (our 200 lost) must be \
+         answered again: {:#?}",
+        f.log.all()
+    );
     assert!(f.call.report.is_some());
     assert_nothing_left_registered(&f);
 }
@@ -697,4 +795,53 @@ fn an_unanswered_outbound_call_leaves_no_dialog_route_behind() {
     );
     assert!(state.dialog_route.lock().unwrap().is_none());
     assert!(state.calls.lock().unwrap().active().is_none());
+}
+
+/// A probe that names the dialog's own Call-ID is still a keepalive and still
+/// answered — it must not fall into the silence reserved for requests siptest
+/// has no answer for.
+#[test]
+fn outbound_options_naming_the_dialogs_own_call_id_is_answered() {
+    let f = run_outbound(PeerAction::DialogOptions, PEER_ACTS_AFTER, 42100);
+
+    assert!(f.log.answered(200, "OPTIONS"), "{:#?}", f.log.all());
+    assert_eq!(f.call.end_reason, Some(EndReason::DurationElapsed));
+    assert_nothing_left_registered(&f);
+}
+
+#[test]
+fn inbound_options_naming_the_dialogs_own_call_id_is_answered() {
+    let f = run_inbound(PeerAction::DialogOptions, PEER_ACTS_AFTER, 42200);
+
+    assert!(f.log.answered(200, "OPTIONS"), "{:#?}", f.log.all());
+    assert_eq!(f.call.end_reason, Some(EndReason::DurationElapsed));
+    assert_nothing_left_registered(&f);
+}
+
+// ---------------------------------------------------------------------------
+// Only the bridge is heard: the connected-call watcher shares the listener's
+// source check
+// ---------------------------------------------------------------------------
+
+/// An untrusted sender that has learned an answered call's Call-ID and tags
+/// can neither hang the call up nor get a reply of any kind — not even to an
+/// `OPTIONS`, which would make siptest a reflector.
+#[test]
+fn an_untrusted_sender_cannot_hang_up_or_probe_an_answered_inbound_call() {
+    let f = run_inbound_with(PeerAction::Bye, PEER_ACTS_AFTER, 42300, true);
+
+    assert_eq!(
+        f.call.end_reason,
+        Some(EndReason::DurationElapsed),
+        "a BYE from an untrusted address ended the call: {:#?}",
+        f.log.all()
+    );
+    assert!(f.elapsed >= Duration::from_secs(CALL_SECS - 1));
+    assert!(
+        f.intruder_log.all().is_empty(),
+        "an untrusted sender was answered: {:#?}",
+        f.intruder_log.all()
+    );
+    assert_eq!(f.log.requests("BYE"), 1, "we hang up at the end ourselves");
+    assert_nothing_left_registered(&f);
 }

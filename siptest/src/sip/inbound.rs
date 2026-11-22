@@ -3,7 +3,7 @@
 //! [`crate::call::execute_inbound_call`], mirroring how outbound signalling
 //! (`sip::outbound`) is separate from its orchestration (`call::execute_outbound_call`).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use gsm_sip_bridge::ims::sip_client::{build_uas_response_with_headers, SipRequest};
@@ -121,8 +121,14 @@ pub enum WaitOutcome {
 }
 
 /// Waits up to `duration` for a `CANCEL` matching `call_id`, handling any
-/// unrelated request seen along the way via [`handle_stray`].
-pub fn wait_or_cancel(socket: &SipSocket, call_id: &str, duration: Duration) -> WaitOutcome {
+/// unrelated request seen along the way via [`handle_stray`]. Only requests
+/// from `trusted` are ever seen ([`SipSocket::recv_request_from`]).
+pub fn wait_or_cancel(
+    socket: &SipSocket,
+    trusted: IpAddr,
+    call_id: &str,
+    duration: Duration,
+) -> WaitOutcome {
     let deadline = Instant::now() + duration;
     loop {
         let now = Instant::now();
@@ -130,7 +136,7 @@ pub fn wait_or_cancel(socket: &SipSocket, call_id: &str, duration: Duration) -> 
             return WaitOutcome::TimedOut;
         }
         let slice = (deadline - now).min(Duration::from_millis(300));
-        match socket.recv_request(slice) {
+        match socket.recv_request_from(trusted, slice) {
             Ok(Some((req, peer))) => {
                 if req.method == "CANCEL" && req.header("Call-ID") == Some(call_id) {
                     return WaitOutcome::Cancelled(req);
@@ -147,12 +153,12 @@ pub fn wait_or_cancel(socket: &SipSocket, call_id: &str, duration: Duration) -> 
 /// `call_id` arrives, a duplicate INVITE is seen (the peer's own retransmit,
 /// because our 200 was lost — resend rather than wait out the ladder), or the
 /// ladder is exhausted.
-pub fn wait_for_ack(socket: &SipSocket, call_id: &str, resend: impl Fn()) -> bool {
+pub fn wait_for_ack(socket: &SipSocket, trusted: IpAddr, call_id: &str, resend: impl Fn()) -> bool {
     let mut interval = Duration::from_millis(500);
     let mut elapsed = Duration::ZERO;
     let cap = Duration::from_secs(32);
     loop {
-        match socket.recv_request(interval) {
+        match socket.recv_request_from(trusted, interval) {
             Ok(Some((req, peer))) => {
                 if req.method == "ACK" && req.header("Call-ID") == Some(call_id) {
                     return true;
@@ -179,6 +185,7 @@ pub fn wait_for_ack(socket: &SipSocket, call_id: &str, resend: impl Fn()) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
 
     fn canned_request(method: &str, extra_headers: &[(&str, &str)]) -> SipRequest {
         let mut headers = vec![
@@ -239,6 +246,80 @@ mod tests {
             .unwrap()
             .expect("a second concurrent call is busied out");
         assert_eq!(busy.status, 486);
+    }
+
+    /// The pre-answer waits share the source check: an unauthenticated peer
+    /// gets no reply to an `OPTIONS`, and its `CANCEL` cannot end a call
+    /// ringing for someone else.
+    #[test]
+    fn the_pre_answer_waits_hear_only_the_trusted_address() {
+        let bind = || {
+            SipSocket::bind(
+                Some("127.0.0.1".parse().unwrap()),
+                0,
+                "127.0.0.1:1".parse().unwrap(),
+            )
+            .unwrap()
+        };
+        let untrusted: IpAddr = "127.0.0.2".parse().unwrap();
+        let trusted: IpAddr = "127.0.0.1".parse().unwrap();
+
+        // Sender is 127.0.0.1; with 127.0.0.2 trusted it is the intruder.
+        let (a, b) = (bind(), bind());
+        b.send(
+            a.local_addr(),
+            &gsm_sip_bridge::ims::sip_client::build_options(
+                &gsm_sip_bridge::ims::sip_client::OptionsRequest {
+                    request_uri: "1002@127.0.0.1",
+                    local_addr: b.local_addr(),
+                    transport: "UDP",
+                    public_uri: "sip:b@127.0.0.1",
+                    from_tag: "t",
+                    call_id: "probe-1",
+                    cseq: 1,
+                    branch: "z9hG4bKprobe",
+                    security_verify: None,
+                },
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            wait_or_cancel(&a, untrusted, "inbound-call-1", Duration::from_millis(400)),
+            WaitOutcome::TimedOut
+        ));
+        assert!(
+            b.recv_response("probe-1", 1, "OPTIONS", Duration::from_millis(200))
+                .unwrap()
+                .is_none(),
+            "an untrusted OPTIONS was answered"
+        );
+
+        // The same request from the trusted address is answered.
+        let (a, b) = (bind(), bind());
+        b.send(
+            a.local_addr(),
+            &gsm_sip_bridge::ims::sip_client::build_options(
+                &gsm_sip_bridge::ims::sip_client::OptionsRequest {
+                    request_uri: "1002@127.0.0.1",
+                    local_addr: b.local_addr(),
+                    transport: "UDP",
+                    public_uri: "sip:b@127.0.0.1",
+                    from_tag: "t",
+                    call_id: "probe-2",
+                    cseq: 1,
+                    branch: "z9hG4bKprobe2",
+                    security_verify: None,
+                },
+            ),
+        )
+        .unwrap();
+        let _ = wait_or_cancel(&a, trusted, "inbound-call-1", Duration::from_millis(400));
+        assert!(
+            b.recv_response("probe-2", 1, "OPTIONS", Duration::from_secs(2))
+                .unwrap()
+                .is_some(),
+            "a trusted OPTIONS was not answered"
+        );
     }
 
     #[test]

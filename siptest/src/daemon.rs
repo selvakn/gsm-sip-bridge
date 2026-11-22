@@ -100,6 +100,7 @@ fn run_with_config(config: Config) -> SipTestResult<()> {
         }),
         manual_decisions: Mutex::new(std::collections::HashMap::new()),
         dialog_route: Mutex::new(None),
+        recent_hangups: Mutex::new(Default::default()),
     });
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -152,24 +153,14 @@ fn run_with_config(config: Config) -> SipTestResult<()> {
 /// `SharedState`, without needing the full HTTP daemon up.
 pub fn inbound_listener_loop(state: Arc<SharedState>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Relaxed) {
-        let Ok(Some((req, peer))) = state.sip_socket.recv_request(Duration::from_millis(500))
+        // Requests from any address but the bridge's are dropped inside
+        // `recv_request_from`, with no reply — see its doc for why.
+        let Ok(Some((req, peer))) = state
+            .sip_socket
+            .recv_request_from(state.bridge_registrar.ip(), Duration::from_millis(500))
         else {
             continue;
         };
-        // Matched on IP only, never port — the bridge's telephony agent
-        // sends INVITEs from a different port than its registrar
-        // (`test_inbound_from_other_port.rs`), so port can't be part of the
-        // check. Anything from elsewhere is dropped with no reply at all,
-        // not just refused: this is the daemon's only defense against an
-        // unauthenticated peer directing an answered call's RTP at an
-        // arbitrary third-party destination via its own SDP offer
-        // (`execute_inbound_call` trusts whatever `c=`/`m=` the offer
-        // names), and replying to a spoofed source would make siptest a
-        // UDP reflection amplifier for that same peer.
-        if peer.ip() != state.bridge_registrar.ip() {
-            tracing::warn!(%peer, "dropping SIP request from an unexpected source IP");
-            continue;
-        }
         // A request belonging to the outbound call in flight goes to that
         // call (its BYE, re-INVITE...), never to the stray handling below.
         if forward_to_dialog(&state, &req, peer) {
@@ -196,6 +187,24 @@ pub fn inbound_listener_loop(state: Arc<SharedState>, stop: Arc<AtomicBool>) {
                 }
                 crate::call::execute_inbound_call(&state, req, peer);
             }
+            // A retransmitted BYE for a call the far end already ended: our
+            // `200` was lost and the call is over, so only this can answer it.
+            "BYE"
+                if req.header("Call-ID").is_some_and(|id| {
+                    state
+                        .recent_hangups
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains(id, std::time::Instant::now())
+                }) =>
+            {
+                let _ = state.sip_socket.send(
+                    peer,
+                    &gsm_sip_bridge::ims::sip_client::build_uas_response(
+                        200, "OK", &req, None, None, None,
+                    ),
+                );
+            }
             "ACK" | "BYE" | "CANCEL" => {
                 // Stray — the dialog these belong to is handled entirely
                 // inside `execute_inbound_call`'s own read loop while it
@@ -211,19 +220,21 @@ pub fn inbound_listener_loop(state: Arc<SharedState>, stop: Arc<AtomicBool>) {
 }
 
 /// Hands `req` to the outbound call whose dialog it belongs to, if one is
-/// registered (`SharedState::dialog_route`). Never blocks: see
-/// [`crate::api::state::Forwarded::Dropped`].
+/// registered (`SharedState::dialog_route`). Never blocks; `false` means the
+/// caller handles it as a stray (see [`crate::api::state::Forwarded::Dropped`]).
 fn forward_to_dialog(state: &SharedState, req: &SipRequest, peer: std::net::SocketAddr) -> bool {
     let route = state.dialog_route.lock().unwrap_or_else(|e| e.into_inner());
     let Some(route) = route.as_ref() else {
         return false;
     };
     match route.try_forward(req, peer) {
-        Forwarded::NotMine => false,
         Forwarded::Queued => true,
+        // Not this dialog's, or the call can no longer take it: handled as a
+        // stray, which still answers a retransmitted BYE and busies a re-INVITE.
+        Forwarded::NotMine => false,
         Forwarded::Dropped => {
-            tracing::warn!(method = %req.method, "dropping an in-dialog request: the call's queue is full or gone");
-            true
+            tracing::warn!(method = %req.method, "an in-dialog request could not be queued for its call");
+            false
         }
     }
 }

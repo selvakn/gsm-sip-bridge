@@ -17,7 +17,7 @@
 //! into one of two queues: `SipMessage::Response`s (consumed by
 //! [`recv_response`](SipSocket::recv_response), used by registration and
 //! outbound calling) and `SipMessage::Request`s (consumed by
-//! [`recv_request`](SipSocket::recv_request), used by inbound-call handling).
+//! [`recv_request_from`](SipSocket::recv_request_from), used by inbound-call handling).
 //! Two threads independently calling `recv_from` on the same socket would
 //! race for each datagram — whichever was blocked when it arrived gets it —
 //! which could silently steal an inbound INVITE meant for the call handler,
@@ -167,12 +167,42 @@ impl SipSocket {
     }
 
     /// Blocks until a SIP request (an inbound INVITE, BYE, CANCEL, OPTIONS...)
-    /// arrives or `timeout` elapses, returning it with the peer address to
-    /// reply to.
-    pub fn recv_request(
+    /// **from `trusted`** arrives or `timeout` elapses, returning it with the
+    /// peer address to reply to.
+    ///
+    /// This is the only way to read requests, and the source check is part of
+    /// it rather than the caller's job: every reader — the listener, the
+    /// ACK/CANCEL waits, a connected call's watcher — would otherwise have to
+    /// remember it, and the one that forgot would answer an unauthenticated
+    /// peer. Matched on IP only, never port: the bridge's telephony agent
+    /// sends INVITEs from a different port than its registrar
+    /// (`test_inbound_from_other_port.rs`). A request from anywhere else is
+    /// dropped with no reply at all, not refused — it is the daemon's only
+    /// defense against an unauthenticated peer directing an answered call's
+    /// RTP at an arbitrary third party through its own SDP offer, or
+    /// stopping a call with a `BYE` that names its `Call-ID`; and replying to
+    /// a spoofed source would make siptest a UDP reflection amplifier.
+    pub fn recv_request_from(
         &self,
+        trusted: IpAddr,
         timeout: Duration,
     ) -> SipTestResult<Option<(SipRequest, SocketAddr)>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.next_request(remaining)? {
+                None => return Ok(None),
+                Some((req, peer)) if peer.ip() == trusted => return Ok(Some((req, peer))),
+                Some((_, peer)) => {
+                    tracing::warn!(%peer, "dropping SIP request from an unexpected source IP");
+                }
+            }
+        }
+    }
+
+    /// The raw queue pop behind [`recv_request_from`](Self::recv_request_from),
+    /// with no source check — private so that nothing can read unfiltered.
+    fn next_request(&self, timeout: Duration) -> SipTestResult<Option<(SipRequest, SocketAddr)>> {
         let deadline = Instant::now() + timeout;
         let mut guard = self
             .inbox
@@ -341,7 +371,7 @@ mod tests {
         )
         .unwrap();
 
-        // b sends a is a request (OPTIONS) — a should see it via recv_request.
+        // b sends a is a request (OPTIONS) — a should see it via recv_request_from.
         let options = build_options(&OptionsRequest {
             request_uri: "a@127.0.0.1",
             local_addr: b.local_addr(),
@@ -355,7 +385,7 @@ mod tests {
         });
         b.send(a.local_addr(), &options).unwrap();
         let (req, _src) = a
-            .recv_request(Duration::from_secs(2))
+            .recv_request_from("127.0.0.1".parse().unwrap(), Duration::from_secs(2))
             .unwrap()
             .expect("expected a to receive the OPTIONS request");
         assert_eq!(req.method, "OPTIONS");
@@ -477,5 +507,68 @@ mod tests {
             .unwrap()
             .expect("CSeq 1's response must not have been consumed by the CSeq-2 waiter");
         assert_eq!(stale.status, 302);
+    }
+
+    /// A request from an address other than the trusted one is consumed and
+    /// dropped — not returned, and not left queued for the next reader
+    /// either, which would hand it to whichever caller looked next.
+    #[test]
+    fn a_request_from_an_untrusted_ip_is_dropped_and_never_returned() {
+        let a = SipSocket::bind(
+            Some("127.0.0.1".parse().unwrap()),
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .unwrap();
+        let b = SipSocket::bind(
+            Some("127.0.0.1".parse().unwrap()),
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .unwrap();
+        let options = "OPTIONS sip:1002@127.0.0.1 SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:5072;branch=z9hG4bK1\r\nCall-ID: c1\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n";
+        b.send(a.local_addr(), options).unwrap();
+
+        let trusted_elsewhere: IpAddr = "127.0.0.2".parse().unwrap();
+        assert!(a
+            .recv_request_from(trusted_elsewhere, Duration::from_millis(500))
+            .unwrap()
+            .is_none());
+        // Gone for good: even the right IP no longer sees it.
+        assert!(a
+            .recv_request_from("127.0.0.1".parse().unwrap(), Duration::from_millis(200))
+            .unwrap()
+            .is_none());
+    }
+
+    /// An untrusted request ahead of a trusted one must not hide it.
+    #[test]
+    fn a_trusted_request_behind_an_untrusted_one_is_still_delivered() {
+        let a = SipSocket::bind(
+            Some("127.0.0.1".parse().unwrap()),
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .unwrap();
+        // Two senders on different loopback addresses.
+        let trusted = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let intruder = std::net::UdpSocket::bind("127.0.0.2:0").unwrap();
+        let msg = |call: &str| {
+            format!("OPTIONS sip:1002@127.0.0.1 SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:5072;branch=z9hG4bK1\r\nCall-ID: {call}\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n")
+        };
+        intruder
+            .send_to(msg("intruder").as_bytes(), a.local_addr())
+            .unwrap();
+        thread::sleep(Duration::from_millis(100));
+        trusted
+            .send_to(msg("friend").as_bytes(), a.local_addr())
+            .unwrap();
+
+        let (req, peer) = a
+            .recv_request_from("127.0.0.1".parse().unwrap(), Duration::from_secs(2))
+            .unwrap()
+            .expect("the trusted request");
+        assert_eq!(req.header("Call-ID"), Some("friend"));
+        assert_eq!(peer.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
     }
 }

@@ -18,8 +18,9 @@
 //! What is answered: `BYE` → `200` and the call ends; `re-INVITE`/`UPDATE` →
 //! `488`, because siptest cannot renegotiate media mid-call and says so
 //! plainly rather than silently dropping the request or agreeing to
-//! something it won't do; `OPTIONS` and unrelated `INVITE`s → the stray
-//! handling every other waiting loop uses.
+//! something it won't do; `OPTIONS` → `200`, in or out of the dialog; any
+//! other in-dialog method → `405`; unrelated `INVITE`s → the stray handling
+//! every other waiting loop uses.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,7 +30,7 @@ use std::time::Duration;
 
 use gsm_sip_bridge::ims::sip_client::{build_uas_response, SipRequest};
 
-use crate::sip::inbound::handle_stray;
+use crate::sip::inbound::{build_405, build_options_ok, handle_stray};
 use crate::sip::socket::SipSocket;
 
 /// How often the watcher re-checks that the call is still running when no
@@ -69,9 +70,22 @@ pub fn respond(
             );
             Disposition::Handled
         }
-        // A retransmitted ACK for our 2xx, or another in-dialog request we
-        // have no answer for (INFO, NOTIFY...): nothing to do.
-        (_, true) => Disposition::Handled,
+        // A keepalive is answered whether or not it names this dialog's
+        // Call-ID: a peer may probe within the dialog as well as outside it.
+        ("OPTIONS", _) => {
+            let _ = socket.send(peer, &build_options_ok(req));
+            Disposition::Handled
+        }
+        // A retransmitted ACK for our 2xx, or a CANCEL for a transaction
+        // that is already over: nothing to answer.
+        ("ACK" | "CANCEL", true) => Disposition::Handled,
+        // Any other in-dialog request (INFO, NOTIFY, MESSAGE...): siptest
+        // implements none of them, and says so rather than going silent, so
+        // the peer does not retransmit it into the void.
+        (_, true) => {
+            let _ = socket.send(peer, &build_405(req));
+            Disposition::Handled
+        }
         _ => {
             handle_stray(socket, req, peer, call_id);
             Disposition::Handled
@@ -195,6 +209,42 @@ mod tests {
             assert_eq!(
                 reply_to(&theirs, method, Duration::from_secs(2)),
                 Some(488),
+                "{method}"
+            );
+        }
+    }
+
+    /// The dialog's own Call-ID must not turn a keepalive into silence.
+    #[test]
+    fn options_is_answered_whether_or_not_it_names_the_dialog() {
+        for call_id in [CALL, "some-other-call"] {
+            let (ours, theirs) = pair();
+            let d = respond(
+                &ours,
+                &request("OPTIONS", call_id),
+                theirs.local_addr(),
+                CALL,
+            );
+            assert_eq!(d, Disposition::Handled);
+            let resp = theirs
+                .recv_response(call_id, 7, "OPTIONS", Duration::from_secs(2))
+                .unwrap()
+                .unwrap_or_else(|| panic!("OPTIONS with Call-ID {call_id} got no reply"));
+            assert_eq!(resp.status, 200);
+        }
+    }
+
+    /// siptest implements no other in-dialog method; it says so instead of
+    /// leaving the peer to retransmit into silence.
+    #[test]
+    fn any_other_in_dialog_method_is_refused_with_405() {
+        for method in ["INFO", "NOTIFY", "MESSAGE"] {
+            let (ours, theirs) = pair();
+            let d = respond(&ours, &request(method, CALL), theirs.local_addr(), CALL);
+            assert_eq!(d, Disposition::Handled, "{method} must not end the call");
+            assert_eq!(
+                reply_to(&theirs, method, Duration::from_secs(2)),
+                Some(405),
                 "{method}"
             );
         }

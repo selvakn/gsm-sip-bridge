@@ -3,6 +3,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::api::events::EventBus;
 use crate::call::{Call, CallId};
@@ -173,6 +174,56 @@ pub struct SharedState {
     /// UPDATE...) for the outbound call currently in flight. `None` whenever
     /// no outbound call is registered — see [`DialogRoute`].
     pub dialog_route: Mutex<Option<DialogRoute>>,
+    /// Dialogs the far end ended with a `BYE` we answered, so a retransmitted
+    /// `BYE` (our `200` was lost) still gets its `200` after the call is over.
+    pub recent_hangups: Mutex<RecentHangups>,
+}
+
+/// Call-IDs of dialogs the far end ended, kept briefly after the call.
+///
+/// siptest has no SIP transaction layer, so nothing else would answer a
+/// retransmission of a `BYE` once its call is gone — and a peer that never
+/// sees our `200` retransmits for about 32 s (64 × T1, RFC 3261 §17.2.2).
+/// The call's own watcher answers retransmissions while the call lasts, and
+/// a remote hang-up now ends it within milliseconds, well inside the peer's
+/// first retry at 500 ms. This covers the rest of that window. Bounded in
+/// both time and size.
+#[derive(Debug, Default)]
+pub struct RecentHangups {
+    entries: VecDeque<(String, Instant)>,
+}
+
+impl RecentHangups {
+    /// How long a retransmitted `BYE` is still answered: 64 × T1.
+    pub const TTL: Duration = Duration::from_secs(32);
+    /// The most dialogs remembered at once; the oldest is forgotten first.
+    pub const CAPACITY: usize = 16;
+
+    pub fn record(&mut self, sip_call_id: &str, now: Instant) {
+        self.prune(now);
+        if self.entries.iter().any(|(id, _)| id == sip_call_id) {
+            return;
+        }
+        if self.entries.len() == Self::CAPACITY {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((sip_call_id.to_string(), now));
+    }
+
+    pub fn contains(&mut self, sip_call_id: &str, now: Instant) -> bool {
+        self.prune(now);
+        self.entries.iter().any(|(id, _)| id == sip_call_id)
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while self
+            .entries
+            .front()
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) > Self::TTL)
+        {
+            self.entries.pop_front();
+        }
+    }
 }
 
 /// Registered by an outbound call for its whole lifetime so the inbound
@@ -196,8 +247,10 @@ pub enum Forwarded {
     /// Queued for the call.
     Queued,
     /// Part of this dialog but not queued — the call's queue is full or the
-    /// call has already gone. Dropped (the peer retransmits) rather than
-    /// blocking the thread that answers every other caller.
+    /// call's watcher has already finished. Never blocks the thread that
+    /// answers every other caller; the caller treats the request as a stray,
+    /// so a retransmitted `BYE` can still be answered from
+    /// [`RecentHangups`] instead of vanishing.
     Dropped,
 }
 
@@ -224,6 +277,15 @@ impl SharedState {
         *n += 1;
         CallId(format!("c-{n}"))
     }
+
+    /// Remembers that the far end hung up `sip_call_id`'s dialog, so a
+    /// retransmitted `BYE` is still answered after the call has gone.
+    pub fn note_remote_bye(&self, sip_call_id: &str) {
+        self.recent_hangups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(sip_call_id, Instant::now());
+    }
 }
 
 pub type AppState = Arc<SharedState>;
@@ -232,7 +294,6 @@ pub type AppState = Arc<SharedState>;
 mod tests {
     use super::*;
     use crate::call::{CallState, CallerId, Direction};
-    use std::time::Instant;
 
     fn dummy_call(id: &str) -> Call {
         Call {
@@ -318,6 +379,35 @@ mod tests {
             Forwarded::Dropped,
             "a call that is gone must not block either"
         );
+    }
+
+    #[test]
+    fn a_hang_up_is_remembered_for_the_retransmission_window_then_forgotten() {
+        let t0 = Instant::now();
+        let mut h = RecentHangups::default();
+        assert!(!h.contains("c1", t0));
+        h.record("c1", t0);
+        assert!(h.contains("c1", t0 + Duration::from_secs(31)));
+        assert!(
+            !h.contains("c1", t0 + RecentHangups::TTL + Duration::from_secs(1)),
+            "forgotten once the peer would have stopped retransmitting"
+        );
+    }
+
+    #[test]
+    fn the_hang_up_record_is_bounded_and_forgets_the_oldest_first() {
+        let t0 = Instant::now();
+        let mut h = RecentHangups::default();
+        for n in 0..RecentHangups::CAPACITY + 1 {
+            h.record(&format!("c{n}"), t0);
+        }
+        assert!(!h.contains("c0", t0), "the oldest was evicted");
+        assert!(h.contains("c1", t0));
+        assert!(h.contains(&format!("c{}", RecentHangups::CAPACITY), t0));
+        // Recording the same dialog twice does not use up a second slot.
+        let before = h.entries.len();
+        h.record("c1", t0);
+        assert_eq!(h.entries.len(), before);
     }
 
     /// Outbound and inbound admission share this one reservation, so whichever
