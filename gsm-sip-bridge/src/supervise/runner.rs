@@ -773,7 +773,19 @@ mod real_runner_tests {
         assert!(!runner.unix_connect_ok(&path), "nothing at the path");
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
         assert!(path.exists(), "the socket file outlives its listener");
-        assert!(!runner.unix_connect_ok(&path), "a file nobody listens on");
+        // Other tests in this process spawn children at the same time. A
+        // child forked while the listener was open holds a copy of its fd
+        // until it execs (CLOEXEC acts only at exec), so the listener can
+        // briefly outlive the drop and accept a connect. That copy is gone
+        // within milliseconds; a file nobody listens on refuses for good.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runner.unix_connect_ok(&path) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a file nobody listens on"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
