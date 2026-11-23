@@ -435,13 +435,19 @@ fn prime_lines(
     );
 
     // One shared pcscd for the whole pass, matching `start_vowifi_subsystem`
-    // exactly: `render_vpcd_reader_conf`'s one conf entry already serves up
-    // to 8 slots from `[vowifi].vpcd_port` upward (its own doc comment), and
-    // every priming line's own `vpcd_port` — derived from its pass-local
-    // index (research.md R4) — falls within that range by construction.
-    let needs_vpcd = targets.iter().any(|t| !t.line.pcsc_reader);
+    // exactly: `render_vpcd_reader_conf`'s one conf entry serves the vpcd
+    // driver's slots from `[vowifi].vpcd_port` upward, and every priming
+    // line's own `vpcd_port` is derived from its pass-local index
+    // (research.md R4). How many slots there are is the driver's build
+    // (8 in the image, 2 in a distribution's), so `start_pass_pcscd` checks
+    // each modem-backed line's port.
+    let vpcd_ports: Vec<u16> = targets
+        .iter()
+        .filter(|t| !t.line.pcsc_reader)
+        .map(|t| t.line.vpcd_port)
+        .collect();
     let pcscd_handle =
-        match super::orchestrate::start_pass_pcscd(runner.as_ref(), config, needs_vpcd) {
+        match super::orchestrate::start_pass_pcscd(runner.as_ref(), config, &vpcd_ports) {
             Ok(h) => h,
             Err(e) => {
                 let msg = format!("priming: pcscd did not become ready: {e}");
@@ -805,6 +811,9 @@ mod tests {
         let runner: Arc<dyn CommandRunner> = mock.clone();
         let config = test_config();
         mock.set_tcp_connect_ok(&config.vowifi.vpcd_host, config.vowifi.vpcd_port, true);
+        // The modem-backed line's own slot: every modem line's port must
+        // answer before the pass starts any line.
+        mock.set_tcp_connect_ok(&config.vowifi.vpcd_host, 35964, true);
         mock.set_unix_connect_ok(
             &crate::supervise::vpcd::pcscd_socket_path().to_string_lossy(),
             true,

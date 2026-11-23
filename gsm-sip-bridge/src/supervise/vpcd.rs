@@ -186,8 +186,8 @@ pub enum StartPcscdError {
     /// uses the host's pcscd only once a connect has succeeded).
     ExternalUnreachable,
     /// The host's pcscd is used and a line needs the vpcd reader, but the
-    /// base slot's port never answered, even after that pcscd was asked to
-    /// re-read its reader configuration.
+    /// base slot's port never answered: that pcscd started before the vpcd
+    /// entry was written, or something else holds the port.
     ExternalVpcdUnavailable,
 }
 
@@ -240,30 +240,24 @@ fn poll_until(runner: &dyn CommandRunner, mut ok: impl FnMut() -> bool) -> bool 
 /// Waits for the host's pcscd to serve the vpcd reader on `host:port`, the
 /// base slot's port.
 ///
-/// pcscd reads `/etc/reader.conf.d` when it starts. A host pcscd that
-/// started before the bridge first wrote the vpcd entry has no vpcd reader,
-/// so if the port does not answer within the poll window, pcscd is asked
-/// once to re-read its reader configuration (`pcscd --hotplug`, which
-/// signals the running pcscd and is what systemd's `ExecReload` runs) and
-/// the port is polled again. A reader already loaded is left alone by that
-/// re-read, so it does not disturb the host's other PC/SC clients.
+/// pcscd reads `/etc/reader.conf.d` only when it starts. A running pcscd
+/// cannot be made to load a new entry: `pcscd --hotplug` (what systemd's
+/// `ExecReload` runs) sends SIGUSR1, which on a libudev build only rescans
+/// USB. A host pcscd that started before the bridge first wrote the vpcd
+/// entry therefore has no vpcd reader until it is restarted, and the bridge
+/// does not restart it, as that would cut off the host's other PC/SC
+/// clients. Startup fails instead, and the error names the restart. The
+/// entry stays after the bridge stops, so one restart is enough.
 fn wait_for_external_vpcd(
     runner: &dyn CommandRunner,
     host: &str,
     port: u16,
 ) -> Result<(), StartPcscdError> {
     if poll_until(runner, || runner.tcp_connect_ok(host, port)) {
-        return Ok(());
+        Ok(())
+    } else {
+        Err(StartPcscdError::ExternalVpcdUnavailable)
     }
-    println!(
-        "[supervise] the host's pcscd does not serve the vpcd reader on {host}:{port}; \
-         asking it to re-read its reader configuration (pcscd --hotplug)"
-    );
-    let _ = runner.run(&["pcscd", "--hotplug"]);
-    if poll_until(runner, || runner.tcp_connect_ok(host, port)) {
-        return Ok(());
-    }
-    Err(StartPcscdError::ExternalVpcdUnavailable)
 }
 
 /// Makes a pcscd available to this pass's lines, per `mode`, and waits until
@@ -330,6 +324,27 @@ pub fn start_pcscd(
         }
     }
     unreachable!("loop always returns by the final attempt")
+}
+
+/// The first of `ports` that pcscd's vpcd reader does not listen on, or
+/// `None` when it listens on all of them.
+///
+/// The vpcd driver opens one TCP listener per slot, from the reader
+/// configuration's base port upward, and how many slots it has is fixed
+/// when the driver is built (`--enable-vpcdslots`): 8 in the Docker image,
+/// the default 2 in the distributions' `vsmartcard-vpcd`. Each modem-backed
+/// line connects to its own slot's port. Readiness checks only the base
+/// port, so without this a line past the last slot would start and its
+/// `vowifi-usim-bridge` would retry `Connection refused` forever. Ports are
+/// checked in ascending order, each with the readiness poll, and the check
+/// stops at the first that does not answer.
+pub fn missing_vpcd_slot(runner: &dyn CommandRunner, host: &str, ports: &[u16]) -> Option<u16> {
+    let mut sorted = ports.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    sorted
+        .into_iter()
+        .find(|&port| !poll_until(runner, || runner.tcp_connect_ok(host, port)))
 }
 
 /// The last non-empty line our own pcscd wrote to its log, for a startup
@@ -615,10 +630,6 @@ mod tests {
         let result = start_pcscd(&runner, PcscdMode::Auto, true, sock(), "127.0.0.1", 15963);
         assert_eq!(result, Ok(Pcscd::External));
         assert!(runner.spawn_specs.lock().unwrap().is_empty());
-        assert!(
-            runner.run_calls.lock().unwrap().is_empty(),
-            "a reader that already answers needs no re-read"
-        );
     }
 
     #[test]
@@ -632,47 +643,53 @@ mod tests {
     }
 
     #[test]
-    fn the_hosts_pcscd_is_asked_to_reread_its_readers_when_vpcd_is_missing() {
-        // A host pcscd that started before the vpcd entry was first written.
-        let runner = MockCommandRunner::new();
-        runner.set_unix_connect_ok(SOCK, true);
-        runner.set_tcp_connect_ok_after_run(&["pcscd", "--hotplug"], "127.0.0.1", 15963);
-        let result = start_pcscd(
-            &runner,
-            PcscdMode::External,
-            true,
-            sock(),
-            "127.0.0.1",
-            15963,
-        );
-        assert_eq!(result, Ok(Pcscd::External));
-        assert_eq!(
-            *runner.run_calls.lock().unwrap(),
-            vec![vec!["pcscd".to_string(), "--hotplug".to_string()]]
-        );
-        assert_eq!(
-            runner.tcp_connect_attempts.lock().unwrap().len() as u32,
-            READY_POLL_ATTEMPTS + 1,
-            "a full poll before the re-read, and one connect after it"
-        );
-        assert!(runner.spawn_specs.lock().unwrap().is_empty());
-    }
-
-    #[test]
     fn a_host_vpcd_reader_that_never_answers_is_an_error_and_nothing_is_spawned() {
         let runner = MockCommandRunner::new();
         runner.set_unix_connect_ok(SOCK, true);
         let result = start_pcscd(&runner, PcscdMode::Auto, true, sock(), "127.0.0.1", 15963);
         assert_eq!(result, Err(StartPcscdError::ExternalVpcdUnavailable));
         assert!(runner.spawn_specs.lock().unwrap().is_empty());
-        assert_eq!(
-            runner.run_calls.lock().unwrap().len(),
-            1,
-            "pcscd is asked to re-read its readers once"
+        assert!(
+            runner.run_calls.lock().unwrap().is_empty(),
+            "the host's pcscd is neither signalled nor restarted"
         );
         assert_eq!(
             runner.tcp_connect_attempts.lock().unwrap().len() as u32,
-            2 * READY_POLL_ATTEMPTS
+            READY_POLL_ATTEMPTS
+        );
+    }
+
+    #[test]
+    fn every_vpcd_slot_that_answers_is_no_missing_slot() {
+        let runner = MockCommandRunner::new();
+        runner.set_tcp_connect_ok("127.0.0.1", 15963, true);
+        runner.set_tcp_connect_ok("127.0.0.1", 15964, true);
+        assert_eq!(
+            missing_vpcd_slot(&runner, "127.0.0.1", &[15964, 15963]),
+            None
+        );
+        assert_eq!(missing_vpcd_slot(&runner, "127.0.0.1", &[]), None);
+    }
+
+    #[test]
+    fn the_first_vpcd_slot_past_the_drivers_last_is_reported_and_no_later_one_is_tried() {
+        // A distribution vpcd driver: 2 slots, and three modem-backed lines.
+        let runner = MockCommandRunner::new();
+        runner.set_tcp_connect_ok("127.0.0.1", 15963, true);
+        runner.set_tcp_connect_ok("127.0.0.1", 15964, true);
+        assert_eq!(
+            missing_vpcd_slot(&runner, "127.0.0.1", &[15966, 15963, 15965, 15964]),
+            Some(15965)
+        );
+        let tried = runner.tcp_connect_attempts.lock().unwrap().clone();
+        assert!(
+            !tried.iter().any(|t| t.2 == 15966),
+            "stops at the first missing slot: {tried:?}"
+        );
+        assert_eq!(
+            tried.iter().filter(|t| t.2 == 15965).count() as u32,
+            READY_POLL_ATTEMPTS,
+            "a missing slot gets the same poll as readiness"
         );
     }
 

@@ -220,12 +220,35 @@ The host's pcscd serves modem-backed lines too. Their SIM reaches pcscd
 through the vpcd virtual reader, which pcscd loads from
 `/etc/reader.conf.d/vpcd`; the bridge writes that file before it first
 contacts the host's pcscd, so a pcscd that socket activation starts then
-loads the reader. A host pcscd that was already running without it is asked
-once to re-read its reader configuration (`pcscd --hotplug`, what `systemctl
-reload pcscd.service` runs); the readers it already has are not touched. If
-the vpcd port still does not answer, startup fails and names the port. The
-file stays after the bridge stops, so the host's pcscd keeps listening on
-`[vowifi].vpcd_port` and the ports after it.
+loads the reader. pcscd reads that directory only when it starts:
+`pcscd --hotplug` and `systemctl reload pcscd.service` only rescan USB. A
+host pcscd that was already running before the file was first written, for
+example because another client such as a browser's smart-card module keeps
+it up, has no vpcd reader. The bridge does not restart it, since that would
+cut off the host's other PC/SC clients: startup fails with an error that
+names the port and the file. Restart the host's pcscd once:
+
+```bash
+sudo systemctl restart pcscd.service
+```
+
+The file stays after the bridge stops, so later starts need no restart. It
+also means the host's pcscd keeps listening on `[vowifi].vpcd_port` and the
+ports after it while it runs, even with the bridge stopped. A bridge started
+in `managed` mode in that window fails with `DriverBindFailed` (pcscd's log
+line `RFAddReader() Virtual PCD init failed`); wait for the host's pcscd to
+auto-exit, or stop it.
+
+The file holds no list of lines or modems, only the base port, so adding,
+removing or swapping modems needs no restart. The number of modem-backed
+lines is limited, though: the vpcd driver opens one slot, and one TCP port,
+per modem-backed line, from `[vowifi].vpcd_port` upward, and its slot count
+is fixed when it is built. The distributions' `vsmartcard-vpcd` has the
+default 2 (on the host, `ss -ltnp` shows the host's pcscd on 15963 and 15964
+only), and the Docker image's has 8. Card-reader lines take no slot. So the
+host's pcscd serves at most 2 modem-backed lines, alongside any number of
+card-reader lines. With more, startup fails with an error that names the
+port of the first line without a slot.
 
 The bridge never stops a pcscd it did not start. A distribution pcscd started
 by socket activation usually runs with `--auto-exit` and exits about a

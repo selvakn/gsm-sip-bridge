@@ -197,7 +197,9 @@ pub fn render_updown_script(netns: &str, tun_iface: &str) -> String {
 
 /// Renders `/etc/reader.conf.d/vpcd`, pcscd's driver config for the shared
 /// vpcd reader every strongswan-engine line's `vowifi-usim-bridge` connects
-/// to: one shared pcscd, N slots from `port`..`port+7`. See
+/// to: one shared pcscd, one slot per port from `port` upward, as many as
+/// the driver was built with (8 in the image, 2 in a distribution's
+/// `vsmartcard-vpcd`). See
 /// `supervise::vpcd` for the startup and readiness gate around it. 1:1 port
 /// of the entrypoint's `cat >/etc/reader.conf.d/vpcd` heredoc.
 pub fn render_vpcd_reader_conf(port: u16) -> String {

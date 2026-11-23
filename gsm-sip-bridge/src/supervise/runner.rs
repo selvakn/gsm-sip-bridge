@@ -1543,9 +1543,6 @@ mod mock {
         /// front entry while more than one is queued, then keeps returning
         /// the last. Unseeded paths have no identity (nothing there).
         pub path_identities: Mutex<Map<String, PathIdentityQueue>>,
-        /// See [`Self::set_tcp_connect_ok_after_run`]: `(trigger key,
-        /// "host:port")`, applied when the trigger command runs.
-        tcp_effects: Mutex<Vec<(String, String)>>,
         /// How many times `hold_pcsc_context` was called.
         pub pcsc_context_holds: AtomicU64,
         /// Overrides `resolve_host`'s return value for a given host;
@@ -1671,14 +1668,6 @@ mod mock {
 
         /// Applies every seeded effect whose trigger key is `key`.
         fn apply_effects(&self, key: &str) {
-            for (trigger, hostport) in self.tcp_effects.lock().unwrap().iter() {
-                if trigger == key {
-                    self.tcp_connect_results
-                        .lock()
-                        .unwrap()
-                        .insert(hostport.clone(), true);
-                }
-            }
             for (trigger, seeded, out) in self.netns_effects.lock().unwrap().iter() {
                 if trigger == key {
                     self.run_outputs
@@ -1695,16 +1684,6 @@ mod mock {
                 .lock()
                 .unwrap()
                 .insert(format!("{host}:{port}"), ok);
-        }
-
-        /// Makes `tcp_connect_ok(host, port)` succeed once the host command
-        /// `trigger` has run — e.g. `pcscd --hotplug` making a pcscd load
-        /// the vpcd reader that then listens on that port.
-        pub fn set_tcp_connect_ok_after_run(&self, trigger: &[&str], host: &str, port: u16) {
-            self.tcp_effects
-                .lock()
-                .unwrap()
-                .push((trigger.join(" "), format!("{host}:{port}")));
         }
 
         /// Seeds `unix_connect_ok(path)`'s return value.
