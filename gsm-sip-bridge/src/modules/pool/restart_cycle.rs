@@ -29,7 +29,7 @@ impl CardPool {
             self.next_scheduled_at = None;
             return;
         };
-        let now_local = jiff::Zoned::now();
+        let now_local = jiff::ZonedDateTime::now();
         // Use the last natural cron tick as the lower bound so we never re-fire
         // the same occurrence regardless of jitter direction.  On the very first
         // call `last_fired_tick` is None, so we fall back to `now_local`.
@@ -129,7 +129,7 @@ impl CardPool {
             return;
         }
 
-        let cron_tick = jiff::Zoned::now();
+        let cron_tick = jiff::ZonedDateTime::now();
         let id = cron_tick.timestamp().as_second().max(0) as u64;
 
         let mut as_vec: Vec<u32> = slots.keys().copied().collect();
@@ -139,7 +139,7 @@ impl CardPool {
         tracing::info!(
             cycle_id = id,
             cron_tick = %cron_tick,
-            actual_start = %jiff::Zoned::now(),
+            actual_start = %jiff::ZonedDateTime::now(),
             n_slots = pending.len(),
             pending_slots = ?as_vec,
             "scheduled_restart cycle-start"

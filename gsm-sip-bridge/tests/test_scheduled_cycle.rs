@@ -93,7 +93,7 @@ fn fresh_state(slots: &[u32]) -> CycleState {
     let now = tokio::time::Instant::now();
     CycleState {
         id: 42,
-        cron_tick: jiff::Zoned::now(),
+        cron_tick: jiff::ZonedDateTime::now(),
         started_at: now,
         phase: CyclePhase::Initial,
         pending: slots.iter().copied().collect(),
