@@ -3,6 +3,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::api::events::EventBus;
 use crate::call::{Call, CallId};
@@ -169,6 +170,105 @@ pub struct SharedState {
     pub registration_config: crate::sip::registration::RegistrationConfig,
     pub inbound_policy: Mutex<InboundPolicy>,
     pub manual_decisions: Mutex<std::collections::HashMap<CallId, ManualDecision>>,
+    /// Where the inbound listener hands in-dialog requests (BYE, re-INVITE,
+    /// UPDATE...) for the outbound call currently in flight. `None` whenever
+    /// no outbound call is registered — see [`DialogRoute`].
+    pub dialog_route: Mutex<Option<DialogRoute>>,
+    /// Dialogs that have just ended, so a `BYE` for one — retransmitted, or
+    /// crossing our own — still gets its `200` after the call is over.
+    pub recent_hangups: Mutex<RecentHangups>,
+}
+
+/// Call-IDs of dialogs that have just ended — hung up by the far end *or* by
+/// us — kept briefly after the call.
+///
+/// siptest has no SIP transaction layer, so nothing else would answer a `BYE`
+/// for a dialog once its call is gone: not a retransmission of one we already
+/// answered (our `200` was lost), and not one that crossed our own hang-up.
+/// A peer that never sees a `200` retransmits for about 32 s (64 × T1, RFC
+/// 3261 §17.2.2). The call's own watcher answers while the call lasts; this
+/// covers the rest of that window. Bounded in both time and size.
+#[derive(Debug, Default)]
+pub struct RecentHangups {
+    entries: VecDeque<(String, Instant)>,
+}
+
+impl RecentHangups {
+    /// How long a retransmitted `BYE` is still answered: 64 × T1.
+    pub const TTL: Duration = Duration::from_secs(32);
+    /// The most dialogs remembered at once; the oldest is forgotten first.
+    pub const CAPACITY: usize = 16;
+
+    pub fn record(&mut self, sip_call_id: &str, now: Instant) {
+        self.prune(now);
+        if self.entries.iter().any(|(id, _)| id == sip_call_id) {
+            return;
+        }
+        if self.entries.len() == Self::CAPACITY {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((sip_call_id.to_string(), now));
+    }
+
+    pub fn contains(&mut self, sip_call_id: &str, now: Instant) -> bool {
+        self.prune(now);
+        self.entries.iter().any(|(id, _)| id == sip_call_id)
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while self
+            .entries
+            .front()
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) > Self::TTL)
+        {
+            self.entries.pop_front();
+        }
+    }
+}
+
+/// Registered by an outbound call for its whole lifetime so the inbound
+/// listener — the only reader of unsolicited requests — can forward requests
+/// belonging to that call's dialog instead of treating them as strays.
+/// Bounded and non-blocking on the sending side: a stuck call must never
+/// stall the listener.
+pub struct DialogRoute {
+    pub sip_call_id: String,
+    pub tx: std::sync::mpsc::SyncSender<(
+        gsm_sip_bridge::ims::sip_client::SipRequest,
+        std::net::SocketAddr,
+    )>,
+}
+
+/// What [`DialogRoute::try_forward`] did with a request.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Forwarded {
+    /// Not part of this dialog: the caller handles it as it would any stray.
+    NotMine,
+    /// Queued for the call.
+    Queued,
+    /// Part of this dialog but not queued — the call's queue is full or the
+    /// call's watcher has already finished. Never blocks the thread that
+    /// answers every other caller; the caller treats the request as a stray,
+    /// so a retransmitted `BYE` can still be answered from
+    /// [`RecentHangups`] instead of vanishing.
+    Dropped,
+}
+
+impl DialogRoute {
+    /// Never blocks.
+    pub fn try_forward(
+        &self,
+        req: &gsm_sip_bridge::ims::sip_client::SipRequest,
+        peer: std::net::SocketAddr,
+    ) -> Forwarded {
+        if req.header("Call-ID") != Some(self.sip_call_id.as_str()) {
+            return Forwarded::NotMine;
+        }
+        match self.tx.try_send((req.clone(), peer)) {
+            Ok(()) => Forwarded::Queued,
+            Err(_) => Forwarded::Dropped,
+        }
+    }
 }
 
 impl SharedState {
@@ -176,6 +276,25 @@ impl SharedState {
         let mut n = self.next_call_seq.lock().unwrap_or_else(|e| e.into_inner());
         *n += 1;
         CallId(format!("c-{n}"))
+    }
+
+    /// What every reader of SIP requests answers through: this socket, the
+    /// bridge as the only trusted source, and the record of ended dialogs.
+    pub fn request_ctx(&self) -> crate::sip::inbound::RequestCtx<'_> {
+        crate::sip::inbound::RequestCtx {
+            socket: &self.sip_socket,
+            trusted: self.bridge_registrar.ip(),
+            hangups: &self.recent_hangups,
+        }
+    }
+
+    /// Remembers that `sip_call_id`'s dialog has ended, so a `BYE` for it is
+    /// still answered after the call has gone.
+    pub fn note_hangup(&self, sip_call_id: &str) {
+        self.recent_hangups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(sip_call_id, Instant::now());
     }
 }
 
@@ -185,7 +304,6 @@ pub type AppState = Arc<SharedState>;
 mod tests {
     use super::*;
     use crate::call::{CallState, CallerId, Direction};
-    use std::time::Instant;
 
     fn dummy_call(id: &str) -> Call {
         Call {
@@ -207,6 +325,99 @@ mod tests {
             state: CallState::Inviting,
             ..dummy_call(id)
         }
+    }
+
+    fn request(method: &str, call_id: &str) -> gsm_sip_bridge::ims::sip_client::SipRequest {
+        gsm_sip_bridge::ims::sip_client::SipRequest {
+            method: method.to_string(),
+            request_uri: "sip:1002@127.0.0.1:5065".to_string(),
+            headers: vec![("Call-ID".to_string(), call_id.to_string())],
+            body: String::new(),
+            body_bytes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_route_only_takes_requests_of_its_own_dialog() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        let route = DialogRoute {
+            sip_call_id: "call-a".to_string(),
+            tx,
+        };
+        let peer: std::net::SocketAddr = "127.0.0.1:5060".parse().unwrap();
+
+        assert_eq!(
+            route.try_forward(&request("OPTIONS", "call-b"), peer),
+            Forwarded::NotMine
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "another dialog's request was queued"
+        );
+
+        assert_eq!(
+            route.try_forward(&request("BYE", "call-a"), peer),
+            Forwarded::Queued
+        );
+        let (queued, from) = rx.try_recv().expect("the BYE was queued");
+        assert_eq!((queued.method.as_str(), from), ("BYE", peer));
+    }
+
+    /// The listener is the only thread answering every other caller; a call
+    /// that stopped draining its queue must cost it nothing but a dropped
+    /// request.
+    #[test]
+    fn a_full_or_abandoned_queue_drops_the_request_instead_of_blocking() {
+        let peer: std::net::SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let route = DialogRoute {
+            sip_call_id: "call-a".to_string(),
+            tx,
+        };
+        assert_eq!(
+            route.try_forward(&request("INVITE", "call-a"), peer),
+            Forwarded::Queued
+        );
+        assert_eq!(
+            route.try_forward(&request("INVITE", "call-a"), peer),
+            Forwarded::Dropped,
+            "a full queue must not block"
+        );
+        drop(rx);
+        assert_eq!(
+            route.try_forward(&request("BYE", "call-a"), peer),
+            Forwarded::Dropped,
+            "a call that is gone must not block either"
+        );
+    }
+
+    #[test]
+    fn a_hang_up_is_remembered_for_the_retransmission_window_then_forgotten() {
+        let t0 = Instant::now();
+        let mut h = RecentHangups::default();
+        assert!(!h.contains("c1", t0));
+        h.record("c1", t0);
+        assert!(h.contains("c1", t0 + Duration::from_secs(31)));
+        assert!(
+            !h.contains("c1", t0 + RecentHangups::TTL + Duration::from_secs(1)),
+            "forgotten once the peer would have stopped retransmitting"
+        );
+    }
+
+    #[test]
+    fn the_hang_up_record_is_bounded_and_forgets_the_oldest_first() {
+        let t0 = Instant::now();
+        let mut h = RecentHangups::default();
+        for n in 0..RecentHangups::CAPACITY + 1 {
+            h.record(&format!("c{n}"), t0);
+        }
+        assert!(!h.contains("c0", t0), "the oldest was evicted");
+        assert!(h.contains("c1", t0));
+        assert!(h.contains(&format!("c{}", RecentHangups::CAPACITY), t0));
+        // Recording the same dialog twice does not use up a second slot.
+        let before = h.entries.len();
+        h.record("c1", t0);
+        assert_eq!(h.entries.len(), before);
     }
 
     /// Outbound and inbound admission share this one reservation, so whichever

@@ -125,6 +125,8 @@ fn build_state(config: Config, sip_socket: Arc<SipSocket>, registered: bool) -> 
         },
         inbound_policy: Mutex::new(inbound_policy),
         manual_decisions: Mutex::new(std::collections::HashMap::new()),
+        dialog_route: Mutex::new(None),
+        recent_hangups: Mutex::new(Default::default()),
     })
 }
 
