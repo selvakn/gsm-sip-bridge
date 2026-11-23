@@ -650,10 +650,7 @@ fn send_cancel(
 }
 
 fn extract_to_tag(resp: &SipResponse) -> Option<String> {
-    let to = resp.header("To")?;
-    to.split(';')
-        .find_map(|part| part.trim().strip_prefix("tag="))
-        .map(|s| s.to_string())
+    crate::sip::message::header_tag(resp.header("To")?).map(str::to_string)
 }
 
 /// `sip:user@addr` (or `sip:addr` when there is no user part).
@@ -733,6 +730,34 @@ fn parse_contact_inner(header_value: &str) -> Option<(String, SocketAddr, bool)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn response_with_to(to: &str) -> SipResponse {
+        SipResponse {
+            status: 200,
+            reason: "OK".to_string(),
+            headers: vec![("To".to_string(), to.to_string())],
+            body: String::new(),
+        }
+    }
+
+    /// The tag the 2xx/non-2xx ACK and our BYE are built from must be read
+    /// however the far end spaces it, and never from the URI's own params.
+    #[test]
+    fn the_to_tag_is_read_however_the_far_end_writes_it() {
+        for (to, expected) in [
+            ("<sip:a@h>;tag=abc", Some("abc")),
+            ("<sip:a@h> ; tag = abc", Some("abc")),
+            ("<sip:a@h>;Tag=abc", Some("abc")),
+            ("<sip:a@h;tag=uri>", None),
+            ("<sip:a@h>", None),
+        ] {
+            assert_eq!(
+                extract_to_tag(&response_with_to(to)).as_deref(),
+                expected,
+                "{to:?}"
+            );
+        }
+    }
 
     #[test]
     fn parses_bracketed_contact_with_params() {

@@ -126,7 +126,8 @@ impl RequestCtx<'_> {
 /// it) has none; a re-INVITE does.
 pub fn has_to_tag(req: &SipRequest) -> bool {
     req.header("To")
-        .is_some_and(|to| to.to_ascii_lowercase().contains(";tag="))
+        .and_then(crate::sip::message::header_tag)
+        .is_some()
 }
 
 /// Answers a request that is not part of the call in progress (whose `Call-ID`

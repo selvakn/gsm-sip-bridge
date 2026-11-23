@@ -290,6 +290,28 @@ mod tests {
         assert_eq!(rig.reply(CALL, "INVITE", NO_REPLY), None);
     }
 
+    /// A re-INVITE whose `To` tag is written with the spacing RFC 3261 allows
+    /// is still a re-INVITE: it must be refused, not ignored as if it were a
+    /// duplicate of the INVITE that set the call up.
+    #[test]
+    fn a_re_invite_with_a_spaced_to_tag_is_still_refused_with_488() {
+        for to in [
+            "<sip:1002@127.0.0.1> ; tag=ourtag",
+            "<sip:1002@127.0.0.1>;  tag = ourtag",
+            "<sip:1002@127.0.0.1>;Tag=ourtag",
+        ] {
+            let rig = Rig::new();
+            let mut req = request("INVITE", CALL);
+            for (name, value) in req.headers.iter_mut() {
+                if name == "To" {
+                    *value = to.to_string();
+                }
+            }
+            assert_eq!(rig.respond(&req), Disposition::Handled);
+            assert_eq!(rig.reply(CALL, "INVITE", WAIT), Some(488), "To: {to}");
+        }
+    }
+
     /// The dialog's own Call-ID must not turn a keepalive into silence.
     #[test]
     fn options_is_answered_whether_or_not_it_names_the_dialog() {
@@ -372,6 +394,19 @@ mod tests {
     fn an_invite_for_a_dialog_we_no_longer_have_is_481_not_busy() {
         let rig = Rig::new();
         rig.respond(&request("INVITE", "ended-call"));
+        assert_eq!(rig.reply("ended-call", "INVITE", WAIT), Some(481));
+    }
+
+    #[test]
+    fn an_invite_for_a_dialog_we_no_longer_have_is_481_whatever_the_tag_spacing() {
+        let rig = Rig::new();
+        let mut req = request("INVITE", "ended-call");
+        for (name, value) in req.headers.iter_mut() {
+            if name == "To" {
+                *value = "<sip:1002@127.0.0.1> ; tag = gone".to_string();
+            }
+        }
+        rig.respond(&req);
         assert_eq!(rig.reply("ended-call", "INVITE", WAIT), Some(481));
     }
 
