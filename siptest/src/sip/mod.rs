@@ -1,3 +1,4 @@
+pub mod dialog;
 pub mod inbound;
 pub mod message;
 pub mod outbound;

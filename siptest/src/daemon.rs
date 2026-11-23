@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::api::state::{Counters, InboundMode, InboundPolicy, SharedState};
+use gsm_sip_bridge::ims::sip_client::SipRequest;
+
+use crate::api::state::{Counters, Forwarded, InboundMode, InboundPolicy, SharedState};
 use crate::config::Config;
 use crate::error::SipTestResult;
 use crate::sip::registration::{
@@ -97,6 +99,8 @@ fn run_with_config(config: Config) -> SipTestResult<()> {
             duration_secs: config.inbound.duration_secs,
         }),
         manual_decisions: Mutex::new(std::collections::HashMap::new()),
+        dialog_route: Mutex::new(None),
+        recent_hangups: Mutex::new(Default::default()),
     });
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -139,65 +143,61 @@ fn run_with_config(config: Config) -> SipTestResult<()> {
     Ok(())
 }
 
-/// Owns nothing but the read side of `recv_request` (via `SipSocket`, which
+/// Owns nothing but the read side of the request queue (via `SipSocket`, which
 /// already demultiplexes responses away from it — `sip/socket.rs`'s module
-/// doc). Answers `OPTIONS` immediately, busies out a second concurrent
-/// INVITE, refuses anything else with `405`, and hands a fresh INVITE to
-/// `call::execute_inbound_call`, which runs to completion before this loop
-/// reads again — correct for `max_concurrent = 1`.
+/// doc). Hands a fresh INVITE to `call::execute_inbound_call`, which runs to
+/// completion before this loop reads again — correct for `max_concurrent = 1`
+/// — and gives everything else to `sip::inbound::handle_stray`.
 /// `pub` so integration tests can drive it directly against a hand-built
 /// `SharedState`, without needing the full HTTP daemon up.
 pub fn inbound_listener_loop(state: Arc<SharedState>, stop: Arc<AtomicBool>) {
+    let ctx = state.request_ctx();
     while !stop.load(Ordering::Relaxed) {
-        let Ok(Some((req, peer))) = state.sip_socket.recv_request(Duration::from_millis(500))
-        else {
+        // Requests from any address but the bridge's are dropped inside
+        // `recv_request_from`, with no reply — see its doc for why.
+        let Some((req, peer)) = ctx.recv(Duration::from_millis(500)) else {
             continue;
         };
-        // Matched on IP only, never port — the bridge's telephony agent
-        // sends INVITEs from a different port than its registrar
-        // (`test_inbound_from_other_port.rs`), so port can't be part of the
-        // check. Anything from elsewhere is dropped with no reply at all,
-        // not just refused: this is the daemon's only defense against an
-        // unauthenticated peer directing an answered call's RTP at an
-        // arbitrary third-party destination via its own SDP offer
-        // (`execute_inbound_call` trusts whatever `c=`/`m=` the offer
-        // names), and replying to a spoofed source would make siptest a
-        // UDP reflection amplifier for that same peer.
-        if peer.ip() != state.bridge_registrar.ip() {
-            tracing::warn!(%peer, "dropping SIP request from an unexpected source IP");
+        // A request belonging to the outbound call in flight goes to that
+        // call (its BYE, re-INVITE...), never to the stray handling below.
+        if forward_to_dialog(&state, &req, peer) {
             continue;
         }
-        match req.method.as_str() {
-            "OPTIONS" => {
-                let _ = state
-                    .sip_socket
-                    .send(peer, &crate::sip::inbound::build_options_ok(&req));
-            }
-            "INVITE" => {
-                if state
-                    .calls
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .active()
-                    .is_some()
-                {
-                    let _ = state
-                        .sip_socket
-                        .send(peer, &crate::sip::inbound::build_busy(&req));
-                    continue;
-                }
-                crate::call::execute_inbound_call(&state, req, peer);
-            }
-            "ACK" | "BYE" | "CANCEL" => {
-                // Stray — the dialog these belong to is handled entirely
-                // inside `execute_inbound_call`'s own read loop while it
-                // runs; anything reaching here has no matching call.
-            }
-            _ => {
-                let _ = state
-                    .sip_socket
-                    .send(peer, &crate::sip::inbound::build_405(&req));
-            }
+        // Only an INVITE that starts a dialog (no `To` tag) can be a new call,
+        // and only when none is active; everything else is the shared stray
+        // handling's, the same as for every other reader.
+        if req.method == "INVITE"
+            && !crate::sip::inbound::has_to_tag(&req)
+            && state
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .active()
+                .is_none()
+        {
+            crate::call::execute_inbound_call(&state, req, peer);
+        } else {
+            crate::sip::inbound::handle_stray(&ctx, &req, peer, "");
+        }
+    }
+}
+
+/// Hands `req` to the outbound call whose dialog it belongs to, if one is
+/// registered (`SharedState::dialog_route`). Never blocks; `false` means the
+/// caller handles it as a stray (see [`crate::api::state::Forwarded::Dropped`]).
+fn forward_to_dialog(state: &SharedState, req: &SipRequest, peer: std::net::SocketAddr) -> bool {
+    let route = state.dialog_route.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(route) = route.as_ref() else {
+        return false;
+    };
+    match route.try_forward(req, peer) {
+        Forwarded::Queued => true,
+        // Not this dialog's, or the call can no longer take it: handled as a
+        // stray, which still answers a retransmitted BYE and busies a re-INVITE.
+        Forwarded::NotMine => false,
+        Forwarded::Dropped => {
+            tracing::warn!(method = %req.method, "an in-dialog request could not be queued for its call");
+            false
         }
     }
 }

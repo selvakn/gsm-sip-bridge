@@ -6,16 +6,32 @@ Observed pending items
       T026/T037 in that spec's task list. Registration runs as a blocking
       function in its own background thread, outbound calls run
       synchronously inside the HTTP handler via `spawn_blocking`, and
-      inbound calls run on their own dedicated listener thread, instead of
-      one `step(Input) -> Vec<Output>` state machine driving a shared
-      per-call dialog table. Every documented *behaviour* (302 handling,
-      digest auth, CANCEL/timeout, caller-ID capture) is implemented and
-      tested regardless. Concrete consequence: no second concurrent dialog
-      can be handled — an inbound call arriving while an outbound call is
-      already mid-flight has no path to be processed, since the inbound
-      listener thread is blocked inside the first call. Fine for the
-      current single-call-at-a-time scope; would block true concurrent-call
-      support if that's ever needed.
+      inbound calls run on the inbound listener thread, instead of one
+      `step(Input) -> Vec<Output>` state machine driving a shared per-call
+      dialog table. Every documented *behaviour* (302 handling, digest
+      auth, CANCEL/timeout, caller-ID capture, remote BYE, `488` for a
+      mid-call re-INVITE, `405` for UPDATE) is implemented and tested
+      regardless.
+      Overlapping calls are **refused by design** (`max_concurrent = 1`): an
+      inbound INVITE during an outbound call gets `486`, and `POST /calls`
+      during an inbound call gets `409`, both decided atomically by
+      `CallRegistry::try_reserve`. Only *true* concurrent calls — siptest
+      simulating several phones at once — would need the engine; nothing
+      needs that today.
+      (An earlier version of this item said an inbound call arriving
+      mid-outbound had "no path to be processed" and that a far-end BYE
+      during an outbound call was unhandled. The first was never true — it
+      is busied out — and the second is fixed: see `sip/dialog.rs`.)
+- [ ] `siptest` accepts SIP requests only from the bridge's IP
+      (`SipSocket::recv_request_from`, the one trusted address). If a `302`
+      redirect or a `200`'s `Contact` points at a different *host*, that
+      host's `BYE` during a connected call is dropped with only a warning, so
+      remote-hang-up detection does nothing and the call runs its full
+      configured length. Does not arise against the real bridge (the redirect
+      target is its own telephony agent, same host). **Accepted limit** for
+      now (maintainer, PR #223). Fix if it ever matters: also accept the
+      active dialog's `remote_target` IP — a small widening of trust, but only
+      to the host siptest itself sent the INVITE to.
 - [ ] `siptest` (specs/037-siptest-softphone) has no early-media (`18x` +
       SDP) support — found live while verifying specs/037-p-early-media
       (2026-08-16). `sip/outbound.rs`'s response loop explicitly skips the

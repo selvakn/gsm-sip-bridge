@@ -93,7 +93,7 @@ pub struct LevelStats {
     pub silent_frame_pct: f64,
 }
 
-/// How many tone symbols a call of `duration` should carry: none if the tone
+/// How many tone symbols a call whose media ran for `duration` should carry: none if the tone
 /// plan is off, and none while prerecorded audio (`play_samples` at
 /// `audio_hz`) is playing — the tone plan is suppressed until it ends, so the
 /// far end can only be expected to return what was actually sent.
@@ -129,6 +129,10 @@ pub struct MediaSessionResult {
     pub level: LevelStats,
     pub tone: ToneStats,
 }
+
+/// How often the session re-checks an external `stop` while waiting out its
+/// duration. Bounds how long a remote hang-up takes to end the call.
+const STOP_POLL: Duration = Duration::from_millis(20);
 
 /// Binds the RTP socket, runs tx/rx threads for `config.duration` (or until
 /// `stop` is set externally), and returns the counters needed to build a
@@ -215,8 +219,33 @@ pub fn run(
         })
     };
 
-    thread::sleep(config.duration);
+    // Waits out the configured duration, but wakes within `STOP_POLL` of
+    // `stop` being raised from outside (the far end hanging up) instead of
+    // sleeping through it.
+    let started = Instant::now();
+    // `None` when the duration is too large to add to an `Instant` (the API
+    // takes any `u64` of seconds): no deadline, only `stop` ends the call,
+    // which is what sleeping for that long amounted to.
+    let deadline = started.checked_add(config.duration);
+    while !stop.load(Ordering::Relaxed) {
+        let nap = match deadline {
+            Some(deadline) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                (deadline - now).min(STOP_POLL)
+            }
+            None => STOP_POLL,
+        };
+        thread::sleep(nap);
+    }
     stop.store(true, Ordering::Relaxed);
+    // How long media really ran: shorter than `config.duration` when `stop`
+    // came from outside. Measured before the joins, which can wait out the
+    // receiver's read timeout. Anything derived from "the call's length"
+    // must use this, not the configured duration.
+    let ran = started.elapsed().min(config.duration);
 
     let _ = tx_handle.join();
     let _ = rx_handle.join();
@@ -253,7 +282,7 @@ pub fn run(
         });
     tone.tx_symbols_sent = tx_timeline.lock().unwrap_or_else(|e| e.into_inner()).len() as u64;
     tone.expected_symbols = expected_tone_symbols(
-        config.duration,
+        ran,
         config.tone_enabled,
         config.play.as_ref().map_or(0, |p| p.len() as u64),
         config.codec.audio_hz,
@@ -531,6 +560,101 @@ mod tests {
         assert!(
             result.receive_stats.received_packets > 0,
             "expected the loopback echo to produce received packets"
+        );
+    }
+
+    /// `POST /calls` accepts any `u64` of seconds. Adding that to an `Instant`
+    /// overflows and panics; the call must instead just run until stopped.
+    #[test]
+    fn an_absurdly_long_duration_does_not_panic_and_still_honours_stop() {
+        use std::net::UdpSocket as StdUdp;
+
+        let far = StdUdp::bind("127.0.0.1:0").unwrap();
+        let config = MediaSessionConfig {
+            local_rtp: "127.0.0.1:0".parse().unwrap(),
+            remote_rtp: far.local_addr().unwrap(),
+            codec: PCMU,
+            duration: Duration::from_secs(u64::MAX),
+            sent_wav_path: None,
+            received_wav_path: None,
+            tone_enabled: false,
+            play: None,
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopper = {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(200));
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+        let started = Instant::now();
+        let result = run(config, stop);
+        let _ = stopper.join();
+
+        assert!(result.is_ok());
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    /// A call the far end ends early can only have sent — and so only be
+    /// expected back — the symbols of the time it actually ran. Measuring
+    /// against the configured duration would report most of a short call's
+    /// tone plan as lost even when every symbol that could be carried was.
+    #[test]
+    fn an_early_stop_expects_only_the_symbols_the_media_actually_ran_for() {
+        use std::net::UdpSocket as StdUdp;
+
+        let far_socket = StdUdp::bind("127.0.0.1:0").unwrap();
+        far_socket
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let far_addr = far_socket.local_addr().unwrap();
+        let echo_stop = Arc::new(AtomicBool::new(false));
+        let echo_handle = {
+            let stop = echo_stop.clone();
+            thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok((n, src)) = far_socket.recv_from(&mut buf) {
+                        let _ = far_socket.send_to(&buf[..n], src);
+                    }
+                }
+            })
+        };
+
+        let config = MediaSessionConfig {
+            local_rtp: "127.0.0.1:0".parse().unwrap(),
+            remote_rtp: far_addr,
+            codec: PCMU,
+            duration: Duration::from_secs(10),
+            sent_wav_path: None,
+            received_wav_path: None,
+            tone_enabled: true,
+            play: None,
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopper = {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(600));
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+        let started = Instant::now();
+        let result = run(config, stop).unwrap();
+        let _ = stopper.join();
+        echo_stop.store(true, Ordering::Relaxed);
+        let _ = echo_handle.join();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the session ignored the external stop"
+        );
+        // 600 ms of tone plan is 6 symbols; the configured 10 s would be 100.
+        let expected = result.tone.expected_symbols;
+        assert!(
+            (4..=8).contains(&expected),
+            "expected about 6 symbols for the ~600 ms that ran, got {expected}"
         );
     }
 

@@ -273,6 +273,29 @@ pub fn call_id_of(req: &SipRequest) -> Option<&str> {
     req.header("Call-ID")
 }
 
+/// The `tag` parameter of a `From`/`To` header value, if it has a non-empty
+/// one.
+///
+/// RFC 3261 allows whitespace around both the `;` and the `=` (§25.1:
+/// `SEMI = *WSP ";" *WSP`, `EQUAL = SWS "=" SWS`) and parameter names are
+/// case-insensitive, so `;tag=x`, `; tag = x` and `;Tag=x` are the same
+/// header. Only *header* parameters count: with a `name-addr` form
+/// (`"Name" <sip:a@b;tag=u>;tag=h`) they are the ones after the closing `>`,
+/// and a `;tag=` inside the angle brackets is a URI parameter, not the
+/// dialog tag.
+pub fn header_tag(value: &str) -> Option<&str> {
+    let params = match value.rfind('>') {
+        Some(end) => &value[end + 1..],
+        None => value.find(';').map_or("", |i| &value[i..]),
+    };
+    params
+        .split(';')
+        .filter_map(|param| param.split_once('='))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("tag"))
+        .map(|(_, tag)| tag.trim())
+        .filter(|tag| !tag.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +402,40 @@ mod tests {
         assert!(challenge_is_stale(&stale));
         assert!(!challenge_is_stale(&not_stale));
         assert!(!challenge_is_stale(&absent));
+    }
+
+    #[test]
+    fn header_tag_accepts_every_spelling_rfc_3261_allows() {
+        for (value, expected) in [
+            ("<sip:a@h>;tag=abc", Some("abc")),
+            ("<sip:a@h> ; tag=abc", Some("abc")),
+            ("<sip:a@h>;  tag = abc ", Some("abc")),
+            ("<sip:a@h>;Tag=abc", Some("abc")),
+            ("<sip:a@h>;TAG=abc", Some("abc")),
+            ("; tag=abc", Some("abc")),
+            ("sip:a@h;tag=abc", Some("abc")),
+            ("\"Al\" <sip:a@h>;foo=1;tag=abc;bar", Some("abc")),
+            // A `>` inside a quoted display name does not end the URI.
+            ("\"a>b\" <sip:a@h>;tag=abc", Some("abc")),
+        ] {
+            assert_eq!(header_tag(value), expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn header_tag_is_absent_when_there_is_no_header_tag() {
+        for value in [
+            "<sip:a@h>",
+            "<sip:a@h>;tag=",
+            "<sip:a@h>; tag = ",
+            "<sip:a@h>;notag=abc",
+            "<sip:a@h>;tagged",
+            "",
+            // A `tag` parameter of the URI is not the dialog's tag.
+            "<sip:a@h;tag=uri>",
+            "\"Al\" <sip:a@h;tag=uri>;foo=1",
+        ] {
+            assert_eq!(header_tag(value), None, "{value:?}");
+        }
     }
 }
