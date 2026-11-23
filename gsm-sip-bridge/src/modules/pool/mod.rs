@@ -38,7 +38,7 @@ use crate::sms::SmsHandler;
 use crate::sms::{self, SmsForwarder};
 use crate::store::events::{self, EventKind};
 use crate::store::{StoreCommand, StoreHandle};
-use jiff::{Timestamp, Zoned};
+use jiff::{Timestamp, ZonedDateTime};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -62,7 +62,7 @@ pub struct CardPool {
     cron_schedule: Option<croner::Cron>,
     cycle: Option<CycleState>,
     next_scheduled_at: Option<tokio::time::Instant>,
-    last_fired_tick: Option<Zoned>,
+    last_fired_tick: Option<ZonedDateTime>,
     /// specs/030-bad-port-isolation: persistent across rescans so a port
     /// quarantined after repeated probe timeouts stays skipped, and the
     /// operator `[discovery]` blocklist/timeout apply on every rescan. Behind a

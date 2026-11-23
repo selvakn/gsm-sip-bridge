@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use croner::parser::{CronParser, Seconds, Year};
 use croner::Cron;
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use rand::{Rng, RngExt};
 
 /// One end-to-end execution triggered by a single cron occurrence.
@@ -20,7 +20,7 @@ pub struct CycleState {
     /// of the cron tick that triggered this cycle.
     pub id: u64,
     /// The wall-clock cron tick that triggered this cycle.
-    pub cron_tick: Zoned,
+    pub cron_tick: ZonedDateTime,
     /// The actual (post-jitter) cycle-start instant.
     pub started_at: tokio::time::Instant,
     /// Which phase of the cycle we are in.
@@ -258,7 +258,7 @@ pub fn parse_cron_5field(expr: &str) -> Result<Cron, String> {
 /// is not a time the expression names, so such a result is passed over. A
 /// fall-back hour runs once, at the first of its two instants (croner's own
 /// behaviour).
-pub fn compute_next_scheduled_at(schedule: &Cron, after: &Zoned) -> Option<Zoned> {
+pub fn compute_next_scheduled_at(schedule: &Cron, after: &ZonedDateTime) -> Option<ZonedDateTime> {
     let mut from = after.clone();
     // A gap is passed over once; the bound only guards against looping.
     for _ in 0..3 {
@@ -505,7 +505,7 @@ mod tests {
         let now = fixed_instant();
         CycleState {
             id: 1,
-            cron_tick: Zoned::now(),
+            cron_tick: ZonedDateTime::now(),
             started_at: now,
             phase: CyclePhase::Initial,
             pending: slots.iter().copied().collect(),
@@ -591,14 +591,14 @@ mod tests {
 
     /// A wall-clock time in a fixed zone, so the tests do not depend on the
     /// host's TZ.
-    fn at(tz: &str, y: i16, mo: i8, d: i8, h: i8, mi: i8, s: i8) -> Zoned {
+    fn at(tz: &str, y: i16, mo: i8, d: i8, h: i8, mi: i8, s: i8) -> ZonedDateTime {
         jiff::civil::date(y, mo, d)
             .at(h, mi, s, 0)
             .in_tz(tz)
             .unwrap()
     }
 
-    fn next(expr: &str, after: &Zoned) -> Zoned {
+    fn next(expr: &str, after: &ZonedDateTime) -> ZonedDateTime {
         compute_next_scheduled_at(&parse_cron_5field(expr).unwrap(), after).unwrap()
     }
 
@@ -616,6 +616,19 @@ mod tests {
         assert!(parse_cron_5field("0 1 * *").is_err()); // 4 fields
         assert!(parse_cron_5field("0 0 1 * * *").is_err()); // 6 fields
         assert!(parse_cron_5field("0 0 1 * * * 2027").is_err()); // 7 fields
+    }
+
+    /// croner 5 rejects names outside their own field and a bare `L` weekday,
+    /// which croner 4 accepted and ran on an unintended schedule (`jan` in
+    /// day-of-week ran on Mondays). Such a schedule now disables the restart
+    /// with a config error instead of firing on the wrong days.
+    #[test]
+    fn parse_cron_5field_rejects_misplaced_names_and_bare_l() {
+        assert!(parse_cron_5field("0 4 * * jan").is_err());
+        assert!(parse_cron_5field("mon 4 * * *").is_err());
+        assert!(parse_cron_5field("0 4 * * L").is_err());
+        assert!(parse_cron_5field("0 4 * jan mon").is_ok());
+        assert!(parse_cron_5field("0 4 * * 5L").is_ok());
     }
 
     #[test]
