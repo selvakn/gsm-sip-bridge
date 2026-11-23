@@ -20,7 +20,7 @@ use super::shutdown::{self, StartedState};
 use super::{daemon_supervisor, epdg_iface, sim_recovery, vpcd};
 use crate::alerts::{self, discord::DiscordClient, AlertContext};
 use crate::config::secret::Secret;
-use crate::config::{AppConfig, PcscdMode, TunnelAddressFamily};
+use crate::config::{AppConfig, TunnelAddressFamily};
 use crate::vowifi::discovery::LineResolutionEntry;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -334,8 +334,9 @@ fn start_vowifi_subsystem(
         // an unrelated vpcd port bind, and left eap-sim-pcsc iterating
         // over empty vpcd slots ("SCardConnect: No smart card
         // inserted") before reaching the real one.
-        let needs_vpcd = needs_vpcd_reader(vowifi_lines);
-        if let Some(handle) = start_pass_pcscd(runner.as_ref(), config, needs_vpcd)? {
+        let vpcd_ports = vpcd_reader_ports(vowifi_lines);
+        let needs_vpcd = !vpcd_ports.is_empty();
+        if let Some(handle) = start_pass_pcscd(runner.as_ref(), config, &vpcd_ports)? {
             started.lock().unwrap().pcscd = Some(handle);
         }
         if !needs_vpcd {
@@ -1388,33 +1389,41 @@ mod swu_payload_tests {
 /// handle of a pcscd this pass spawned, which the caller records in its
 /// teardown state; `None` means the host's own pcscd is used, which the
 /// bridge must never stop.
+///
+/// `vpcd_ports` are the vpcd ports of this pass's modem-backed lines (see
+/// [`vpcd_reader_ports`]); empty means no line needs the vpcd reader.
+///
+/// When a line needs the vpcd reader, its configuration is written first,
+/// whichever pcscd ends up serving it: the host's pcscd loads it from the
+/// same file, including a socket-activated one that the mode decision's
+/// own probe starts. Once pcscd is ready, every line's port must answer
+/// too, since the vpcd driver's slot count is fixed when it is built (see
+/// [`vpcd::missing_vpcd_slot`]).
 pub(super) fn start_pass_pcscd(
     runner: &dyn CommandRunner,
     config: &AppConfig,
-    needs_vpcd: bool,
+    vpcd_ports: &[u16],
 ) -> Result<Option<Arc<ChildHandle>>, String> {
+    let needs_vpcd = !vpcd_ports.is_empty();
     let mode = config.vowifi.pcscd;
     let socket = vpcd::pcscd_socket_path();
-    if needs_vpcd && mode != PcscdMode::External {
-        vpcd::write_vpcd_reader_conf(runner, config.vowifi.vpcd_port);
-        println!(
-            "[supervise] starting shared pcscd; one vpcd reader, slots from {}",
-            config.vowifi.vpcd_port
-        );
+    let vpcd_host = &config.vowifi.vpcd_host;
+    let vpcd_port = config.vowifi.vpcd_port;
+    if needs_vpcd {
+        vpcd::write_vpcd_reader_conf(runner, vpcd_port);
     }
-    match vpcd::start_pcscd(
-        runner,
-        mode,
-        needs_vpcd,
-        &socket,
-        &config.vowifi.vpcd_host,
-        config.vowifi.vpcd_port,
-    ) {
+    match vpcd::start_pcscd(runner, mode, needs_vpcd, &socket, vpcd_host, vpcd_port) {
         Ok(vpcd::Pcscd::Managed(handle)) => {
+            if let Some(port) = vpcd::missing_vpcd_slot(runner, vpcd_host, vpcd_ports) {
+                // Not handed back, so nothing else would stop it.
+                runner.reap(&handle);
+                return Err(missing_vpcd_slot_error(vpcd_host, vpcd_port, port, false));
+            }
             if needs_vpcd {
                 println!(
-                    "[supervise] vpcd reader ready on {}:{}",
-                    config.vowifi.vpcd_host, config.vowifi.vpcd_port
+                    "[supervise] started shared pcscd ([vowifi].pcscd = {mode}); vpcd reader \
+                     ready on {vpcd_host}:{vpcd_port}, serving on {}",
+                    socket.display()
                 );
             } else {
                 println!(
@@ -1425,52 +1434,105 @@ pub(super) fn start_pass_pcscd(
             Ok(Some(Arc::new(handle)))
         }
         Ok(vpcd::Pcscd::External) => {
+            if let Some(port) = vpcd::missing_vpcd_slot(runner, vpcd_host, vpcd_ports) {
+                return Err(missing_vpcd_slot_error(vpcd_host, vpcd_port, port, true));
+            }
+            let reader = if needs_vpcd {
+                format!(", vpcd reader on {vpcd_host}:{vpcd_port}")
+            } else {
+                String::new()
+            };
             println!(
-                "[supervise] using the host's pcscd on {} ([vowifi].pcscd = {mode}); \
-                 the bridge does not start or stop it",
+                "[supervise] using the host's pcscd on {}{reader} ([vowifi].pcscd = {mode}); \
+                 the bridge does not start or stop it, and holds a PC/SC context open so it \
+                 does not auto-exit",
                 socket.display()
             );
+            runner.hold_pcsc_context();
             Ok(None)
         }
         Err(vpcd::StartPcscdError::SpawnFailed) => Err("failed to start pcscd".to_string()),
-        Err(vpcd::StartPcscdError::NotReady(vpcd::ReadyOutcome::SocketNotReady)) => Err(format!(
-            "pcscd never accepted connections on {} after {} attempt(s). Check /tmp/pcscd.log; \
-             if the host runs its own pcscd, set [vowifi].pcscd = \"external\" or stop the \
-             host's pcscd.socket.",
-            socket.display(),
-            vpcd::PCSCD_STARTUP_ATTEMPTS
-        )),
-        Err(vpcd::StartPcscdError::NotReady(other)) => Err(format!(
-            "pcscd's vpcd reader never came up on {}:{} after {} attempt(s) ({other:?}). \
-             If pcscd logged 'Address in use', another process holds that port — pick a \
-             [vowifi].vpcd_port below the ephemeral range.",
-            config.vowifi.vpcd_host,
-            config.vowifi.vpcd_port,
-            vpcd::PCSCD_STARTUP_ATTEMPTS
-        )),
-        Err(vpcd::StartPcscdError::ExternalCannotServeVpcd) => Err(
-            "[vowifi].pcscd = \"external\", but at least one line is modem-backed and needs \
-             the vpcd reader only the bridge's own pcscd provides; set [vowifi].pcscd = \
-             \"auto\" or \"managed\""
-                .to_string(),
-        ),
+        Err(vpcd::StartPcscdError::NotReady(outcome)) => {
+            let what = if outcome == vpcd::ReadyOutcome::SocketNotReady {
+                format!("pcscd never accepted connections on {}", socket.display())
+            } else {
+                format!("pcscd's vpcd reader never came up on {vpcd_host}:{vpcd_port}")
+            };
+            let hint = match outcome {
+                vpcd::ReadyOutcome::DriverBindFailed => {
+                    " Another process holds that port: pick a [vowifi].vpcd_port below the \
+                     ephemeral range."
+                }
+                vpcd::ReadyOutcome::PcscdDied => {
+                    " If another pcscd is running on this host (e.g. systemd's pcscd.socket), \
+                     set [vowifi].pcscd = \"auto\" or \"external\" to use it, or stop it."
+                }
+                _ => "",
+            };
+            let log = vpcd::last_pcscd_log_line(runner)
+                .map(|l| format!(" pcscd's last log line: {l}"))
+                .unwrap_or_default();
+            Err(format!(
+                "{what} after {} attempt(s) ({outcome:?}).{log}{hint}",
+                vpcd::PCSCD_STARTUP_ATTEMPTS
+            ))
+        }
         Err(vpcd::StartPcscdError::ExternalUnreachable) => Err(format!(
             "[vowifi].pcscd = \"external\", but nothing accepts connections on {}; start the \
              host's pcscd (e.g. `systemctl enable --now pcscd.socket`) or set \
              [vowifi].pcscd = \"managed\"",
             socket.display()
         )),
+        Err(vpcd::StartPcscdError::ExternalVpcdUnavailable) => Err(format!(
+            "the host's pcscd on {} ([vowifi].pcscd = {mode}) does not serve the vpcd reader on \
+             {vpcd_host}:{vpcd_port}. pcscd loads {} only when it starts, so a pcscd that was \
+             already running when the bridge wrote it has no vpcd reader: restart the host's \
+             pcscd (`systemctl restart pcscd.service`). The file stays, so this is needed once. \
+             If it persists, check that nothing else holds that port.",
+            socket.display(),
+            vpcd::VPCD_READER_CONF_PATH
+        )),
     }
 }
 
-/// Whether this line table needs pcscd's vpcd *virtual* reader provisioned.
-/// Only a modem-backed line does — it reaches its SIM through the vpcd slot
+/// Which vpcd ports this line table needs pcscd's vpcd *virtual* reader to
+/// serve. Only a modem-backed line needs the reader — it reaches its SIM through the vpcd slot
 /// that `vowifi-usim-bridge` drives over AT+CSIM. A `pcsc_reader` line
 /// (specs/023-omnikey-pcsc-vowifi) uses a real CCID reader that pcscd picks
 /// up from USB by itself, so an all-card-reader deployment needs no vpcd at
 /// all and must not fail startup when one can't be bound.
-fn needs_vpcd_reader(lines: &[LineResolutionEntry]) -> bool {
-    lines.iter().any(|l| !l.pcsc_reader)
+///
+/// Returns each modem-backed line's vpcd port; empty when no line needs the
+/// reader. Discovery numbers the modem-backed lines first, so they hold the
+/// slots from `[vowifi].vpcd_port` upward and card-reader lines take none.
+fn vpcd_reader_ports(lines: &[LineResolutionEntry]) -> Vec<u16> {
+    lines
+        .iter()
+        .filter(|l| !l.pcsc_reader)
+        .map(|l| l.vpcd_port)
+        .collect()
+}
+
+/// The startup error for a modem-backed line whose vpcd slot does not
+/// exist: `port` did not answer, though pcscd's vpcd reader was ready on
+/// `base`. `host_pcscd`: the host's pcscd, whose vpcd driver is the
+/// distribution's.
+fn missing_vpcd_slot_error(host: &str, base: u16, port: u16, host_pcscd: bool) -> String {
+    let slots = port.saturating_sub(base);
+    let remedy = if host_pcscd {
+        "The host's pcscd uses the distribution's vpcd driver (vsmartcard-vpcd), which is \
+         built with 2 slots by default. Use no more modem-backed lines than it has slots, or \
+         run the bridge in the Docker image, whose own pcscd has 8 ([vowifi].pcscd = \
+         \"managed\")."
+    } else {
+        "The vpcd driver's slot count is fixed when it is built (--enable-vpcdslots; the \
+         Docker image's has 8). Use no more modem-backed lines than it has slots."
+    };
+    format!(
+        "pcscd's vpcd reader does not listen on {host}:{port}, the port of a modem-backed \
+         line. Its driver serves {slots} slot(s), from {base}: modem-backed lines take one \
+         each from there, card-reader lines take none. {remedy}"
+    )
 }
 
 /// Fail fast on an unsupported combination (specs/023-omnikey-pcsc-vowifi
@@ -4147,7 +4209,7 @@ mod tests {
         );
     }
 
-    use crate::config::VowifiConfig;
+    use crate::config::{PcscdMode, VowifiConfig};
     use crate::supervise::runner::MockCommandRunner;
 
     fn test_shared_charon() -> Arc<SharedCharon> {
@@ -4447,8 +4509,13 @@ mod tests {
         mock.set_unix_connect_ok(&vpcd::pcscd_socket_path().to_string_lossy(), true);
         let mut config = test_config();
         config.vowifi.pcscd = PcscdMode::Auto;
-        assert_eq!(start_pass_pcscd(&mock, &config, false), Ok(None));
+        assert_eq!(start_pass_pcscd(&mock, &config, &[]), Ok(None));
         assert!(mock.spawn_specs.lock().unwrap().is_empty());
+        assert_eq!(
+            mock.pcsc_context_holds
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
         assert!(
             !mock
                 .files
@@ -4465,20 +4532,111 @@ mod tests {
         mock.set_unix_connect_ok(&vpcd::pcscd_socket_path().to_string_lossy(), true);
         let mut config = test_config();
         config.vowifi.pcscd = PcscdMode::Managed;
-        let handle = start_pass_pcscd(&mock, &config, false).unwrap();
+        let handle = start_pass_pcscd(&mock, &config, &[]).unwrap();
         assert!(handle.is_some());
         assert_eq!(mock.spawn_specs.lock().unwrap().len(), 1);
     }
 
     #[test]
-    fn start_pass_pcscd_external_with_a_modem_line_is_a_startup_error() {
+    fn start_pass_pcscd_serves_a_modem_line_from_the_hosts_pcscd() {
         let mock = MockCommandRunner::new();
         mock.set_unix_connect_ok(&vpcd::pcscd_socket_path().to_string_lossy(), true);
         let mut config = test_config();
         config.vowifi.pcscd = PcscdMode::External;
-        let err = start_pass_pcscd(&mock, &config, true).unwrap_err();
-        assert!(err.contains("modem-backed"), "{err}");
+        mock.set_tcp_connect_ok(&config.vowifi.vpcd_host, config.vowifi.vpcd_port, true);
+        assert_eq!(
+            start_pass_pcscd(&mock, &config, &[config.vowifi.vpcd_port]),
+            Ok(None)
+        );
         assert!(mock.spawn_specs.lock().unwrap().is_empty());
+        assert_eq!(
+            mock.pcsc_context_holds
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        // Written before the socket was probed, so a socket-activated pcscd
+        // that the probe starts loads the reader.
+        assert_eq!(
+            mock.write_order
+                .lock()
+                .unwrap()
+                .first()
+                .map(|p| p.as_path()),
+            Some(std::path::Path::new(vpcd::VPCD_READER_CONF_PATH))
+        );
+    }
+
+    #[test]
+    fn start_pass_pcscd_refuses_a_modem_line_past_the_host_drivers_last_slot() {
+        // The host's packaged vpcd driver has 2 slots; a third modem-backed
+        // line's port never answers.
+        let mock = MockCommandRunner::new();
+        mock.set_unix_connect_ok(&vpcd::pcscd_socket_path().to_string_lossy(), true);
+        let mut config = test_config();
+        config.vowifi.pcscd = PcscdMode::External;
+        let base = config.vowifi.vpcd_port;
+        let host = config.vowifi.vpcd_host.clone();
+        mock.set_tcp_connect_ok(&host, base, true);
+        mock.set_tcp_connect_ok(&host, base + 1, true);
+        let err = start_pass_pcscd(&mock, &config, &[base, base + 1, base + 2]).unwrap_err();
+        assert!(err.contains(&format!("{host}:{}", base + 2)), "{err}");
+        assert!(err.contains("serves 2 slot(s)"), "{err}");
+        assert!(err.contains("vsmartcard-vpcd"), "{err}");
+        assert_eq!(
+            mock.pcsc_context_holds
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no context is held for a pass that fails"
+        );
+    }
+
+    #[test]
+    fn start_pass_pcscd_reaps_its_own_pcscd_when_a_modem_line_has_no_slot() {
+        let mock = MockCommandRunner::new();
+        let mut config = test_config();
+        config.vowifi.pcscd = PcscdMode::Managed;
+        let base = config.vowifi.vpcd_port;
+        let host = config.vowifi.vpcd_host.clone();
+        mock.set_tcp_connect_ok(&host, base, true);
+        let socket = vpcd::pcscd_socket_path().to_string_lossy().into_owned();
+        mock.set_unix_connect_ok(&socket, true);
+        mock.set_path_identities(&socket, vec![None, Some((1, 101))]);
+        let err = start_pass_pcscd(&mock, &config, &[base, base + 1]).unwrap_err();
+        assert!(err.contains("serves 1 slot(s)"), "{err}");
+        assert!(err.contains("--enable-vpcdslots"), "{err}");
+        let children = mock.children.lock().unwrap();
+        assert_eq!(children.len(), 1);
+        assert!(
+            children.values().all(|c| c
+                .signals_received
+                .contains(&crate::supervise::runner::Signal::Term)),
+            "the spawned pcscd is reaped, not left running"
+        );
+    }
+
+    #[test]
+    fn start_pass_pcscd_reports_why_its_own_pcscd_exited() {
+        let mock = MockCommandRunner::new();
+        mock.set_born_dead_if_argv_contains("pcscd");
+        mock.set_file(
+            "/tmp/pcscd.log",
+            "main() Another pcscd (pid: 4242) seems to be running.\n",
+        );
+        let mut config = test_config();
+        config.vowifi.pcscd = PcscdMode::Managed;
+        let err = start_pass_pcscd(&mock, &config, &[config.vowifi.vpcd_port]).unwrap_err();
+        assert!(err.contains("(PcscdDied)"), "{err}");
+        assert!(
+            err.contains("pcscd's last log line: main() Another pcscd (pid: 4242)"),
+            "{err}"
+        );
+        assert!(err.contains("[vowifi].pcscd = \"auto\""), "{err}");
+        assert!(!err.contains("ephemeral"), "not a port clash: {err}");
+        assert_eq!(
+            mock.pcsc_context_holds
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     #[test]
@@ -4642,19 +4800,23 @@ mod tests {
         // with "pcscd's vpcd reader never came up" because vpcd was
         // provisioned unconditionally under the strongswan engine, even
         // though no line would ever connect to it.
-        assert!(!needs_vpcd_reader(&[pcsc_line(0)]));
-        assert!(!needs_vpcd_reader(&[pcsc_line(0), pcsc_line(1)]));
+        assert!(vpcd_reader_ports(&[pcsc_line(0)]).is_empty());
+        assert!(vpcd_reader_ports(&[pcsc_line(0), pcsc_line(1)]).is_empty());
     }
 
     #[test]
     fn any_modem_backed_line_still_needs_the_vpcd_reader() {
-        assert!(needs_vpcd_reader(&[modem_line(0, "/dev/ttyUSB0")]));
+        assert_eq!(
+            vpcd_reader_ports(&[modem_line(0, "/dev/ttyUSB0")]),
+            vec![15963]
+        );
         // Mixed deployment: the modem line's SIM still reaches charon only
-        // through vpcd, so one modem line is enough to require it.
-        assert!(needs_vpcd_reader(&[
-            modem_line(0, "/dev/ttyUSB0"),
-            pcsc_line(1)
-        ]));
+        // through vpcd, so one modem line is enough to require it, and the
+        // card-reader line takes no slot.
+        assert_eq!(
+            vpcd_reader_ports(&[modem_line(0, "/dev/ttyUSB0"), pcsc_line(1)]),
+            vec![15963]
+        );
     }
 
     mod rebuild_sync_tests {

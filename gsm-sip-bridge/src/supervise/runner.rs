@@ -338,6 +338,18 @@ pub trait CommandRunner: Send + Sync {
     /// that was already there before it started.
     fn path_identity(&self, path: &Path) -> Option<(u64, u64)>;
 
+    /// Keeps one PC/SC context open on the pcscd behind the control socket
+    /// for the rest of this process, re-establishing it whenever that
+    /// pcscd goes away. Used while the host's pcscd serves the bridge: a
+    /// pcscd started by systemd's socket activation runs with
+    /// `--auto-exit` and exits about a minute after its last context
+    /// closes. Every PC/SC client the bridge runs opens a context only for
+    /// one operation, so without this one the host's pcscd would come and
+    /// go between registrations, taking the vpcd reader (and every
+    /// `vowifi-usim-bridge` session on it) and the enumerated USB readers
+    /// with it. Idempotent: later calls in the same process do nothing.
+    fn hold_pcsc_context(&self);
+
     /// Fetch a URL over plain HTTP/1.0.
     ///
     /// Exists so the container healthcheck can read the daemon's own
@@ -692,6 +704,18 @@ impl CommandRunner for RealCommandRunner {
         socket.set_nonblocking(true).is_ok() && socket.connect(&addr).is_ok()
     }
 
+    fn hold_pcsc_context(&self) {
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        STARTED.call_once(|| {
+            let spawned = std::thread::Builder::new()
+                .name("pcsc-context".into())
+                .spawn(hold_pcsc_context_forever);
+            if let Err(e) = spawned {
+                println!("[supervise] could not start the PC/SC context holder: {e}");
+            }
+        });
+    }
+
     fn path_identity(&self, path: &Path) -> Option<(u64, u64)> {
         use std::os::unix::fs::MetadataExt;
         std::fs::symlink_metadata(path)
@@ -711,6 +735,324 @@ impl CommandRunner for RealCommandRunner {
                 IpAddr::V6(_) => None,
             })
             .collect())
+    }
+}
+
+/// How often the held PC/SC context checks that its pcscd is still there.
+const PCSC_CONTEXT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long to wait before trying again when no context can be opened.
+const PCSC_CONTEXT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What one check of a held PC/SC context found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContextCheck {
+    /// pcscd answered: keep the context.
+    Alive,
+    /// The context no longer reaches a pcscd: open a new one.
+    Lost(String),
+}
+
+/// Classifies one check of a held context, a reader listing, which is a
+/// round trip to pcscd. A context whose pcscd has exited fails it
+/// (`SCardIsValidContext` would not, it checks only the client side).
+/// "No readers" is a valid answer from a live pcscd, for example one
+/// whose vpcd slots are not connected yet, so it keeps the context.
+fn classify_context_check(result: Result<usize, pcsc::Error>) -> ContextCheck {
+    match result {
+        Ok(_) | Err(pcsc::Error::NoReadersAvailable) => ContextCheck::Alive,
+        Err(e) => ContextCheck::Lost(e.to_string()),
+    }
+}
+
+/// What [`run_pcsc_context_holder`] needs from the outside world, so the
+/// loop can be driven without a pcscd.
+trait PcscContextSource {
+    type Context;
+    /// Opens a context to pcscd (which starts a socket-activated pcscd).
+    fn establish(&mut self) -> Result<Self::Context, String>;
+    /// Checks that `ctx` still reaches a pcscd.
+    fn check(&mut self, ctx: &Self::Context) -> ContextCheck;
+    /// Waits `d`. Returns `false` to stop the loop (tests only; the real
+    /// source never stops).
+    fn sleep(&mut self, d: std::time::Duration) -> bool;
+    fn log(&mut self, line: &str);
+}
+
+/// Holds one PC/SC context open for as long as `source` keeps the loop
+/// going: checks it every [`PCSC_CONTEXT_CHECK_INTERVAL`], opens a new
+/// one as soon as a check finds it lost, and retries a failed open every
+/// [`PCSC_CONTEXT_RETRY_DELAY`]. A run of failed opens is logged once,
+/// and the next successful open says so.
+fn run_pcsc_context_holder<S: PcscContextSource>(source: &mut S) {
+    let mut logged_failure = false;
+    loop {
+        match source.establish() {
+            Ok(ctx) => {
+                if logged_failure {
+                    source.log("[supervise] PC/SC context to the host's pcscd open again");
+                    logged_failure = false;
+                }
+                loop {
+                    if !source.sleep(PCSC_CONTEXT_CHECK_INTERVAL) {
+                        return;
+                    }
+                    if let ContextCheck::Lost(e) = source.check(&ctx) {
+                        source.log(&format!(
+                            "[supervise] PC/SC context to the host's pcscd lost ({e}); \
+                             opening a new one"
+                        ));
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                if !logged_failure {
+                    source.log(&format!(
+                        "[supervise] cannot open a PC/SC context to the host's pcscd ({e}); \
+                         retrying every {PCSC_CONTEXT_RETRY_DELAY:?}"
+                    ));
+                    logged_failure = true;
+                }
+                if !source.sleep(PCSC_CONTEXT_RETRY_DELAY) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// The real [`PcscContextSource`]: pcsc-lite's client library.
+struct RealPcscContextSource;
+
+impl PcscContextSource for RealPcscContextSource {
+    type Context = pcsc::Context;
+
+    fn establish(&mut self) -> Result<pcsc::Context, String> {
+        pcsc::Context::establish(pcsc::Scope::System).map_err(|e| e.to_string())
+    }
+
+    fn check(&mut self, ctx: &pcsc::Context) -> ContextCheck {
+        classify_context_check(ctx.list_readers_len())
+    }
+
+    fn sleep(&mut self, d: std::time::Duration) -> bool {
+        std::thread::sleep(d);
+        true
+    }
+
+    fn log(&mut self, line: &str) {
+        println!("{line}");
+    }
+}
+
+/// The body of [`RealCommandRunner::hold_pcsc_context`]'s thread.
+fn hold_pcsc_context_forever() {
+    run_pcsc_context_holder(&mut RealPcscContextSource);
+}
+
+#[cfg(test)]
+mod pcsc_context_holder_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    /// A scripted source: each `establish` and `check` takes the next
+    /// scripted answer, and the loop stops once `sleeps_allowed` sleeps
+    /// have happened. Contexts are numbered in the order they were opened,
+    /// so a test can tell which one a check was made on.
+    #[derive(Default)]
+    struct FakeSource {
+        establishes: VecDeque<Result<(), String>>,
+        checks: VecDeque<ContextCheck>,
+        sleeps_allowed: usize,
+        opened: u32,
+        /// `(context number, check result)` per check, in order.
+        checked: Vec<(u32, ContextCheck)>,
+        sleeps: Vec<Duration>,
+        logs: Vec<String>,
+    }
+
+    impl PcscContextSource for FakeSource {
+        type Context = u32;
+
+        fn establish(&mut self) -> Result<u32, String> {
+            self.establishes
+                .pop_front()
+                .expect("establish called more often than scripted")?;
+            self.opened += 1;
+            Ok(self.opened)
+        }
+
+        fn check(&mut self, ctx: &u32) -> ContextCheck {
+            let result = self
+                .checks
+                .pop_front()
+                .expect("check called more often than scripted");
+            self.checked.push((*ctx, result.clone()));
+            result
+        }
+
+        fn sleep(&mut self, d: Duration) -> bool {
+            if self.sleeps.len() == self.sleeps_allowed {
+                return false;
+            }
+            self.sleeps.push(d);
+            true
+        }
+
+        fn log(&mut self, line: &str) {
+            self.logs.push(line.to_string());
+        }
+    }
+
+    fn lost(why: &str) -> ContextCheck {
+        ContextCheck::Lost(why.to_string())
+    }
+
+    #[test]
+    fn a_live_context_is_kept_and_checked_at_the_check_interval() {
+        let mut source = FakeSource {
+            establishes: VecDeque::from([Ok(())]),
+            checks: VecDeque::from(vec![ContextCheck::Alive; 3]),
+            sleeps_allowed: 3,
+            ..Default::default()
+        };
+        run_pcsc_context_holder(&mut source);
+        assert_eq!(source.opened, 1, "a live context is never replaced");
+        assert_eq!(
+            source.checked,
+            vec![(1, ContextCheck::Alive); 3],
+            "every check is made on the one context"
+        );
+        assert_eq!(source.sleeps, vec![PCSC_CONTEXT_CHECK_INTERVAL; 3]);
+        assert!(source.logs.is_empty(), "{:?}", source.logs);
+    }
+
+    #[test]
+    fn a_lost_context_is_replaced_at_once() {
+        let mut source = FakeSource {
+            establishes: VecDeque::from([Ok(()), Ok(())]),
+            checks: VecDeque::from([
+                ContextCheck::Alive,
+                lost("Service was stopped"),
+                ContextCheck::Alive,
+            ]),
+            sleeps_allowed: 3,
+            ..Default::default()
+        };
+        run_pcsc_context_holder(&mut source);
+        assert_eq!(source.opened, 2);
+        assert_eq!(
+            source.checked,
+            vec![
+                (1, ContextCheck::Alive),
+                (1, lost("Service was stopped")),
+                (2, ContextCheck::Alive),
+            ]
+        );
+        assert_eq!(
+            source.sleeps,
+            vec![PCSC_CONTEXT_CHECK_INTERVAL; 3],
+            "no retry delay before reopening after a loss"
+        );
+        assert_eq!(source.logs.len(), 1, "{:?}", source.logs);
+        assert!(
+            source.logs[0].contains("lost (Service was stopped)"),
+            "{:?}",
+            source.logs
+        );
+    }
+
+    #[test]
+    fn failed_opens_are_retried_and_logged_once_until_one_succeeds() {
+        let mut source = FakeSource {
+            establishes: VecDeque::from([
+                Err("Service not available".to_string()),
+                Err("Service not available".to_string()),
+                Err("Service not available".to_string()),
+                Ok(()),
+            ]),
+            checks: VecDeque::from([ContextCheck::Alive]),
+            sleeps_allowed: 4,
+            ..Default::default()
+        };
+        run_pcsc_context_holder(&mut source);
+        assert_eq!(source.opened, 1);
+        assert_eq!(source.checked, vec![(1, ContextCheck::Alive)]);
+        assert_eq!(
+            source.sleeps,
+            vec![
+                PCSC_CONTEXT_RETRY_DELAY,
+                PCSC_CONTEXT_RETRY_DELAY,
+                PCSC_CONTEXT_RETRY_DELAY,
+                PCSC_CONTEXT_CHECK_INTERVAL,
+            ]
+        );
+        assert_eq!(source.logs.len(), 2, "{:?}", source.logs);
+        assert!(
+            source.logs[0].contains("cannot open a PC/SC context")
+                && source.logs[0].contains("Service not available"),
+            "{:?}",
+            source.logs
+        );
+        assert!(source.logs[1].contains("open again"), "{:?}", source.logs);
+    }
+
+    #[test]
+    fn a_reopen_that_fails_after_a_loss_keeps_retrying() {
+        // pcscd gone for good for a while: the context is lost, the first
+        // reopens fail, a later one brings it back.
+        let mut source = FakeSource {
+            establishes: VecDeque::from([
+                Ok(()),
+                Err("Service not available".to_string()),
+                Err("Service not available".to_string()),
+                Ok(()),
+            ]),
+            checks: VecDeque::from([lost("Service was stopped"), ContextCheck::Alive]),
+            sleeps_allowed: 4,
+            ..Default::default()
+        };
+        run_pcsc_context_holder(&mut source);
+        assert_eq!(source.opened, 2);
+        assert_eq!(
+            source.checked,
+            vec![(1, lost("Service was stopped")), (2, ContextCheck::Alive)]
+        );
+        assert_eq!(
+            source.sleeps,
+            vec![
+                PCSC_CONTEXT_CHECK_INTERVAL,
+                PCSC_CONTEXT_RETRY_DELAY,
+                PCSC_CONTEXT_RETRY_DELAY,
+                PCSC_CONTEXT_CHECK_INTERVAL,
+            ]
+        );
+        assert_eq!(source.logs.len(), 3, "{:?}", source.logs);
+        assert!(source.logs[0].contains("lost"), "{:?}", source.logs);
+        assert!(source.logs[1].contains("cannot open"), "{:?}", source.logs);
+        assert!(source.logs[2].contains("open again"), "{:?}", source.logs);
+    }
+
+    #[test]
+    fn no_readers_is_a_live_pcscd_and_any_other_error_is_a_lost_one() {
+        assert_eq!(classify_context_check(Ok(0)), ContextCheck::Alive);
+        assert_eq!(classify_context_check(Ok(42)), ContextCheck::Alive);
+        assert_eq!(
+            classify_context_check(Err(pcsc::Error::NoReadersAvailable)),
+            ContextCheck::Alive
+        );
+        for e in [
+            pcsc::Error::NoService,
+            pcsc::Error::ServiceStopped,
+            pcsc::Error::InvalidHandle,
+            pcsc::Error::CommError,
+        ] {
+            assert!(
+                matches!(classify_context_check(Err(e)), ContextCheck::Lost(_)),
+                "{e:?} must replace the context"
+            );
+        }
     }
 }
 
@@ -773,19 +1115,38 @@ mod real_runner_tests {
         assert!(!runner.unix_connect_ok(&path), "nothing at the path");
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
         assert!(path.exists(), "the socket file outlives its listener");
-        assert!(!runner.unix_connect_ok(&path), "a file nobody listens on");
+        // Other tests in this process spawn children at the same time. A
+        // child forked while the listener was open holds a copy of its fd
+        // until it execs (CLOEXEC acts only at exec), so the listener can
+        // briefly outlive the drop and accept a connect. That copy is gone
+        // within milliseconds; a file nobody listens on refuses for good.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runner.unix_connect_ok(&path) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a file nobody listens on"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Polls `is_alive` until the child is gone, failing after 5 s. A
+    /// fixed sleep before a single check failed under load: on a busy
+    /// host (load average about 5 during `make test`) `true` had not been
+    /// observed exiting 200 ms after its spawn.
+    fn assert_exits_soon(runner: &RealCommandRunner, handle: &ChildHandle, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runner.is_alive(handle) {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
     fn a_reaped_child_is_removed_so_a_later_signal_is_a_safe_no_op() {
         let runner = RealCommandRunner::new();
         let handle = runner.spawn(ChildSpec::new(["true"])).unwrap();
-        // Give the (near-instant) child a moment to actually exit.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(
-            !runner.is_alive(&handle),
-            "`true` should have exited by now"
-        );
+        assert_exits_soon(&runner, &handle, "`true` should have exited by now");
         // Must not panic/error — and, per the fix, must not attempt to
         // signal the stale pid at all.
         runner.signal(&handle, Signal::Term);
@@ -858,8 +1219,7 @@ mod real_runner_tests {
         let handle = runner.spawn(ChildSpec::new(["sleep", "30"])).unwrap();
         assert!(runner.is_alive(&handle));
         runner.signal(&handle, Signal::Kill);
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(!runner.is_alive(&handle));
+        assert_exits_soon(&runner, &handle, "a killed child should be observed dead");
     }
 
     #[test]
@@ -896,8 +1256,7 @@ mod real_runner_tests {
             .expect("liveness checker thread must not panic");
         signaler.join().expect("signaler thread must not panic");
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(!runner.is_alive(&handle));
+        assert_exits_soon(&runner, &handle, "a killed child should be observed dead");
     }
 
     #[test]
@@ -1184,6 +1543,8 @@ mod mock {
         /// front entry while more than one is queued, then keeps returning
         /// the last. Unseeded paths have no identity (nothing there).
         pub path_identities: Mutex<Map<String, PathIdentityQueue>>,
+        /// How many times `hold_pcsc_context` was called.
+        pub pcsc_context_holds: AtomicU64,
         /// Overrides `resolve_host`'s return value for a given host;
         /// unseeded hosts resolve to an empty address list (no real DNS in
         /// tests).
@@ -1686,6 +2047,10 @@ mod mock {
                 .get(&key)
                 .copied()
                 .unwrap_or(false)
+        }
+
+        fn hold_pcsc_context(&self) {
+            self.pcsc_context_holds.fetch_add(1, Ordering::SeqCst);
         }
 
         fn path_identity(&self, path: &Path) -> Option<(u64, u64)> {

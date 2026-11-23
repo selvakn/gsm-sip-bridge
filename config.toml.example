@@ -468,11 +468,13 @@ tunnel_engine = "strongswan"
 vpcd_host = "127.0.0.1"
 vpcd_port = 15963
 # strongswan engine only: who runs pcscd. "managed" = the bridge starts its own
-# (needed for modem-backed lines and in the Docker image); "external" = use the
-# host's pcscd (e.g. systemd's pcscd.socket), card-reader lines only; "auto" =
-# "external" when every line is a card reader and something already answers on
-# /run/pcscd/pcscd.comm, otherwise "managed". Two pcscd instances cannot share
-# one host.
+# (needed in the Docker image); "external" = use the host's pcscd (e.g.
+# systemd's pcscd.socket), which loads the vpcd reader for modem-backed lines
+# from /etc/reader.conf.d/vpcd (pcscd reads it only at start: a host pcscd
+# already running when the bridge first writes it needs one
+# `systemctl restart pcscd.service`); "auto" = "external" when something already
+# answers on /run/pcscd/pcscd.comm, otherwise "managed". Two pcscd instances
+# cannot share one host.
 # pcscd = "auto"
 # Upper bound on auto-discovered VoWiFi lines (1-64). Modems past this count
 # are reported and skipped.

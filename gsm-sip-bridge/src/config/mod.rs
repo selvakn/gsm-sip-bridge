@@ -109,14 +109,15 @@ impl std::fmt::Display for TunnelAddressFamily {
 ///
 /// `Managed` is the original behaviour: `supervise` spawns its own pcscd,
 /// which is the only option inside the container image, where nothing else
-/// provides one, and the only option for a modem-backed line, whose SIM
-/// reaches pcscd through the vpcd virtual reader `supervise` configures.
-/// `External` uses a pcscd the host already provides (typically systemd's
-/// `pcscd.socket`), which is only possible when every line is
-/// card-reader-backed. `Auto` picks `External` when no line needs vpcd and
-/// something already answers on pcscd's socket, otherwise `Managed`. Two
-/// pcscd instances cannot coexist on one host: their control socket path is
-/// fixed at compile time (specs/013-multi-card-vowifi research §4).
+/// provides one. `External` uses a pcscd the host already provides
+/// (typically systemd's `pcscd.socket`), for card-reader and modem-backed
+/// lines alike: the host's pcscd loads the vpcd virtual reader a
+/// modem-backed line needs from the same `/etc/reader.conf.d/vpcd`
+/// `supervise` writes. `Auto` picks `External` when something already
+/// answers on pcscd's socket, otherwise `Managed`. Two pcscd instances
+/// cannot coexist on one host: their control socket path is fixed at
+/// compile time (specs/013-multi-card-vowifi research §4), and pcscd
+/// refuses to start while another one's pid file names a live process.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PcscdMode {
@@ -2596,7 +2597,7 @@ password = "pass"
     }
 
     #[test]
-    fn vowifi_pcscd_external_is_accepted_for_card_reader_lines_only() {
+    fn vowifi_pcscd_external_is_accepted_for_any_strongswan_line_table() {
         let pcsc_line =
             "[[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404940123456789\"\n";
         let ok = parse(&format!(
@@ -2604,20 +2605,17 @@ password = "pass"
         ));
         assert_eq!(ok.vowifi.pcscd, PcscdMode::External);
 
-        let no_lines = try_parse(&format!(
+        // Discovered modems and modem-backed lines are served through the
+        // vpcd reader the host's pcscd loads from the same reader config.
+        let no_lines = parse(&format!(
             "{MINIMAL_TOML}\n[vowifi]\nenabled = true\npcscd = \"external\"\n"
-        ))
-        .unwrap_err()
-        .to_string();
-        assert!(no_lines.contains("discovered modems"), "{no_lines}");
-
-        let modem_line = try_parse(&format!(
+        ));
+        assert_eq!(no_lines.vowifi.pcscd, PcscdMode::External);
+        let modem_line = parse(&format!(
             "{MINIMAL_TOML}\n[vowifi]\nenabled = true\npcscd = \"external\"\n{pcsc_line}\
              [[vowifi.line]]\nmodem_port = \"/dev/ttyUSB2\"\n"
-        ))
-        .unwrap_err()
-        .to_string();
-        assert!(modem_line.contains("vowifi.line[1]"), "{modem_line}");
+        ));
+        assert_eq!(modem_line.vowifi.pcscd, PcscdMode::External);
 
         let swu = try_parse(&format!(
             "{MINIMAL_TOML}\n[vowifi]\nenabled = true\ntunnel_engine = \"swu\"\npcscd = \"external\"\n"
