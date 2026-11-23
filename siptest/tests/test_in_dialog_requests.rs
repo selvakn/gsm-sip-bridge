@@ -727,7 +727,7 @@ fn inbound_remote_bye_is_answered_and_ends_the_call_early() {
 }
 
 // ---------------------------------------------------------------------------
-// re-INVITE / UPDATE are refused, and the call carries on
+// re-INVITE is refused (488) and UPDATE is unsupported (405); the call carries on
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -750,12 +750,12 @@ fn outbound_re_invite_is_refused_with_488_and_the_call_carries_on() {
 }
 
 #[test]
-fn outbound_update_is_refused_with_488_and_the_call_carries_on() {
+fn outbound_update_is_405_unsupported_and_the_call_carries_on() {
     let f = run_outbound(PeerAction::Update, PEER_ACTS_AFTER, 41600);
 
     assert!(
-        f.log.answered(488, "UPDATE"),
-        "an UPDATE must be refused with 488: {:#?}",
+        f.log.answered(405, "UPDATE"),
+        "an UPDATE is not advertised in Allow and must get 405: {:#?}",
         f.log.all()
     );
     assert_eq!(f.call.end_reason, Some(EndReason::DurationElapsed));

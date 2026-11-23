@@ -182,6 +182,16 @@ impl SipSocket {
     /// RTP at an arbitrary third party through its own SDP offer, or
     /// stopping a call with a `BYE` that names its `Call-ID`; and replying to
     /// a spoofed source would make siptest a UDP reflection amplifier.
+    ///
+    /// **Known limit (accepted by the maintainer):** the one trusted address
+    /// is the bridge's. An outbound call whose `302` redirects to a different
+    /// *host*, or whose `200` carries a `Contact` on another host, is
+    /// answered by that host — and a `BYE` from it is dropped here with only
+    /// a warning, so the call runs its configured length instead of ending
+    /// early. The bridge's redirect target is its own telephony agent on the
+    /// same host, so this does not arise against the real bridge; widening
+    /// the filter to also accept the active dialog's remote IP is the fix if
+    /// it ever does (tracked in `docs/todo.md`).
     pub fn recv_request_from(
         &self,
         trusted: IpAddr,

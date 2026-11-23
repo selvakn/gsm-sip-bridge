@@ -15,12 +15,13 @@
 //! - **inbound**: the listener thread *is* the one running the call, so the
 //!   watcher reads the socket's request queue itself.
 //!
-//! What is answered: `BYE` → `200` and the call ends; `re-INVITE`/`UPDATE` →
-//! `488`, because siptest cannot renegotiate media mid-call and says so
-//! plainly rather than silently dropping the request or agreeing to
-//! something it won't do; `OPTIONS` → `200`, in or out of the dialog; any
-//! other in-dialog method → `405`; unrelated `INVITE`s → the stray handling
-//! every other waiting loop uses.
+//! What is answered: `BYE` → `200` and the call ends; `re-INVITE` → `488`,
+//! because siptest cannot renegotiate media mid-call and says so plainly
+//! rather than silently dropping the request or agreeing to something it
+//! won't do; `OPTIONS` → `200`, in or out of the dialog; any other in-dialog
+//! method, `UPDATE` included → `405` with the `Allow` list (siptest does not
+//! advertise `UPDATE`, so there is no offer of its to refuse); unrelated
+//! `INVITE`s → the stray handling every other waiting loop uses.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,11 +67,8 @@ pub fn respond(
         // late or duplicated on the wire: nothing to refuse, and a `488` for
         // it would read as the call having failed.
         ("INVITE", true) if !has_to_tag(req) => Disposition::Handled,
-        ("INVITE" | "UPDATE", true) => {
-            tracing::warn!(
-                method = %req.method,
-                "refusing a mid-call media renegotiation with 488"
-            );
+        ("INVITE", true) => {
+            tracing::warn!("refusing a mid-call re-INVITE with 488");
             let _ = ctx.socket.send(
                 peer,
                 &build_uas_response(488, "Not Acceptable Here", req, None, None, None),
@@ -80,8 +78,8 @@ pub fn respond(
         // A retransmitted ACK for our 2xx, or a CANCEL for a transaction
         // that is already over: nothing to answer.
         ("ACK" | "CANCEL", true) => Disposition::Handled,
-        // Any other in-dialog request (INFO, NOTIFY, MESSAGE...): siptest
-        // implements none of them, and says so rather than going silent, so
+        // Any other in-dialog request (UPDATE, INFO, NOTIFY, MESSAGE...):
+        // siptest implements none of them, and does not advertise them, and says so rather than going silent, so
         // the peer does not retransmit it into the void. (`OPTIONS` is a
         // keepalive and is answered by the stray handling, in or out of the
         // dialog.)
@@ -265,16 +263,28 @@ mod tests {
     }
 
     #[test]
-    fn a_re_invite_or_update_is_refused_with_488_and_the_call_carries_on() {
-        for method in ["INVITE", "UPDATE"] {
-            let rig = Rig::new();
-            assert_eq!(
-                rig.respond(&request(method, CALL)),
-                Disposition::Handled,
-                "{method} must not end the call"
-            );
-            assert_eq!(rig.reply(CALL, method, WAIT), Some(488), "{method}");
-        }
+    fn a_re_invite_is_refused_with_488_and_the_call_carries_on() {
+        let rig = Rig::new();
+        assert_eq!(
+            rig.respond(&request("INVITE", CALL)),
+            Disposition::Handled,
+            "a re-INVITE must not end the call"
+        );
+        assert_eq!(rig.reply(CALL, "INVITE", WAIT), Some(488));
+    }
+
+    /// `UPDATE` is not in the `Allow` list siptest advertises, so it is an
+    /// unsupported method (`405` with `Allow`), not an offer to refuse — and
+    /// an SDP-less one (a session refresh) has no offer at all.
+    #[test]
+    fn an_update_is_an_unsupported_method_405_not_a_refused_offer() {
+        let rig = Rig::new();
+        assert_eq!(
+            rig.respond(&request("UPDATE", CALL)),
+            Disposition::Handled,
+            "an UPDATE must not end the call"
+        );
+        assert_eq!(rig.reply(CALL, "UPDATE", WAIT), Some(405));
     }
 
     /// An INVITE with no `To` tag and this dialog's Call-ID is the one that
@@ -333,7 +343,7 @@ mod tests {
     /// leaving the peer to retransmit into silence.
     #[test]
     fn any_other_in_dialog_method_is_refused_with_405() {
-        for method in ["INFO", "NOTIFY", "MESSAGE"] {
+        for method in ["INFO", "NOTIFY", "MESSAGE", "UPDATE"] {
             let rig = Rig::new();
             assert_eq!(
                 rig.respond(&request(method, CALL)),
