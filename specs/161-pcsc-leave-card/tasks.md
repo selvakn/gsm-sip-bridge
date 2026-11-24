@@ -140,7 +140,7 @@
   - No real identifiers anywhere in the diff.
   - Tick each task; record any narrowed requirement as a **Deviation** line in this file, never as done.
 - [X] T030 Commit 3 (T025, T026, any doc fixes from T029), after `make format`, `make lint` and `make test`: `docs: record the PC/SC reset rule and release note (#232)`. End it with the `Co-Authored-By` line.
-- [ ] T031 Push with an explicit refspec (`git push -u origin 161-pcsc-leave-card:161-pcsc-leave-card`; never rely on tracking, see the memory notes), then open the PR with `gh pr create`:
+- [X] T031 Push with an explicit refspec (`git push -u origin 161-pcsc-leave-card:161-pcsc-leave-card`; never rely on tracking, see the memory notes), then open the PR with `gh pr create`:
   - Title: `fix(pcsc): stop resetting a shared card-reader SIM (#232)`.
   - Body: the summary, the repro table (before/after), the test counts, the hardware-test and live results from T027/T028, the out-of-scope pointer to #233, and `Refs #232` (not `Fixes`; #233 remains). End it with the PR attribution line.
 
