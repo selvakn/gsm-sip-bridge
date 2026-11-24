@@ -204,7 +204,9 @@ A card-reader line whose SIM is out of reach (#233) logs:
 - `the SIM is out of reach; retrying the registration without counting toward the restart budget`
   (`retry_in_secs`, `error`), when a full registration fails because the card is out of reach. The line shows
   `state: Failed` with `last_failure: … SIM card unreachable: …` and raises the registration-loss alert, but
-  the agent does not exit for it, because a restart cannot bring a card back.
+  these failures do not count toward the agent's exit, because a restart cannot bring a card back. The ePDG
+  tunnel needs the card too, so if the supervisor has to rebuild it while the card is out, the line stays down
+  until the card returns.
 
 Modem-backed lines are unchanged.
 

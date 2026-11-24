@@ -204,11 +204,14 @@ registration and waiting for the card`, and `vowifi-status` shows
 minute, and refreshes the registration in place when the card answers. It
 registers in full only when the registration is about to end and no call is up.
 A full registration that fails because the card is out of reach is retried on
-the usual backoff (at most every 2 minutes), and never restarts the agent:
-expect `the SIM is out of reach; retrying the registration without counting
+the usual backoff (at most every 2 minutes), and does not count toward the
+agent's exit after six failed registrations: expect `the SIM is out of reach; retrying the registration without counting
 toward the restart budget` and `last_failure: … SIM card unreachable: …`. A
 card that is out of reach when the agent starts still makes the agent exit, and
-the supervisor restarts it.
+the supervisor restarts it. The ePDG tunnel also needs the card (EAP-AKA): if it
+has to be rebuilt while the card is out (`SCardConnect: No smart card
+inserted`), the line restarts every few seconds until the card is back, then
+registers within seconds.
 
 ## Running on a host with its own pcscd
 
