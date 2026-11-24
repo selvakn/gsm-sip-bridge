@@ -170,7 +170,14 @@ if that is when it falls due (specs/123). `vowifi-status` and `volte-status` sho
 
 - `refresh_mode: in-place` or `fallback`. `fallback` means the carrier rejected two in-place refreshes
   in a row, so the next cycle re-registers in full; it reads `in-place` again once that succeeds.
-- `last_refresh: ok <time>`, `rejected <status> <time>`, `timeout <time>` or `none`.
+- `last_refresh:` the latest refresh outcome and its time:
+  - `ok <time>`;
+  - `rejected <status> <time>`;
+  - `timeout <time>`;
+  - `error <time>`, when re-authenticating for a challenged refresh failed and the line registers in full;
+  - `awaiting-card <time>`, when a card-reader line's SIM was out of reach during a challenged refresh and the
+    line is keeping its registration until the card is back (#233);
+  - `none`.
 - `next_refresh: <time>`, 600 s before expiry for a grant over 1200 s and half the grant otherwise.
 - `refresh_rejections: <N>`, the consecutive rejections counted toward the fallback.
 
@@ -182,6 +189,24 @@ the existing session` (`status`, `in_call`, `binding_valid`): the earlier grant 
 `the connection did not carry the refresh; rebuilding it and sending it again` (`error`) is the one-time connection rebuild before a refresh is counted as failed; `in-place refresh keeps being rejected; the next cycle re-registers in full` marks the fallback. A very short
 grant logs `registrar granted a very short lifetime`. A registration that expires during a call is reported as
 `state: Failed`; the call is left running and the full re-registration starts when it ends.
+
+A card-reader line whose SIM is out of reach (#233) logs:
+
+- `the SIM is out of reach; asking it the same challenge again` (`attempt`, `error`), every 2 s for up to 30 s
+  while the network waits for the answer to a challenge;
+- `the SIM stayed out of reach; keeping the registration and waiting for the card` (`window_secs`,
+  `expires_in_secs`, `error`), when it gives the challenge up and `last_refresh` reads `awaiting-card`. It then
+  checks the card locally (no network traffic) after 5 s, 10 s, 20 s and so on, up to once a minute;
+- `the SIM is reachable again; refreshing the registration in place` (`waited_secs`), followed by an ordinary
+  in-place refresh;
+- `the SIM is still out of reach and the registration is about to end; registering in full` (`reason` =
+  `margin` with under 60 s left, or `lapsed`), only when no call is in progress;
+- `the SIM is out of reach; retrying the registration without counting toward the restart budget`
+  (`retry_in_secs`, `error`), when a full registration fails because the card is out of reach. The line shows
+  `state: Failed` with `last_failure: … SIM card unreachable: …` and raises the registration-loss alert, but
+  the agent does not exit for it, because a restart cannot bring a card back.
+
+Modem-backed lines are unchanged.
 
 ## Reg-event subscription logs
 
