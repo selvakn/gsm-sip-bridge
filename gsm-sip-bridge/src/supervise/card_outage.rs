@@ -328,10 +328,17 @@ impl OutageWatch {
 }
 
 /// Whether to restart an agent that lived through a card outage, now that the
-/// card is back: when it says it is not registered and no call is up. A
-/// registration that lapses during a call keeps the call (`docs/observability.md`),
-/// so a call always wins. An agent that does not answer is left alone; the
-/// healthcheck owns that.
+/// card is back: when it says it is not registered, no call is up, and at
+/// least one P-CSCF in its pool is free of a mark.
+///
+/// - A registration that lapses during a call keeps the call
+///   (`docs/observability.md`), so a call always wins.
+/// - With every P-CSCF still marked, a new agent waits for the soonest mark to
+///   end (up to 2 minutes) before its first attempt (`register_via_pool`), so
+///   the restart would only trade the live agent's retry for that wait (PR #236
+///   review). Marks only lapse with time, so a pool with a free member now
+///   cannot make the replacement wait.
+/// - An agent that does not answer is left alone; the healthcheck owns that.
 pub fn restart_after_outage(status: &super::runner::AgentStatusProbe, in_call: bool) -> bool {
     use crate::vowifi::control::ControlMessage;
     if in_call {
@@ -340,10 +347,21 @@ pub fn restart_after_outage(status: &super::runner::AgentStatusProbe, in_call: b
     match status {
         super::runner::AgentStatusProbe::Reply(ControlMessage::RegistrationStatusReply {
             state,
+            pcscf,
             ..
-        }) => !is_registered_state(state),
+        }) => !is_registered_state(state) && !pcscf.as_deref().is_some_and(every_pcscf_marked),
         _ => false,
     }
+}
+
+/// Whether every P-CSCF in the agent's pool carries a mark still in force. An
+/// empty pool (an agent that reports none) is not.
+fn every_pcscf_marked(pcscf: &crate::vowifi::control::PcscfStatusReply) -> bool {
+    !pcscf.pool.is_empty()
+        && pcscf
+            .pool
+            .iter()
+            .all(|addr| pcscf.unavailable.iter().any(|(marked, _)| marked == addr))
 }
 
 /// Whether a status reply's `state` is a registration that holds. The agent
@@ -986,6 +1004,76 @@ mod tests {
         }
         let silent = super::super::runner::AgentStatusProbe::NoAnswer("refused".into());
         assert!(!restart_after_outage(&silent, false));
+    }
+
+    fn with_pool(
+        probe: super::super::runner::AgentStatusProbe,
+        pool: &[&str],
+        marked: &[&str],
+    ) -> super::super::runner::AgentStatusProbe {
+        let super::super::runner::AgentStatusProbe::Reply(
+            crate::vowifi::control::ControlMessage::RegistrationStatusReply {
+                state,
+                registered_at,
+                expires_at,
+                last_failure,
+                can_answer,
+                blocked_reason,
+                gm_connection,
+                rejection_cooldown_until,
+                refresh,
+                reg_subscription,
+                reg_subscription_last_failure,
+                ..
+            },
+        ) = probe
+        else {
+            unreachable!()
+        };
+        super::super::runner::AgentStatusProbe::Reply(
+            crate::vowifi::control::ControlMessage::RegistrationStatusReply {
+                state,
+                registered_at,
+                expires_at,
+                last_failure,
+                can_answer,
+                blocked_reason,
+                gm_connection,
+                rejection_cooldown_until,
+                refresh,
+                reg_subscription,
+                reg_subscription_last_failure,
+                pcscf: Some(Box::new(crate::vowifi::control::PcscfStatusReply {
+                    active: pool.first().copied().unwrap_or_default().to_string(),
+                    pool: pool.iter().map(|a| a.to_string()).collect(),
+                    unavailable: marked
+                        .iter()
+                        .map(|a| (a.to_string(), 9_999_999_999))
+                        .collect(),
+                })),
+            },
+        )
+    }
+
+    #[test]
+    fn no_restart_while_every_pcscf_is_still_marked() {
+        // PR #236 review: a new agent would wait the marks out before its
+        // first attempt, so the restart would only add that wait.
+        use crate::ims::RegistrationState::Failed;
+        let all_marked = with_pool(
+            status(Failed),
+            &["10.0.0.11", "10.0.0.12"],
+            &["10.0.0.11", "10.0.0.12"],
+        );
+        assert!(!restart_after_outage(&all_marked, false));
+        // One member free: the replacement registers at once.
+        let one_free = with_pool(status(Failed), &["10.0.0.11", "10.0.0.12"], &["10.0.0.11"]);
+        assert!(restart_after_outage(&one_free, false));
+        let none_marked = with_pool(status(Failed), &["10.0.0.11"], &[]);
+        assert!(restart_after_outage(&none_marked, false));
+        // An agent that reports no pool is judged on its state alone.
+        let no_pool = with_pool(status(Failed), &[], &[]);
+        assert!(restart_after_outage(&no_pool, false));
     }
 
     #[test]

@@ -232,8 +232,9 @@ The supervisor's log lines (stdout, `docker logs`), none of which carries an IMS
 
 A held rebuild logs nothing at the default level. The outage ends when a check finds the card or the agent
 registers, and every delay starts again from its first value next time. An agent that rode the outage out
-without exiting is asked for its registration state when it ends, and restarted if it is not registered and
-no call is up, rather than left to its own retry (up to 2 minutes). While it lasts, the tunnel-failure
+without exiting is asked for its registration state when it ends, and restarted if it is not registered, no
+call is up and at least one P-CSCF in its pool is free of a mark, rather than left to its own retry (up to 2
+minutes). With every P-CSCF marked a new agent would wait the marks out first, so it is left alone. While it lasts, the tunnel-failure
 alert reads `…; SIM card out of reach, tunnel attempts slowed until it is back`. `vowifi-status`, the `uplink`
 status file and the metrics are unchanged. The pacing starts once the line's tunnel has first come up; a card
 that is out of reach when the bridge starts is handled by the start-up MCC/MNC read's own retries, as before.

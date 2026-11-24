@@ -222,7 +222,7 @@ not complete. The supervisor checks the card every 5 seconds meanwhile and logs
 to be restarted then starts at once and registers within seconds. An agent that
 kept running through the outage and is not registered is restarted too (`SIM
 card back but vowifi-ims-agent is not registered; restarting it now`), unless a
-call is up. The tunnel-failure alert names the card while this lasts.
+call is up or every P-CSCF it knows is still marked unavailable. The tunnel-failure alert names the card while this lasts.
 
 ## Running on a host with its own pcscd
 
