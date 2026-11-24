@@ -15,7 +15,9 @@ use crate::ims::gm_ipsec::{
     self, GmEndpoints, IpXfrm, RetiredSas, SaKeys, SaSet, StagedSas, XfrmBackend,
 };
 use crate::ims::observability::AgentObservability;
-use crate::ims::registration_auth::{Answer, ChallengeJob, Reauthentication};
+use crate::ims::registration_auth::{
+    Answer, CardCheck, CardTiming, ChallengeJob, Reauthentication,
+};
 use crate::ims::session::ClientReader;
 use crate::ims::session::Inbound;
 use crate::ims::session::RegisterFailure;
@@ -30,6 +32,7 @@ use crate::ims::{
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -731,6 +734,11 @@ impl LoopState {
         if self.challenged.is_some() {
             return self.drive_challenge(session, p, link, now);
         }
+        // Waiting for a card-reader SIM: no REGISTER goes out until the card
+        // answers, then the refresh below goes out at once (#233).
+        if self.awaiting_card.is_some() && !self.drive_awaiting_card(p, now)? {
+            return Ok(());
+        }
         if let Some(mut pending) = self.registration_refresh.take() {
             return match pending.poll(session, now) {
                 Ok(true) => {
@@ -1078,11 +1086,13 @@ impl LoopState {
 /// and the kernel's XFRM tables. Production uses the real ones; the tests
 /// substitute a SIM that answers from a script and a table that follows the
 /// kernel's rules, because CI has neither a modem nor `CAP_NET_ADMIN`. Nothing
-/// else about the procedure is replaced.
+/// else about the procedure is replaced. `timing` is how a card-reader line
+/// deals with a SIM it cannot reach (#233); the tests shorten it.
 #[derive(Clone)]
 pub(super) struct ReauthEnv {
     pub(super) open_card: OpenCard,
     pub(super) xfrm: XfrmFactory,
+    pub(super) timing: CardTiming,
 }
 
 pub(super) type OpenCard =
@@ -1094,6 +1104,7 @@ impl Default for ReauthEnv {
         Self {
             open_card: Arc::new(crate::ims::open_card),
             xfrm: Arc::new(|| Box::new(IpXfrm)),
+            timing: CardTiming::default(),
         }
     }
 }
@@ -1106,6 +1117,37 @@ const DRAIN: Duration = TRANSACTION_TIMEOUT;
 
 /// No pending call can hold a retired leg longer than this.
 const DRAIN_LIMIT: Duration = Duration::from_secs(600);
+
+/// A card-reader line gave up a challenge because its SIM could not be reached,
+/// and keeps the registration the network already granted while it waits for
+/// the card (#233). It checks the card locally on a doubling backoff and sends
+/// a fresh in-place refresh once the card answers. It registers in full only
+/// when the registration is about to end with no call in progress, or when
+/// another path asks for a full registration. See `drive_awaiting_card`.
+pub(super) struct AwaitingCard {
+    /// When the line started waiting.
+    since: Instant,
+    /// The check in flight, if any.
+    check: Option<CardCheck>,
+    /// When the next check may start.
+    next_check_at: Instant,
+    /// The pause before the next check after this one fails.
+    backoff: Duration,
+    /// Set by the last worker the line stopped waiting for (the challenge, or
+    /// a stuck check) once its thread ends. That thread may still be inside
+    /// the card, which no other command can reach until it returns, so no
+    /// check starts before it is set (FR-015).
+    previous: Option<Arc<AtomicBool>>,
+}
+
+impl AwaitingCard {
+    /// After a check that found the card still out of reach (or stuck):
+    /// double the pause, up to its cap, and wait that long.
+    fn schedule_next(&mut self, now: Instant, timing: &CardTiming) {
+        self.backoff = crate::ims::session::next_backoff(self.backoff, timing.check_max);
+        self.next_check_at = now + self.backoff;
+    }
+}
 
 /// The SIM is answering a challenge. The registration is untouched meanwhile.
 pub(super) struct Challenged {
@@ -1181,7 +1223,15 @@ impl LoopState {
         self.challenged = Some(Challenged {
             work: {
                 let open = Arc::clone(&self.reauth_env.open_card);
-                Reauthentication::spawn(job, move |cfg| open(cfg))
+                if p.reg_cfg.pcsc_reader {
+                    Reauthentication::spawn_retrying(
+                        job,
+                        move |cfg| open(cfg),
+                        self.reauth_env.timing.clone(),
+                    )
+                } else {
+                    Reauthentication::spawn(job, move |cfg| open(cfg))
+                }
             },
             offers: response
                 .headers_all("Security-Server")
@@ -1199,7 +1249,10 @@ impl LoopState {
     }
 
     /// Runs once per pass while the SIM works: takes the answer when it is in,
-    /// and gives up on one that takes too long.
+    /// and gives up on one that takes too long. A modem line then registers in
+    /// full. A card-reader line whose card could not be reached (or did not
+    /// answer by the end of its retry window) keeps the registration and waits
+    /// for the card instead (#233).
     fn drive_challenge(
         &mut self,
         session: &mut RegisteredSession,
@@ -1212,6 +1265,12 @@ impl LoopState {
         };
         let Some(result) = challenged.work.poll() else {
             if challenged.work.overdue(now) {
+                if p.reg_cfg.pcsc_reader {
+                    let previous = challenged.work.finished_flag();
+                    drop(challenged);
+                    self.await_card(p, now, Some(previous), "the SIM did not answer in time");
+                    return Ok(());
+                }
                 return self
                     .fall_back_to_full("the SIM did not answer the challenge in time".into());
             }
@@ -1224,6 +1283,10 @@ impl LoopState {
             work: _,
         } = challenged;
         match result {
+            Err(e) if p.reg_cfg.pcsc_reader && e.is_card_unreachable() => {
+                self.await_card(p, now, None, &e.to_string());
+                Ok(())
+            }
             Err(e) => {
                 self.fall_back_to_full(format!("the SIM could not answer the challenge: {e}"))
             }
@@ -1429,6 +1492,138 @@ impl LoopState {
         });
     }
 
+    /// A card-reader line's challenge ran out of time to reach the SIM: drop
+    /// the challenge (the carry's reserved port with it) but keep the
+    /// registration, and wait for the card (#233). `force_renewal` is left as
+    /// it is. `previous` is the abandoned worker's done flag, when it may still
+    /// be inside the card.
+    fn await_card(
+        &mut self,
+        p: &RefreshCtx,
+        now: Instant,
+        previous: Option<Arc<AtomicBool>>,
+        error: &str,
+    ) {
+        self.registration_refresh = None;
+        self.challenged = None;
+        let timing = &self.reauth_env.timing;
+        let expires_in_secs = p
+            .status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .expires_at
+            .and_then(|at| at.duration_since(SystemTime::now()).ok())
+            .map_or(0, |left| left.as_secs());
+        tracing::warn!(
+            window_secs = timing.retry_window.as_secs(),
+            expires_in_secs,
+            error = %error,
+            "the SIM stayed out of reach; keeping the registration and waiting for the card"
+        );
+        self.last_refresh = Some((SystemTime::now(), "awaiting-card".to_string()));
+        self.awaiting_card = Some(AwaitingCard {
+            since: now,
+            check: None,
+            next_check_at: now + timing.check_initial,
+            backoff: timing.check_initial,
+            previous,
+        });
+    }
+
+    /// Runs once per pass while a card-reader line waits for its SIM (#233).
+    /// `true` when the card answered and the in-place refresh should go out
+    /// now. Otherwise the pass ends here: no REGISTER goes out while the line
+    /// waits, because each would spend one of the network's authentication
+    /// vectors on a challenge the card cannot answer.
+    ///
+    /// In order:
+    /// 1. A full registration asked for elsewhere (Gm liveness, failover, a
+    ///    reg-event loss, repeated rejections) ends the wait: that path owns
+    ///    the line. Every path that wants a full registration sets one of
+    ///    these two flags, so none needs to know about the wait.
+    /// 2. With no call in progress, a registration that has lapsed or has
+    ///    less than [`REFRESH_FLOOR`](crate::ims::REFRESH_FLOOR) left is
+    ///    renewed in full. During a call the line keeps waiting, as it keeps
+    ///    a lapsed binding for an in-place refresh then.
+    /// 3. The check in flight: the card answered, is still out of reach, gave
+    ///    an error of its own (a full registration), or is stuck (wait for it
+    ///    to end before the next check).
+    /// 4. The next check starts when it is due and no earlier worker is still
+    ///    inside the card.
+    fn drive_awaiting_card(&mut self, p: &RefreshCtx, now: Instant) -> BridgeResult<bool> {
+        let Some(mut waiting) = self.awaiting_card.take() else {
+            return Ok(true);
+        };
+        if self.force_renewal || self.refresh_fallback {
+            tracing::info!("stopped waiting for the SIM; a full registration takes over");
+            return Ok(false);
+        }
+        if !self.busy() {
+            let expires_at = p
+                .status
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .expires_at;
+            let reason = match expires_at.map(|at| at.duration_since(SystemTime::now())) {
+                None | Some(Err(_)) => Some("lapsed"),
+                Some(Ok(left)) if left < crate::ims::REFRESH_FLOOR => Some("margin"),
+                Some(Ok(_)) => None,
+            };
+            if let Some(reason) = reason {
+                tracing::warn!(
+                    reason,
+                    "the SIM is still out of reach and the registration is about to end; \
+                     registering in full"
+                );
+                self.force_renewal = true;
+                return Ok(false);
+            }
+        }
+        let timing = self.reauth_env.timing.clone();
+        if let Some(check) = waiting.check.take() {
+            match check.poll() {
+                Some(Ok(())) => {
+                    tracing::info!(
+                        waited_secs = now.saturating_duration_since(waiting.since).as_secs(),
+                        "the SIM is reachable again; refreshing the registration in place"
+                    );
+                    return Ok(true);
+                }
+                Some(Err(e)) if e.is_card_unreachable() => {
+                    tracing::debug!(error = %e, "the SIM is still out of reach");
+                    waiting.schedule_next(now, &timing);
+                }
+                Some(Err(e)) => {
+                    self.fall_back_to_full(format!(
+                        "the SIM answered the check with an error: {e}"
+                    ))?;
+                    return Ok(false);
+                }
+                None if check.overdue(now) => {
+                    tracing::debug!("a check of the SIM did not finish in time");
+                    waiting.previous = Some(check.finished_flag());
+                    waiting.schedule_next(now, &timing);
+                }
+                None => waiting.check = Some(check),
+            }
+        }
+        let card_free = waiting
+            .previous
+            .as_ref()
+            .is_none_or(|done| done.load(Ordering::SeqCst));
+        if waiting.check.is_none() && now >= waiting.next_check_at && card_free {
+            waiting.previous = None;
+            let open = Arc::clone(&self.reauth_env.open_card);
+            waiting.check = Some(CardCheck::spawn(
+                p.reg_cfg.clone(),
+                move |cfg| open(cfg),
+                timing.attempt_bound,
+            ));
+        }
+        self.awaiting_card = Some(waiting);
+        Ok(false)
+    }
+
     /// The procedure cannot continue: whatever was staged is undone and the
     /// registration is renewed in full, as soon as the line is idle. The
     /// binding the network already granted keeps serving calls until then.
@@ -1461,6 +1656,38 @@ fn rejected(response: &SipResponse) -> RegisterFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #233: the pause between checks of a card that is out of reach doubles
+    /// from its first step up to its cap.
+    #[test]
+    fn the_card_check_backoff_doubles_to_its_cap() {
+        let pauses = |timing: CardTiming| {
+            let now = Instant::now();
+            let mut waiting = AwaitingCard {
+                since: now,
+                check: None,
+                next_check_at: now + timing.check_initial,
+                backoff: timing.check_initial,
+                previous: None,
+            };
+            let mut pauses = vec![waiting.next_check_at - now];
+            for _ in 0..5 {
+                waiting.schedule_next(now, &timing);
+                pauses.push(waiting.next_check_at - now);
+            }
+            pauses
+        };
+        let ms = Duration::from_millis;
+        assert_eq!(
+            pauses(CardTiming::fast()),
+            [ms(20), ms(40), ms(80), ms(80), ms(80), ms(80)]
+        );
+        let s = Duration::from_secs;
+        assert_eq!(
+            pauses(CardTiming::default()),
+            [s(5), s(10), s(20), s(40), s(60), s(60)]
+        );
+    }
     use crate::ims::sip_client::SipTransport;
     use crate::ims::RegistrationAuth;
     use std::net::UdpSocket;

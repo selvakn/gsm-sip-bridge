@@ -2912,6 +2912,24 @@ mod tests {
     }
 
     #[test]
+    fn a_line_waiting_for_its_card_says_so() {
+        // #233: a card-reader line keeping its registration while its SIM is
+        // out of reach.
+        let status = control::RefreshStatusReply {
+            last: Some((1_700_000_000, "awaiting-card".into())),
+            ..Default::default()
+        };
+        let lines = format_refresh_lines(Some(&status));
+        assert_eq!(
+            lines[1],
+            format!(
+                "last_refresh: awaiting-card {}",
+                format_unix(Some(1_700_000_000))
+            )
+        );
+    }
+
+    #[test]
     fn an_agent_that_predates_the_refresh_fields_reads_as_unknown() {
         assert_eq!(
             format_refresh_lines(None),

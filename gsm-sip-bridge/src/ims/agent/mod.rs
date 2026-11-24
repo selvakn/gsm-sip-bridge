@@ -157,7 +157,10 @@ const ACTIVE_CALL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// than this, the same cross-check `CALL_ATTEMPT_TIMEOUT` does against
 /// `OUTBOUND_INVITE_TIMEOUT`.
 pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
+/// The first step of the renewal backoff ladder. `pub(crate)` so a card-reader
+/// line's first check for a SIM it lost touch with uses the same first step
+/// (`registration_auth::CardTiming`, #233).
+pub(crate) const RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
 const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(120);
 /// How many consecutive renewal failures this agent absorbs in-process before
 /// exiting and letting the supervisor recover the line.
@@ -2152,6 +2155,12 @@ struct LoopState {
     registration_refresh: Option<registration_refresh::PendingRegister>,
     /// A challenge to the refresh that the SIM is answering on its own thread.
     challenged: Option<registration_refresh::Challenged>,
+    /// A card-reader line is waiting for a SIM it could not reach, keeping its
+    /// registration meanwhile (#233). Never set on a modem line. Never set
+    /// together with `challenged`: entering the wait consumes the challenge,
+    /// and no REGISTER (so no new challenge) goes out while it lasts. Cleared
+    /// when the card answers, and before any full registration.
+    awaiting_card: Option<registration_refresh::AwaitingCard>,
     /// Client connections and security associations a re-authentication
     /// replaced, kept while transactions started on them finish.
     retired_gm: Vec<registration_refresh::RetiredLeg>,
@@ -2215,6 +2224,7 @@ impl LoopState {
             force_renewal: false,
             registration_refresh: None,
             challenged: None,
+            awaiting_card: None,
             retired_gm: Vec::new(),
             reauth_env: registration_refresh::ReauthEnv::default(),
             refresh_rejections: 0,
@@ -4323,6 +4333,7 @@ impl LoopState {
         // sent on the old one can never be matched again.
         self.registration_refresh = None;
         self.challenged = None;
+        self.awaiting_card = None;
         self.retired_gm.clear();
         // A previous attempt failed and its backoff hasn't elapsed yet —
         // `renewal_due` alone would otherwise fire again on every idle wake-up
