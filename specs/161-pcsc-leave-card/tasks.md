@@ -182,3 +182,13 @@ None of these narrows a requirement. They correct details the tasks got wrong or
 - **T015**: the test lives in `registration_auth.rs`'s `mod tests` next to `Probe` (where `Probe` actually is), not in `mod scripted`.
 - **T016**: inside the provided method, `Self` is `?Sized`, so it cannot be cast to `&mut dyn ApduTransport`. `usim::authenticate` is generic over `T: ApduTransport + ?Sized` instead. Every existing `&mut dyn` caller compiles unchanged, and the trait stays object-safe.
 - **T022**: the IMSI is read with `PcscTransport::read_transport_identity` (the same discover/select/read sequence as `pcsc_list`'s private `read_card_identity`) inside a `SharedCard` transaction. The holder is opened **before** the AKA and kept across it, not opened afterwards: a connection opened after a reset cannot see that reset, so only a holder held throughout tests the claim.
+
+## Review follow-up (PR #234)
+
+- **Greptile P2 "Tests miss lost exclusive access"**: no test proved that the AKA window excludes other programs; removing `with_transaction` from the override still passed. The same gap existed at every PC/SC transaction site, so all three got a test. A `Competitor` thread on its own connection sends `SELECT MF` with no transaction, 50 ms apart from each of 20 rounds:
+  - `authenticate_usim_window_excludes_a_competing_session`: every contended AKA gets the same answer as the uncontended one.
+  - `connect_probe_excludes_a_competing_session`: every probe finds the card and the same AID.
+  - `pcsc_list_read_excludes_a_competing_session`: every listing reads the card's IMSI.
+  - Mutation check on the OMNIKEY 3x21: removing each site's transaction fails its own test 20/20 (AKA `SW=6985` instead of the MAC failure `9862`; the probe and listing fail to find the USIM). The other two tests stay green.
+  - `with_transaction`'s other callers (the agent's and `vowifi-plmn`'s PLMN read) share the method the AKA test covers.
+- The old `authenticate_usim_runs_in_one_window_and_leaves_the_card` is renamed to `authenticate_usim_reaches_the_card_and_leaves_it`, because it never proved the window.

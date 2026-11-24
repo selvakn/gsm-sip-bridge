@@ -391,6 +391,218 @@ mod hardware {
         }
     }
 
+    /// The card's own IMSI, read at run time: never hard-coded.
+    fn card_imsi(ctx: &Context, reader: &CStr) -> String {
+        let mut card = SharedCard::connect(ctx, reader).expect("connect failed");
+        let mut tx = card.transaction().expect("transaction failed");
+        let (_, imsi) =
+            PcscTransport::read_transport_identity(&mut tx).expect("reading the IMSI failed");
+        let _ = tx.end(Disposition::LeaveCard);
+        imsi
+    }
+
+    /// Another program sharing the card that ignores transactions: on its
+    /// own connection it sends `SELECT MF` back to back, with no transaction,
+    /// until stopped. One of these landing inside a multi-command sequence
+    /// of ours moves the card's current file under it: an AUTHENTICATE then
+    /// meets the MF instead of the USIM ADF, and a READ BINARY no longer
+    /// reads EF_IMSI. A sequence held in one PC/SC transaction makes the
+    /// competitor wait instead.
+    struct Competitor {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<usize>>,
+    }
+
+    impl Competitor {
+        fn start(reader: &CStr) -> Self {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let reader = reader.to_owned();
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let thread = {
+                let stop = std::sync::Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let ctx = context();
+                    let card = SharedCard::connect(&ctx, &reader).expect("competitor connect");
+                    let select_mf = [0x00, 0xA4, 0x00, 0x0C, 0x02, 0x3F, 0x00];
+                    let mut buf = [0u8; MAX_BUFFER_SIZE];
+                    let mut sent = 0;
+                    ready_tx.send(()).unwrap();
+                    while !stop.load(Ordering::SeqCst) {
+                        if card.transmit(&select_mf, &mut buf).is_ok() {
+                            sent += 1;
+                        }
+                    }
+                    sent
+                })
+            };
+            ready_rx
+                .recv()
+                .expect("competitor thread died before connecting");
+            Self {
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        /// Stops the competitor and returns how many commands it got through.
+        fn stop(mut self) -> usize {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.thread
+                .take()
+                .unwrap()
+                .join()
+                .expect("competitor panicked")
+        }
+    }
+
+    impl Drop for Competitor {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// Rounds of each sequence run against the competitor.
+    const COMPETED_ROUNDS: usize = 20;
+
+    /// Runs `round` [`COMPETED_ROUNDS`] times with a pause before each, so
+    /// the competitor is mid-stream when each of our sequences starts. Back to
+    /// back, our own transactions would starve it of turns and the test would
+    /// prove nothing.
+    fn competed_rounds<T>(mut round: impl FnMut() -> T) -> Vec<T> {
+        (0..COMPETED_ROUNDS)
+            .map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                round()
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "needs a PC/SC reader with a SIM; run with --ignored on the reader host"]
+    fn authenticate_usim_window_excludes_a_competing_session() {
+        let ctx = context();
+        let reader = first_real_reader(&ctx);
+        let imsi = card_imsi(&ctx, &reader);
+        let mut transport = PcscTransport::connect(&imsi).expect("connect by IMSI failed");
+
+        // Uncontended, a bogus AUTN meets the USIM ADF and gets the card's
+        // MAC-failure answer (harmless, no SQN change).
+        let aka = |t: &mut PcscTransport| match t.authenticate_usim(&[0x11; 16], &[0x22; 16]) {
+            Ok(_) => panic!("the card accepted a bogus AUTN"),
+            Err(e) => e.to_string(),
+        };
+        let alone = aka(&mut transport);
+        assert!(
+            alone.contains("AUTHENTICATE failed"),
+            "unexpected error: {alone}"
+        );
+
+        let competitor = Competitor::start(&reader);
+        let contended = competed_rounds(|| aka(&mut transport));
+        let competing_commands = competitor.stop();
+
+        assert!(
+            competing_commands >= COMPETED_ROUNDS,
+            "the competitor barely ran ({competing_commands} commands), so this proved nothing"
+        );
+        // Every round must have met the USIM ADF, exactly as it did alone: a
+        // competing SELECT MF between our SELECT AID and AUTHENTICATE would
+        // change the card's answer.
+        let interleaved: Vec<&String> = contended.iter().filter(|m| **m != alone).collect();
+        assert!(
+            interleaved.is_empty(),
+            "{} of {COMPETED_ROUNDS} AKAs were interleaved (alone: {alone}); first: {}",
+            interleaved.len(),
+            interleaved[0]
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a PC/SC reader with a SIM; run with --ignored on the reader host"]
+    fn connect_probe_excludes_a_competing_session() {
+        // The probe that identifies the card also finds the AID the AKA window
+        // selects later, so an interleaved read would misidentify the card or
+        // cache a wrong AID.
+        let ctx = context();
+        let reader = first_real_reader(&ctx);
+        let imsi = card_imsi(&ctx, &reader);
+        let aid = PcscTransport::connect(&imsi)
+            .expect("connect by IMSI failed")
+            .aid
+            .clone();
+
+        let competitor = Competitor::start(&reader);
+        let failures: Vec<String> = competed_rounds(|| match PcscTransport::connect(&imsi) {
+            Ok(t) if t.aid == aid => None,
+            Ok(t) => Some(format!("wrong AID {}", usim::hex_encode(&t.aid))),
+            Err(e) => Some(e.to_string()),
+        })
+        .into_iter()
+        .flatten()
+        .collect();
+        let competing_commands = competitor.stop();
+
+        assert!(
+            competing_commands >= COMPETED_ROUNDS,
+            "the competitor barely ran ({competing_commands} commands), so this proved nothing"
+        );
+        assert!(
+            failures.is_empty(),
+            "{} of {COMPETED_ROUNDS} probes were interleaved; first: {}",
+            failures.len(),
+            failures[0]
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a PC/SC reader with a SIM; run with --ignored on the reader host"]
+    fn pcsc_list_read_excludes_a_competing_session() {
+        let ctx = context();
+        let reader = first_real_reader(&ctx);
+        let reader_name = reader.to_string_lossy().into_owned();
+        let imsi = card_imsi(&ctx, &reader);
+
+        // The carrier lookup goes to a closed local port and fails at once:
+        // this test is about the card read, not the network.
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
+            .build()
+            .unwrap();
+        let rt = crate::runtime::build_runtime().expect("tokio runtime");
+
+        let competitor = Competitor::start(&reader);
+        let failures: Vec<String> = competed_rounds(|| {
+            let rows = rt
+                .block_on(crate::modules::pcsc_list::list_cards(&client))
+                .expect("list_cards failed");
+            let row = rows
+                .into_iter()
+                .find(|r| r.reader == reader_name)
+                .expect("the reader is missing from the listing");
+            (row.imsi.as_deref() != Some(imsi.as_str()) || !row.status.starts_with("ok"))
+                .then_some(row.status)
+        })
+        .into_iter()
+        .flatten()
+        .collect();
+        let competing_commands = competitor.stop();
+
+        assert!(
+            competing_commands >= COMPETED_ROUNDS,
+            "the competitor barely ran ({competing_commands} commands), so this proved nothing"
+        );
+        assert!(
+            failures.is_empty(),
+            "{} of {COMPETED_ROUNDS} listings were interleaved; first: {}",
+            failures.len(),
+            failures[0]
+        );
+    }
+
     #[test]
     #[ignore = "needs a PC/SC reader with a SIM; run with --ignored on the reader host"]
     fn bare_card_drop_resets_other_handles() {
@@ -466,19 +678,11 @@ mod hardware {
 
     #[test]
     #[ignore = "needs a PC/SC reader with a SIM; run with --ignored on the reader host"]
-    fn authenticate_usim_runs_in_one_window_and_leaves_the_card() {
+    fn authenticate_usim_reaches_the_card_and_leaves_it() {
         let holder_ctx = context();
         let reader = first_real_reader(&holder_ctx);
 
-        // The card's own IMSI, read at run time: never hard-coded.
-        let imsi = {
-            let mut card = SharedCard::connect(&holder_ctx, &reader).expect("connect failed");
-            let mut tx = card.transaction().expect("transaction failed");
-            let (_, imsi) =
-                PcscTransport::read_transport_identity(&mut tx).expect("reading the IMSI failed");
-            let _ = tx.end(Disposition::LeaveCard);
-            imsi
-        };
+        let imsi = card_imsi(&holder_ctx, &reader);
 
         // Held across the whole AKA: a reset at the window's end or at the
         // transport's release would break its next command.
