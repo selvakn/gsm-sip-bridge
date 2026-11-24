@@ -2138,3 +2138,95 @@ fn card_reader_check_card_error_falls_back() {
     assert!(rig.st.awaiting_card.is_none());
     assert_eq!(rig.st.last_refresh.as_ref().unwrap().1, "error");
 }
+
+// --- a full registration while the card reader's SIM is out of reach (#233) --
+//
+// `on_idle_tick`'s full registration calls the real `attempt_renewal`, which
+// needs a SIM CI does not have, so these tests hand `on_full_renewal_failure`
+// the failure `attempt_renewal` returns.
+
+fn card_unreachable_failure() -> RegisterFailure {
+    RegisterFailure {
+        error: crate::ims::registration_auth::scripted::reset_error(),
+        status: None,
+        retry_after: None,
+    }
+}
+
+fn forbidden_failure() -> RegisterFailure {
+    RegisterFailure {
+        error: BridgeError::Ims("renewal REGISTER rejected: 403 Forbidden".into()),
+        status: Some(403),
+        retry_after: None,
+    }
+}
+
+#[test]
+fn card_reader_unreachable_full_registration_never_spends_the_budget() {
+    let mut rig = Rig::new();
+    rig.pool("127.0.0.2");
+    let target = rig.session.pcscf_addr.ip();
+    for n in 1..=2 * MAX_CONSECUTIVE_RENEWAL_FAILURES {
+        rig.st
+            .on_full_renewal_failure(target, &card_unreachable_failure(), true, true)
+            .unwrap_or_else(|e| panic!("failure {n} exited the agent: {e}"));
+    }
+    assert_eq!(rig.st.consecutive_renewal_failures, 0);
+    assert!(rig.st.next_renewal_attempt.is_some());
+    assert_eq!(rig.st.backoff, RETRY_MAX_BACKOFF);
+    assert!(!rig.st.force_renewal, "no failover");
+    assert!(!rig.st.pool.is_marked(target, SystemTime::now()));
+    assert_eq!(rig.st.pool.candidates(SystemTime::now()).len(), 2);
+}
+
+#[test]
+fn card_reader_other_failures_still_count() {
+    let mut rig = Rig::new();
+    let target = rig.session.pcscf_addr.ip();
+    for n in 1..=MAX_CONSECUTIVE_RENEWAL_FAILURES {
+        rig.st
+            .on_full_renewal_failure(target, &card_unreachable_failure(), true, true)
+            .unwrap();
+        let result = rig
+            .st
+            .on_full_renewal_failure(target, &forbidden_failure(), true, true);
+        assert_eq!(rig.st.consecutive_renewal_failures, n);
+        assert_eq!(
+            result.is_err(),
+            n == MAX_CONSECUTIVE_RENEWAL_FAILURES,
+            "403 number {n}"
+        );
+    }
+}
+
+#[test]
+fn modem_line_unreachable_failures_still_count() {
+    let mut rig = Rig::new();
+    let target = rig.session.pcscf_addr.ip();
+    for n in 1..=MAX_CONSECUTIVE_RENEWAL_FAILURES {
+        let result =
+            rig.st
+                .on_full_renewal_failure(target, &card_unreachable_failure(), true, false);
+        assert_eq!(
+            result.is_err(),
+            n == MAX_CONSECUTIVE_RENEWAL_FAILURES,
+            "failure {n}"
+        );
+    }
+}
+
+#[test]
+fn card_reader_success_after_exempt_failures_clears_the_ladder() {
+    let mut rig = Rig::new();
+    let target = rig.session.pcscf_addr.ip();
+    for _ in 0..3 {
+        rig.st
+            .on_full_renewal_failure(target, &card_unreachable_failure(), true, true)
+            .unwrap();
+    }
+    assert!(rig.st.backoff > RETRY_INITIAL_BACKOFF);
+    rig.st.on_renewal_success();
+    assert_eq!(rig.st.backoff, RETRY_INITIAL_BACKOFF);
+    assert!(rig.st.next_renewal_attempt.is_none());
+    assert_eq!(rig.st.consecutive_renewal_failures, 0);
+}

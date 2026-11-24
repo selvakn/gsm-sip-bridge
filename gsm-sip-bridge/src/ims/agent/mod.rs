@@ -170,6 +170,10 @@ const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(120);
 /// fault that is still there after two and a half minutes reaches the only
 /// component that can do anything about it. See
 /// [`LoopState::schedule_renewal_retry`] for why exiting is the recovery.
+///
+/// A card-reader line's full registration that fails only because its card is
+/// out of reach is not counted: exiting buys an `AT+CFUN` power cycle, which a
+/// card reader cannot use (#233, [`LoopState::on_full_renewal_failure`]).
 const MAX_CONSECUTIVE_RENEWAL_FAILURES: u32 = 6;
 /// How long a fresh registration must last before the network dropping it
 /// reads as a new event rather than as that registration having failed.
@@ -2306,6 +2310,16 @@ impl LoopState {
     /// Exiting is safe here by construction: `on_idle_tick` has already
     /// deferred this renewal through [`MaintenancePolicy`] if a call is in
     /// progress, so no live call is ever cut short by it.
+    ///
+    /// # The exemption: a card reader that cannot reach its card
+    ///
+    /// The remedy an exit buys is `AT+CFUN` on a modem. A card-reader line has
+    /// nothing like it: an exit only restarts the agent, which needs the same
+    /// card to register. So on a card-reader line, a full registration that
+    /// fails only because the card is out of reach is retried on the same
+    /// ladder without being counted (#233, Clarification Q1,
+    /// [`Self::on_full_renewal_failure`]). The line still reports itself
+    /// unregistered, and the registration-loss alert is the escalation.
     /// A renewal succeeded: the registration is live again, so the backoff
     /// ladder and the retry budget both start over. The counterpart to
     /// [`Self::schedule_renewal_retry`] — kept next to it so the two can't
@@ -2494,6 +2508,41 @@ impl LoopState {
         self.next_renewal_attempt = Some(Instant::now() + self.backoff);
         self.backoff = next_backoff(self.backoff, RETRY_MAX_BACKOFF);
         self.count_renewal_failure()
+    }
+
+    /// The next full registration on the backoff ladder, without counting the
+    /// failure on the budget: a card-reader line's card is out of reach
+    /// (#233). The ladder still doubles to [`RETRY_MAX_BACKOFF`], so a card
+    /// that comes back is used within one step.
+    fn schedule_card_retry(&mut self) {
+        self.next_renewal_attempt = Some(Instant::now() + self.backoff);
+        self.backoff = next_backoff(self.backoff, RETRY_MAX_BACKOFF);
+    }
+
+    /// A full registration through `target` failed. On a card-reader line, a
+    /// failure that is only the card being out of reach (at open, or during
+    /// the AKA) is retried without counting toward the exit budget and
+    /// without marking the P-CSCF (#233). Every other failure, and every
+    /// failure on a modem line, takes [`Self::on_renewal_failure`] as before.
+    fn on_full_renewal_failure(
+        &mut self,
+        target: IpAddr,
+        failure: &RegisterFailure,
+        routed: bool,
+        pcsc_reader: bool,
+    ) -> BridgeResult<()> {
+        if pcsc_reader && failure.error.is_card_unreachable() {
+            let retry_in = self.backoff;
+            self.schedule_card_retry();
+            tracing::warn!(
+                retry_in_secs = retry_in.as_secs(),
+                error = %failure.error,
+                "the SIM is out of reach; retrying the registration without counting toward the \
+                 restart budget"
+            );
+            return Ok(());
+        }
+        self.on_renewal_failure(target, failure, routed, SystemTime::now())
     }
 
     /// One more failed renewal on the budget; `Err` once it is spent.
@@ -4519,7 +4568,12 @@ impl LoopState {
                 // every iteration in the meantime (see `next_renewal_attempt`'s
                 // doc comment).
                 let routed = crate::ims::route_to(target, p.reg_cfg.pcscf_port).is_ok();
-                return self.on_renewal_failure(target, &failure, routed, SystemTime::now());
+                return self.on_full_renewal_failure(
+                    target,
+                    &failure,
+                    routed,
+                    p.reg_cfg.pcsc_reader,
+                );
             }
         }
         Ok(())
