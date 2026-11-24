@@ -182,8 +182,8 @@
   - every new string against `grep -rn 'contains(' gsm-sip-bridge/src/supervise`;
   - every new constant against existing ones;
   - modem-line paths untouched (`git diff` restricted to `pcsc_reader` branches).
-- [ ] T038 Live per quickstart §2a–2d on the local rig, with the maintainer's agreement to recreate the rig container. Record exactly what was and was not exercised under Deviations, with IST times. Restore the rig config afterwards.
-- [ ] T039 `make format && make lint && make test`, and commit the docs and spec: `docs: supervisor pacing during a card-reader SIM outage`. Push with an explicit refspec (`git push -u origin 163-pcsc-outage-backoff:163-pcsc-outage-backoff`), open the PR (follow-up to #233/#235), and include the T037 answers and the live results. `greploop` and `/code-review` run only when the maintainer asks.
+- [X] T038 Live per quickstart §2a–2d on the local rig, with the maintainer's agreement to recreate the rig container. Record exactly what was and was not exercised under Deviations, with IST times. Restore the rig config afterwards.
+- [X] T039 `make format && make lint && make test`, and commit the docs and spec: `docs: supervisor pacing during a card-reader SIM outage`. Push with an explicit refspec (`git push -u origin 163-pcsc-outage-backoff:163-pcsc-outage-backoff`), open the PR (follow-up to #233/#235), and include the T037 answers and the live results. `greploop` and `/code-review` run only when the maintainer asks.
 
 ---
 
