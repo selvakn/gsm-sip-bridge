@@ -62,6 +62,13 @@ Greptile has *actually* found here, at least once, and usually more.
       `TunVanished` must actually call `recreate_interface`; a `GivenUp` module
       must be able to transition back to healthy on rediscovery **and** on the
       normal retry path.
+- [ ] A recovery that needs the SIM (anything that builds a new IKE_SA) is
+      gated on the card for card-reader lines, through `card_gate` beside
+      `underlay_gate` in the steady tick (specs/163): paced when there is no
+      IKE_SA to lose, held when it would tear down an established one. A new
+      `DegradeReason` must be classified in `needs_the_sim` (exhaustive, no
+      wildcard), and a new recovery site must call `card_gate` after
+      `underlay_gate`.
 
 ### Latching state (set once, never reset)
 
