@@ -11,9 +11,9 @@
 //! at.
 
 use crate::error::{BridgeError, BridgeResult};
-use crate::modules::pcsc_card::real_reader_candidates;
+use crate::modules::pcsc_card::{real_reader_candidates, SharedCard};
 use crate::modules::usim::{self, ApduTransport};
-use pcsc::{Context, Disposition, Protocols, Scope, ShareMode};
+use pcsc::{Context, Disposition, Scope};
 use std::collections::HashMap;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -144,7 +144,7 @@ pub async fn list_cards(client: &reqwest::Client) -> BridgeResult<Vec<CardRow>> 
             }
         };
 
-        let mut card = match ctx.connect(&reader_cstr, ShareMode::Shared, Protocols::ANY) {
+        let mut card = match SharedCard::connect(&ctx, &reader_cstr) {
             Ok(c) => c,
             Err(pcsc::Error::NoSmartcard) => {
                 rows.push(CardRow {

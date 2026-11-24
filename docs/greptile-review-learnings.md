@@ -154,6 +154,11 @@ Greptile has *actually* found here, at least once, and usually more.
 - [ ] Stateful multi-APDU card sequences (SELECT then READ) run inside a
       **PC/SC transaction**, not `ShareMode::Shared`. Concurrent probes
       interleave and read the wrong file.
+- [ ] Every PC/SC connection goes through `SharedCard`
+      (`modules::pcsc_card`), never a bare `pcsc::Card`. The crate's
+      `Card::drop` resets the card (`SCARD_RESET_CARD`), which breaks every
+      other program's session on that SIM: charon, a sibling line, or this
+      line's own re-authentication (#232).
 - [ ] Device selection is bound to the **line's identity** (match on IMSI), not
       "the first reader that isn't vpcd" — otherwise line 1 authenticates with
       line 0's SIM.
