@@ -40,6 +40,12 @@ pub enum AgentExitOutcome {
     /// answering at all are the same physical fault, and `AT+CFUN=0/1` is the
     /// remedy for both.
     AtStall,
+    /// A card-reader line's agent exited because its SIM could not be reached
+    /// (`ims::agent::CARD_UNREACHABLE_MARKER`, #233 follow-up). Never a modem
+    /// line's outcome ([`classify_exit`]). A card reader has no `AT+CFUN` to
+    /// cycle, so it counts towards nothing here: the supervisor paces the
+    /// restart instead (`supervise::card_outage`).
+    CardUnreachable,
     /// A clean run or a non-CSIM failure — either way, the original script
     /// resets both counters (a non-CSIM failure is a different problem, not
     /// evidence of a dropped USIM continuing).
@@ -86,6 +92,9 @@ impl IncidentCounters {
                     Action::None
                 }
             }
+            // Neither continues nor ends a modem incident: a card-reader line
+            // has no modem, and a CSIM count in progress is left as it was.
+            AgentExitOutcome::CardUnreachable => Action::None,
         }
     }
 
@@ -130,6 +139,32 @@ pub fn has_csim_failure(agent_log: &str) -> bool {
 /// cannot drift out of agreement.
 pub fn has_at_stall(agent_log: &str) -> bool {
     agent_log.contains(crate::ims::agent::watchdog::STALL_MARKER)
+}
+
+/// Whether this run's agent exited because its card-reader SIM could not be
+/// reached. Matches the marker `ims::agent::run` logs immediately before that
+/// exit; [`tests::has_card_unreachable_matches_the_marker_the_agent_emits`]
+/// pins the two sides together.
+pub fn has_card_unreachable(agent_log: &str) -> bool {
+    agent_log.contains(crate::ims::agent::CARD_UNREACHABLE_MARKER)
+}
+
+/// What one agent run's log says about why it exited. A stall is checked
+/// first: a run that stalled may *also* have an older `AT+CSIM failed` earlier
+/// in its log, and the stall is the more specific and more recent explanation.
+/// The card marker counts only on a card-reader line (`pcsc_reader`): only the
+/// PC/SC transport ever produces it, and a modem line must never be paced as
+/// if it had a card reader (FR-003).
+pub fn classify_exit(agent_log: &str, pcsc_reader: bool) -> AgentExitOutcome {
+    if has_at_stall(agent_log) {
+        AgentExitOutcome::AtStall
+    } else if has_csim_failure(agent_log) {
+        AgentExitOutcome::CsimFailure
+    } else if pcsc_reader && has_card_unreachable(agent_log) {
+        AgentExitOutcome::CardUnreachable
+    } else {
+        AgentExitOutcome::Other
+    }
 }
 
 /// How long to wait before restarting an agent, once escalation has run out of
@@ -311,6 +346,64 @@ mod tests {
         ));
         // A deferral is not a stall exit — the process is still alive.
         assert!(!has_at_stall(crate::ims::agent::watchdog::DEFER_MARKER));
+    }
+
+    #[test]
+    fn has_card_unreachable_matches_the_marker_the_agent_emits() {
+        // Pins the two sides together, as for the stall marker: a divergence
+        // would put a card-reader line back on a restart every 5 s.
+        let log = format!(
+            "2026-11-24T10:00:00Z ERROR {} error=IMS error: SIM card unreachable: reader gone",
+            crate::ims::agent::CARD_UNREACHABLE_MARKER
+        );
+        assert!(has_card_unreachable(&log));
+        // The error text alone, without the marker, is not the signal.
+        assert!(!has_card_unreachable(
+            "ERROR error: IMS error: SIM card unreachable: reader gone"
+        ));
+    }
+
+    #[test]
+    fn a_card_unreachable_exit_leaves_the_csim_counters_alone() {
+        let mut c = IncidentCounters::default();
+        c.observe(AgentExitOutcome::CsimFailure);
+        c.observe(AgentExitOutcome::CsimFailure);
+        let before = c;
+        assert_eq!(c.observe(AgentExitOutcome::CardUnreachable), Action::None);
+        assert_eq!(c, before, "neither counted nor reset");
+        // The incident in progress still reaches its threshold.
+        assert_eq!(c.observe(AgentExitOutcome::CsimFailure), Action::ResetSim);
+    }
+
+    #[test]
+    fn classification_prefers_stall_then_csim_then_card() {
+        let card = crate::ims::agent::CARD_UNREACHABLE_MARKER;
+        let stall = crate::ims::agent::watchdog::STALL_MARKER;
+        assert_eq!(
+            classify_exit(&format!("{stall}\n{card}"), true),
+            AgentExitOutcome::AtStall
+        );
+        assert_eq!(
+            classify_exit(&format!("AT+CSIM failed: 0\n{card}"), true),
+            AgentExitOutcome::CsimFailure
+        );
+        assert_eq!(classify_exit(card, true), AgentExitOutcome::CardUnreachable);
+        assert_eq!(classify_exit("exited", true), AgentExitOutcome::Other);
+    }
+
+    #[test]
+    fn a_modem_line_never_classifies_as_card_unreachable() {
+        let card = crate::ims::agent::CARD_UNREACHABLE_MARKER;
+        assert_eq!(classify_exit(card, false), AgentExitOutcome::Other);
+        // Everything else classifies as it always did.
+        assert_eq!(
+            classify_exit(crate::ims::agent::watchdog::STALL_MARKER, false),
+            AgentExitOutcome::AtStall
+        );
+        assert_eq!(
+            classify_exit("AT+CSIM failed: 0", false),
+            AgentExitOutcome::CsimFailure
+        );
     }
 
     #[test]

@@ -13,6 +13,7 @@
 //! modules: `line_supervisor`, `sim_recovery`, `epdg_iface`, `vpcd`, `render`)
 //! keep taking a plain `&dyn CommandRunner`, unchanged.
 
+use super::card_outage::{self, CardOutage};
 use super::engines::{SharedCharon, StrongswanEngine, SwuEngine};
 use super::line_supervisor::{self, TunnelEngine};
 use super::runner::{ChildHandle, ChildSpec, CommandRunner, RealCommandRunner};
@@ -2056,6 +2057,12 @@ fn start_vowifi_line_strongswan(
 
     // Shared with the agent loop: set while a rebuild is syncing the P-CSCF.
     let rebuild_gate = Arc::new(RebuildGate::default());
+    // Shared with the agent loop too: whether this card-reader line's SIM is
+    // out of reach, and the pacing that follows (#233 follow-up). Never built
+    // for a modem line (FR-003).
+    let card_outage = line
+        .pcsc_reader
+        .then(|| Arc::new(Mutex::new(CardOutage::default())));
     // Before the agent starts, so its first marks count (specs/097 R3).
     let negotiated_at = SystemTime::now();
     start_line_tail(
@@ -2066,6 +2073,7 @@ fn start_vowifi_line_strongswan(
         &usim_holder,
         pcscf.clone(),
         Arc::clone(&rebuild_gate),
+        card_outage.clone(),
     );
 
     // Steady-state supervision loop — runs for the container's lifetime.
@@ -3137,6 +3145,7 @@ fn clear_line_gm_state(runner: &dyn CommandRunner, idx: u32, netns: &str) -> (us
 /// keepalive sibling. Both supervision loops run on their own background
 /// threads and this function returns immediately, matching the bash original
 /// backgrounding both with `&`.
+#[allow(clippy::too_many_arguments)]
 fn start_line_tail(
     ctx: &LineStartup,
     idx: u32,
@@ -3145,6 +3154,7 @@ fn start_line_tail(
     usim_holder: &Arc<Mutex<Option<Arc<ChildHandle>>>>,
     initial_pcscf: String,
     rebuild_gate: Arc<RebuildGate>,
+    card_outage: Option<Arc<Mutex<CardOutage>>>,
 ) {
     let runner = ctx.runner;
     let bin = ctx.bin;
@@ -3189,7 +3199,10 @@ fn start_line_tail(
         // 'static thread closure, so it captures the owned `Option` rather than
         // borrowing `line` (which does not outlive the spawn).
         let line_msisdn = line.configured_msisdn();
+        // Config validation guarantees a card-reader line names its card.
+        let card_imsi = line.config.imsi_override.clone().unwrap_or_default();
         std::thread::spawn(move || {
+            let card_check = || card_outage::card_check(runner.as_ref(), &bin, &card_imsi);
             let mut csim_fails = sim_recovery::IncidentCounters::default();
             // specs/022-discord-critical-alerts FR-004 (research.md R2):
             // `Action::GiveUpForThisIncident` already existed but was never
@@ -3276,42 +3289,68 @@ fn start_line_tail(
                 // invisible in the supervise log — only the "exited; restarting"
                 // side of the loop ever shows there. Gated on `had_restart` (so
                 // a clean first startup stays quiet) and latched by
-                // `recovery_logged` (so it prints once per spawn, not every
-                // poll); the file read stops once the line is seen.
-                let mut recovery_logged = false;
+                // `registered_seen` (so it prints once per spawn, not every
+                // poll); the file read stops once the line is seen. A
+                // card-reader line watches from the first spawn too: a
+                // registration ends a card outage (FR-005), whichever thread
+                // began it.
+                let mut registered_seen = false;
                 while runner.is_alive(&handle) {
-                    if had_restart
-                        && !recovery_logged
+                    if (had_restart || card_outage.is_some())
+                        && !registered_seen
                         && runner
                             .read_file(&agent_log)
                             .unwrap_or_default()
                             .contains("registered, listening for inbound calls")
                     {
-                        println!(
-                            "[supervise] line {idx}: vowifi-ims-agent registered after restart loop"
-                        );
-                        recovery_logged = true;
+                        if had_restart {
+                            println!(
+                                "[supervise] line {idx}: vowifi-ims-agent registered after restart loop"
+                            );
+                        }
+                        if let Some(outage) = &card_outage {
+                            let ended = outage
+                                .lock()
+                                .unwrap()
+                                .on_registered(std::time::Instant::now());
+                            if let Some(ended) = ended {
+                                println!("{}", card_outage::transition_line(idx, &ended));
+                            }
+                        }
+                        registered_seen = true;
                     }
                     runner.sleep(Duration::from_secs(1));
                 }
                 had_restart = true;
 
                 let log_content = runner.read_file(&agent_log).unwrap_or_default();
-                // A stall is checked first: a run that stalled may *also* have
-                // an older `AT+CSIM failed` earlier in its log, and the stall is
-                // the more specific and more recent explanation for this exit.
-                let outcome = if sim_recovery::has_at_stall(&log_content) {
-                    sim_recovery::AgentExitOutcome::AtStall
-                } else if sim_recovery::has_csim_failure(&log_content) {
-                    sim_recovery::AgentExitOutcome::CsimFailure
-                } else {
-                    sim_recovery::AgentExitOutcome::Other
-                };
+                let outcome = sim_recovery::classify_exit(&log_content, card_outage.is_some());
                 let action = csim_fails.observe(outcome);
-                let restart_delay = csim_fails.restart_delay(action);
+                // A card that cannot be reached is paced by the line's shared
+                // outage, and waited out with checks so the agent restarts as
+                // soon as the card is back (FR-004, FR-006). `None` for
+                // every other exit, which keeps the plain wait.
+                let card_wait = match (&card_outage, outcome) {
+                    (Some(outage), sim_recovery::AgentExitOutcome::CardUnreachable) => {
+                        let (began, delay) = {
+                            let mut o = outage.lock().unwrap();
+                            (o.on_out(std::time::Instant::now()), o.next_agent_delay())
+                        };
+                        if let Some(began) = began {
+                            println!("{}", card_outage::transition_line(idx, &began));
+                        }
+                        Some((outage, delay))
+                    }
+                    _ => None,
+                };
+                let restart_delay = match card_wait {
+                    Some((_, delay)) => delay,
+                    None => csim_fails.restart_delay(action),
+                };
                 let reason = match outcome {
                     sim_recovery::AgentExitOutcome::AtStall => " (stalled on the modem)",
                     sim_recovery::AgentExitOutcome::CsimFailure => " (AT+CSIM failure)",
+                    sim_recovery::AgentExitOutcome::CardUnreachable => " (SIM card out of reach)",
                     sim_recovery::AgentExitOutcome::Other => "",
                 };
                 println!(
@@ -3358,7 +3397,22 @@ fn start_line_tail(
                     }
                 }
 
-                runner.sleep(restart_delay);
+                match card_wait {
+                    Some((outage, delay)) => {
+                        let end = card_outage::wait_for_card_or(
+                            runner.as_ref(),
+                            outage,
+                            delay,
+                            &std::time::Instant::now,
+                            &card_check,
+                            &|| *shutting_down.read().unwrap(),
+                        );
+                        if let card_outage::WaitEnd::CardBack { ended: Some(ended) } = end {
+                            println!("{}", card_outage::transition_line(idx, &ended));
+                        }
+                    }
+                    None => runner.sleep(restart_delay),
+                }
             }
         });
     }
@@ -3594,6 +3648,8 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
         &usim_holder,
         pcscf.clone(),
         Arc::new(RebuildGate::default()),
+        // An SWu line is never a card-reader line (validated at start-up).
+        None,
     );
 
     let mut current_pcscf = pcscf;
