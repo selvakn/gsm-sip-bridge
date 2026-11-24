@@ -504,6 +504,12 @@ pub struct AgentState {
     /// untouched.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub uplink: Option<UplinkState>,
+    /// Supervisor only: whether this card-reader line's SIM is out of reach,
+    /// so its agent restarts and tunnel attempts are slowed until it is back
+    /// (#233 follow-up, specs/163). Absent on a line with no card reader and
+    /// from an older supervisor; ingest then leaves its state untouched.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub card_hold: Option<bool>,
 }
 
 /// A counter delta or histogram observation. Every enumerated field below is
@@ -1161,6 +1167,30 @@ mod tests {
             r#"{"event":"uplink_hold_ended","cause":"no_response","held_secs":312,"ended_by":"restored"}"#
         );
         assert_eq!(serde_json::from_str::<ObservedEvent>(&json).unwrap(), ended);
+    }
+
+    #[test]
+    fn card_hold_round_trips_and_old_payloads_still_parse() {
+        for hold in [true, false] {
+            let state = AgentState {
+                card_hold: Some(hold),
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(json, format!(r#"{{"card_hold":{hold}}}"#));
+            assert_eq!(
+                serde_json::from_str::<AgentState>(&json).unwrap().card_hold,
+                Some(hold)
+            );
+        }
+        // Omitted when unset, and absent from an older supervisor's report.
+        assert_eq!(serde_json::to_string(&AgentState::default()).unwrap(), "{}");
+        assert_eq!(
+            serde_json::from_str::<AgentState>(r#"{"child_sa_up":true,"uplink":"up"}"#)
+                .unwrap()
+                .card_hold,
+            None
+        );
     }
 
     #[test]

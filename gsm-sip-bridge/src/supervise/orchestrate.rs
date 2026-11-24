@@ -1997,6 +1997,7 @@ fn start_vowifi_line_strongswan(
                 tunnel_flapping: Some(s.flapping),
                 ike_sa_loss_cause: s.loss_cause,
                 uplink: s.uplink,
+                card_hold: s.card_hold,
                 ..Default::default()
             },
             events,
@@ -2008,6 +2009,7 @@ fn start_vowifi_line_strongswan(
         flapping: false,
         loss_cause: None,
         uplink: None,
+        card_hold: None,
     };
     report_tunnel(signal);
 
@@ -2316,6 +2318,7 @@ fn start_vowifi_line_strongswan(
             }
         }
         let uplink_now = underlay_enabled.then(|| underlay.state());
+        let card_hold_now = card_state.as_ref().map(|o| o.lock().unwrap().is_out());
         if underlay_enabled {
             write_uplink_file(
                 runner.as_ref(),
@@ -2329,6 +2332,7 @@ fn start_vowifi_line_strongswan(
             // Sent with the state they describe, so the gauge and the counters
             // move together.
             signal.uplink = uplink_now;
+            signal.card_hold = card_hold_now;
             send_tunnel(signal, std::mem::take(&mut uplink_events));
         }
         report_pcscf_sibling(idx, &current_pcscf, via_sibling_before, &tracking);
@@ -2349,6 +2353,7 @@ fn start_vowifi_line_strongswan(
             &rebuilds,
             last_loss_cause,
             uplink_now,
+            card_hold_now,
             &report_tunnel,
         );
         let after_held_initiation = matches!(
@@ -2585,6 +2590,7 @@ fn start_vowifi_line_strongswan(
                         &rebuilds,
                         last_loss_cause,
                         uplink_now,
+                        card_hold_now,
                         &report_tunnel,
                     );
                 } else if line_supervisor::recovery_restarts_agent(reason) {
@@ -2599,6 +2605,7 @@ fn start_vowifi_line_strongswan(
                     &rebuilds,
                     last_loss_cause,
                     uplink_now,
+                    card_hold_now,
                     &report_tunnel,
                 );
             }
@@ -3037,6 +3044,9 @@ struct TunnelSignal {
     /// The underlay guard's verdict (specs/100); `None` with the guard off, so
     /// the field is never sent and ingest keeps whatever it had.
     uplink: Option<crate::control::protocol::UplinkState>,
+    /// Whether this card-reader line's SIM is out of reach (specs/163);
+    /// `None` on a line with no card reader, so the field is never sent.
+    card_hold: Option<bool>,
 }
 
 /// The event that counts one steady-state recovery of a line (specs/096),
@@ -3147,12 +3157,18 @@ fn line_pool_state(
 
 /// Reports the tunnel signal if, and only if, it differs from the last one
 /// sent; the reporter heartbeats the last state, so only changes need sending.
+///
+/// `card_hold` is read from the line's shared card outage once per tick, so
+/// an outage the agent thread began or ended reaches the daemon on the next
+/// tick through this one path, and the two threads cannot report it
+/// differently (specs/163 FR-014).
 fn sync_tunnel_signal(
     signal: &mut TunnelSignal,
     tracking: &line_supervisor::SteadyTracking,
     rebuilds: &line_supervisor::RebuildWindow,
     loss_cause: Option<crate::control::protocol::IkeSaLossCause>,
     uplink: Option<crate::control::protocol::UplinkState>,
+    card_hold: Option<bool>,
     report: &dyn Fn(TunnelSignal),
 ) {
     let now = TunnelSignal {
@@ -3160,6 +3176,7 @@ fn sync_tunnel_signal(
         flapping: rebuilds.is_flapping(),
         loss_cause,
         uplink,
+        card_hold,
     };
     if now != *signal {
         *signal = now;
@@ -5325,26 +5342,86 @@ mod tests {
                 flapping: false,
                 loss_cause: None,
                 uplink: None,
+                card_hold: None,
             };
             let rebuilds = line_supervisor::RebuildWindow::new(Duration::from_secs(300));
             let mut tracking = line_supervisor::SteadyTracking {
                 child_sa_usable: true,
                 ..Default::default()
             };
-            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, None, None, &report);
+            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, None, None, None, &report);
             assert!(sent.borrow().is_empty(), "nothing changed");
             // A new loss cause alone is a change worth reporting.
             let cause = Some(IkeSaLossCause::CarrierDelete);
-            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, cause, None, &report);
+            sync_tunnel_signal(
+                &mut signal,
+                &tracking,
+                &rebuilds,
+                cause,
+                None,
+                None,
+                &report,
+            );
             assert_eq!(sent.borrow().len(), 1);
             assert_eq!(sent.borrow()[0].loss_cause, cause);
             // ...and the same state again is not.
-            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, cause, None, &report);
+            sync_tunnel_signal(
+                &mut signal,
+                &tracking,
+                &rebuilds,
+                cause,
+                None,
+                None,
+                &report,
+            );
             assert_eq!(sent.borrow().len(), 1);
             tracking.child_sa_usable = false;
-            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, cause, None, &report);
+            sync_tunnel_signal(
+                &mut signal,
+                &tracking,
+                &rebuilds,
+                cause,
+                None,
+                None,
+                &report,
+            );
             assert_eq!(sent.borrow().len(), 2);
             assert!(!sent.borrow()[1].child_sa_up);
+        }
+
+        #[test]
+        fn a_card_hold_is_reported_on_change_and_never_for_a_modem_line() {
+            let sent = RefCell::new(Vec::new());
+            let report = |s: TunnelSignal| sent.borrow_mut().push(s);
+            let mut signal = TunnelSignal {
+                child_sa_up: true,
+                flapping: false,
+                loss_cause: None,
+                uplink: None,
+                card_hold: None,
+            };
+            let rebuilds = line_supervisor::RebuildWindow::new(Duration::from_secs(300));
+            let tracking = line_supervisor::SteadyTracking {
+                child_sa_usable: true,
+                ..Default::default()
+            };
+            // A modem line: never set, never sent.
+            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, None, None, None, &report);
+            assert!(sent.borrow().is_empty());
+            // A card-reader line: its state, then each change once.
+            for (hold, reports) in [(false, 1), (true, 2), (true, 2), (false, 3)] {
+                sync_tunnel_signal(
+                    &mut signal,
+                    &tracking,
+                    &rebuilds,
+                    None,
+                    None,
+                    Some(hold),
+                    &report,
+                );
+                assert_eq!(sent.borrow().len(), reports, "{hold}");
+                assert_eq!(sent.borrow().last().unwrap().card_hold, Some(hold));
+            }
         }
 
         #[test]
@@ -5357,6 +5434,7 @@ mod tests {
                 flapping: false,
                 loss_cause: None,
                 uplink: Some(UplinkState::Up),
+                card_hold: None,
             };
             let rebuilds = line_supervisor::RebuildWindow::new(Duration::from_secs(300));
             let tracking = line_supervisor::SteadyTracking {
@@ -5364,8 +5442,8 @@ mod tests {
                 ..Default::default()
             };
             let held = Some(UplinkState::NoRoute);
-            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, None, held, &report);
-            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, None, held, &report);
+            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, None, held, None, &report);
+            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, None, held, None, &report);
             assert_eq!(sent.borrow().len(), 1, "reported on change only");
             assert_eq!(sent.borrow()[0].uplink, held);
             sync_tunnel_signal(
@@ -5374,6 +5452,7 @@ mod tests {
                 &rebuilds,
                 None,
                 Some(UplinkState::Up),
+                None,
                 &report,
             );
             assert_eq!(sent.borrow().len(), 2);
@@ -5382,7 +5461,7 @@ mod tests {
                 uplink: None,
                 ..signal
             };
-            sync_tunnel_signal(&mut off, &tracking, &rebuilds, None, None, &report);
+            sync_tunnel_signal(&mut off, &tracking, &rebuilds, None, None, None, &report);
             assert_eq!(sent.borrow().len(), 2);
         }
     }

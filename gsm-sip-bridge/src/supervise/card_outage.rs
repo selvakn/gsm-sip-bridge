@@ -739,6 +739,108 @@ mod tests {
         );
     }
 
+    /// Whether `line` carries a run of 10 or more digits (an IMSI, ICCID or
+    /// MSISDN would).
+    fn has_a_subscriber_id(line: &str) -> bool {
+        line.split(|c: char| !c.is_ascii_digit())
+            .any(|run| run.len() >= 10)
+    }
+
+    #[test]
+    fn a_ten_minute_outage_logs_one_began_and_one_ended_line() {
+        // The agent thread over a card outage of 10 minutes (SC-001, SC-005):
+        // every run exits on the card, is paced and waited out with checks,
+        // with one steady tick on a missing IKE_SA between restarts.
+        let base = Instant::now();
+        let mock = MockCommandRunner::new();
+        let clock = sleep_clock(&mock, base);
+        let back_at = base + secs(600);
+        let check = || {
+            if clock() >= back_at {
+                CardVerdict::Present
+            } else {
+                CardVerdict::Out
+            }
+        };
+        let outage = Mutex::new(CardOutage::default());
+        let mut lines = Vec::new();
+        let mut restarts = 0;
+        loop {
+            let now = clock();
+            assert!(now < base + secs(900), "the outage never ended");
+            let (began, delay) = {
+                let mut o = outage.lock().unwrap();
+                (o.on_out(now), o.next_agent_delay())
+            };
+            lines.extend(began.map(|t| transition_line(0, &t)));
+            lines.push(format!(
+                "[supervise] line 0: vowifi-ims-agent exited (SIM card out of reach); restarting in {}s",
+                delay.as_secs()
+            ));
+            let tick = {
+                let mut o = outage.lock().unwrap();
+                let due = o.tunnel_attempt_due(now);
+                let outcome = SteadyOutcome::CardHeld {
+                    skipped: DegradeReason::IkeSaLost,
+                    initiated: due,
+                };
+                after_card_tick(&outcome, None, &mut o, now)
+            };
+            lines.extend(tick.transition.map(|t| transition_line(0, &t)));
+            lines.extend(tick.next_try_in.map(|n| paced_initiation_line(0, n)));
+            match wait_for_card_or(&mock, &outage, delay, &clock, &check, &|| false) {
+                WaitEnd::CardBack { ended } => {
+                    lines.extend(ended.map(|t| transition_line(0, &t)));
+                    break;
+                }
+                WaitEnd::Elapsed => restarts += 1,
+                WaitEnd::Shutdown => unreachable!(),
+            }
+        }
+        let count = |needle: &str| lines.iter().filter(|l| l.contains(needle)).count();
+        assert_eq!(
+            count("SIM card out of reach; agent restarts"),
+            1,
+            "{lines:#?}"
+        );
+        assert_eq!(count("SIM card reachable again after"), 1, "{lines:#?}");
+        assert!(
+            lines.last().unwrap().contains("reachable again after 600s"),
+            "{lines:#?}"
+        );
+        assert!(restarts <= 15, "SC-001: {restarts} restarts");
+        // Each paced line carries its delay, and none names the card.
+        assert!(count("restarting in ") > 0);
+        assert!(lines.iter().all(|l| !has_a_subscriber_id(l)), "{lines:#?}");
+        // Back within one check of the card's return (FR-006).
+        assert!(clock() <= back_at + CARD_CHECK_INTERVAL);
+    }
+
+    #[test]
+    fn a_ten_minute_outage_makes_at_most_six_tunnel_attempts() {
+        // The steady loop ticking every 5 s over 10 minutes with no IKE_SA
+        // (SC-002).
+        let t0 = Instant::now();
+        let mut o = CardOutage::default();
+        o.on_out(t0);
+        let mut attempts = Vec::new();
+        for step in 0..120 {
+            let now = t0 + secs(5 * step);
+            let due = o.tunnel_attempt_due(now);
+            let outcome = SteadyOutcome::CardHeld {
+                skipped: DegradeReason::IkeSaLost,
+                initiated: due,
+            };
+            if after_card_tick(&outcome, None, &mut o, now)
+                .next_try_in
+                .is_some()
+            {
+                attempts.push(5 * step);
+            }
+        }
+        assert_eq!(attempts, [0, 60, 180, 300, 420, 540]);
+    }
+
     #[test]
     fn transition_lines_name_the_line_and_never_the_card() {
         assert_eq!(
