@@ -228,9 +228,12 @@ The supervisor's log lines (stdout, `docker logs`), none of which carries an IMS
 | Paced agent restart | `[supervise] line N: vowifi-ims-agent exited (SIM card out of reach); restarting in Ns` |
 | Paced tunnel initiation | `[supervise] line N: SIM card still out of reach; trying the tunnel once (next try in Ns)` |
 | That initiation built an IKE_SA | `[supervise] line N: IKE_SA re-established after a SIM card hold (…); restarting the IMS agent on the new tunnel` |
+| Card back, agent alive but not registered | `[supervise] line N: SIM card back but vowifi-ims-agent is not registered; restarting it now` |
 
 A held rebuild logs nothing at the default level. The outage ends when a check finds the card or the agent
-registers, and every delay starts again from its first value next time. While it lasts, the tunnel-failure
+registers, and every delay starts again from its first value next time. An agent that rode the outage out
+without exiting is asked for its registration state when it ends, and restarted if it is not registered and
+no call is up, rather than left to its own retry (up to 2 minutes). While it lasts, the tunnel-failure
 alert reads `…; SIM card out of reach, tunnel attempts slowed until it is back`. `vowifi-status`, the `uplink`
 status file and the metrics are unchanged. The pacing starts once the line's tunnel has first come up; a card
 that is out of reach when the bridge starts is handled by the start-up MCC/MNC read's own retries, as before.

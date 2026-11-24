@@ -68,7 +68,12 @@ Greptile has *actually* found here, at least once, and usually more.
       IKE_SA to lose, held when it would tear down an established one. A new
       `DegradeReason` must be classified in `needs_the_sim` (exhaustive, no
       wildcard), and a new recovery site must call `card_gate` after
-      `underlay_gate`.
+      `underlay_gate`. Gate *before* any step that consumes the trigger: a
+      held `TunVanished` gated after `recreate_interface` was forgotten,
+      because the next tick no longer saw the interface missing (#236).
+- [ ] A wait of N seconds is measured on the clock against a deadline, not as
+      the sum of its sleeps, when its steps can block too (a bounded check
+      inside the loop stretched a 120 s wait to ~240 s, #236).
 
 ### Latching state (set once, never reset)
 

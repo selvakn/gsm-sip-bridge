@@ -302,6 +302,67 @@ pub fn paced_initiation_line(idx: u32, next_try_in: Duration) -> String {
     )
 }
 
+/// What the agent thread knows, while one agent run is alive, about whether
+/// that run lived through a card outage (specs/163 SC-003).
+///
+/// An agent that exits on the card is restarted by [`wait_for_card_or`] the
+/// moment the card answers. One that rides the outage out in-process (#233
+/// keeps it alive, and full registrations that fail on the card do not count
+/// towards its exit) retries on its own backoff, up to 2 minutes: found live,
+/// it registered 107 s after the card came back. So when an outage this run
+/// saw ends, the agent thread asks the run whether it is registered, and
+/// restarts it if not ([`restart_after_outage`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OutageWatch {
+    seen: bool,
+}
+
+impl OutageWatch {
+    /// Takes the outage's state on one poll of a live run, and says whether
+    /// an outage the run saw has just ended: true once per outage.
+    pub fn ended(&mut self, card_out: bool) -> bool {
+        let ended = self.seen && !card_out;
+        self.seen = card_out;
+        ended
+    }
+}
+
+/// Whether to restart an agent that lived through a card outage, now that the
+/// card is back: when it says it is not registered and no call is up. A
+/// registration that lapses during a call keeps the call (`docs/observability.md`),
+/// so a call always wins. An agent that does not answer is left alone; the
+/// healthcheck owns that.
+pub fn restart_after_outage(status: &super::runner::AgentStatusProbe, in_call: bool) -> bool {
+    use crate::vowifi::control::ControlMessage;
+    if in_call {
+        return false;
+    }
+    match status {
+        super::runner::AgentStatusProbe::Reply(ControlMessage::RegistrationStatusReply {
+            state,
+            ..
+        }) => !is_registered_state(state),
+        _ => false,
+    }
+}
+
+/// Whether a status reply's `state` is a registration that holds. The agent
+/// sends `format!("{:?}", RegistrationState)` (`ims::agent`), so this compares
+/// against the same derivation, never a hand-written string.
+fn is_registered_state(state: &str) -> bool {
+    use crate::ims::RegistrationState;
+    [RegistrationState::Registered, RegistrationState::Renewing]
+        .iter()
+        .any(|s| format!("{s:?}") == state)
+}
+
+/// The log line for a restart [`restart_after_outage`] decided on.
+pub fn restart_after_outage_line(idx: u32) -> String {
+    format!(
+        "[supervise] line {idx}: SIM card back but vowifi-ims-agent is not registered; restarting it now"
+    )
+}
+
 /// How a [`wait_for_card_or`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitEnd {
@@ -871,6 +932,60 @@ mod tests {
             }
         }
         assert_eq!(attempts, [0, 60, 180, 300, 420, 540]);
+    }
+
+    #[test]
+    fn an_outage_a_run_saw_ends_once() {
+        let mut w = OutageWatch::default();
+        assert!(!w.ended(false), "no outage yet");
+        assert!(!w.ended(true));
+        assert!(!w.ended(true));
+        assert!(w.ended(false), "the outage this run saw is over");
+        assert!(!w.ended(false), "once");
+        // A second outage in the same run is watched again.
+        assert!(!w.ended(true));
+        assert!(w.ended(false));
+    }
+
+    fn status(state: crate::ims::RegistrationState) -> super::super::runner::AgentStatusProbe {
+        super::super::runner::AgentStatusProbe::Reply(
+            crate::vowifi::control::ControlMessage::RegistrationStatusReply {
+                state: format!("{state:?}"),
+                registered_at: None,
+                expires_at: None,
+                last_failure: None,
+                can_answer: false,
+                blocked_reason: None,
+                gm_connection: String::new(),
+                rejection_cooldown_until: None,
+                refresh: None,
+                reg_subscription: String::new(),
+                reg_subscription_last_failure: None,
+                pcscf: None,
+            },
+        )
+    }
+
+    #[test]
+    fn an_unregistered_agent_is_restarted_when_the_card_is_back() {
+        use crate::ims::RegistrationState::*;
+        for (state, restart) in [
+            (Failed, true),
+            (Unregistered, true),
+            (Registering, true),
+            (Registered, false),
+            (Renewing, false),
+        ] {
+            assert_eq!(
+                restart_after_outage(&status(state), false),
+                restart,
+                "{state:?}"
+            );
+            // A call in progress always wins.
+            assert!(!restart_after_outage(&status(state), true), "{state:?}");
+        }
+        let silent = super::super::runner::AgentStatusProbe::NoAnswer("refused".into());
+        assert!(!restart_after_outage(&silent, false));
     }
 
     #[test]

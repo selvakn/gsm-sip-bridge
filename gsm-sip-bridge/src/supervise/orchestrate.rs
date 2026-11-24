@@ -3311,6 +3311,14 @@ fn start_line_tail(
         let line_msisdn = line.configured_msisdn();
         // Config validation guarantees a card-reader line names its card.
         let card_imsi = line.config.imsi_override.clone().unwrap_or_default();
+        // Where this line's agent answers status queries, and its call count,
+        // for the restart after a card outage it lived through (SC-003).
+        let agent_status_addr = format!(
+            "{}:{}",
+            line.veth_local_addr,
+            crate::vowifi::AGENT_A_STATUS_PORT
+        );
+        let pcscf_source_path = line.pcscf_source_path.clone();
         std::thread::spawn(move || {
             let card_check = || card_outage::card_check(runner.as_ref(), &bin, &card_imsi);
             let mut csim_fails = sim_recovery::IncidentCounters::default();
@@ -3405,7 +3413,24 @@ fn start_line_tail(
                 // registration ends a card outage (FR-005), whichever thread
                 // began it.
                 let mut registered_seen = false;
+                // Whether this run lived through a card outage that has just
+                // ended; then a run that is not registered is restarted rather
+                // than left to its own backoff (specs/163 SC-003).
+                let mut outage_watch = card_outage::OutageWatch::default();
                 while runner.is_alive(&handle) {
+                    let card_out = card_state
+                        .as_ref()
+                        .is_some_and(|o| o.lock().unwrap().is_out());
+                    if card_state.is_some()
+                        && outage_watch.ended(card_out)
+                        && card_outage::restart_after_outage(
+                            &runner.agent_status(&agent_status_addr),
+                            line_in_call(runner.as_ref(), &pcscf_source_path),
+                        )
+                    {
+                        println!("{}", card_outage::restart_after_outage_line(idx));
+                        runner.signal(&handle, super::runner::Signal::Term);
+                    }
                     if (had_restart || card_state.is_some())
                         && !registered_seen
                         && runner

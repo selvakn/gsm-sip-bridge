@@ -219,9 +219,10 @@ log): a missing tunnel is tried once at once, then after 60 s, then every
 Ns)`), and a tunnel that is still up is not torn down for a rebuild that could
 not complete. The supervisor checks the card every 5 seconds meanwhile and logs
 `SIM card reachable again after Ns; resuming` when it answers. An agent waiting
-to be restarted then starts at once and registers within seconds; an agent that
-kept running through the outage registers on its own next retry, up to 2 minutes
-later. The tunnel-failure alert names the card while this lasts.
+to be restarted then starts at once and registers within seconds. An agent that
+kept running through the outage and is not registered is restarted too (`SIM
+card back but vowifi-ims-agent is not registered; restarting it now`), unless a
+call is up. The tunnel-failure alert names the card while this lasts.
 
 ## Running on a host with its own pcscd
 
