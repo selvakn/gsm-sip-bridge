@@ -19,13 +19,67 @@
 use crate::error::{BridgeError, BridgeResult};
 use crate::modules::usim::{self, ApduTransport};
 use pcsc::{Card, Context, Disposition, Protocols, Scope, ShareMode, Transaction, MAX_BUFFER_SIZE};
+use std::ffi::CStr;
+use std::ops::{Deref, DerefMut};
 
 /// Reader names pcscd assigns its virtual vpcd slots — never a real reader
 /// we should connect to for IMS-AKA.
 const VPCD_READER_MARKER: &str = "Virtual PCD";
 
+/// A shared PC/SC connection that is always released *leaving* the card.
+///
+/// The `pcsc` crate's own `Card::drop` hard-codes `SCARD_RESET_CARD`
+/// (pcsc 2.9.0 `lib.rs:1668`). A reset invalidates every other program's
+/// session on the same SIM — charon's `eap-sim-pcsc`, a sibling line, or
+/// this line's own re-authentication — whose next command then fails with
+/// "The smart card has been reset" (#232). Every PC/SC connection the bridge
+/// opens goes through this type, never a bare `Card`, so every exit path
+/// (normal scope end, `?`, an early `continue`, a panic's unwind) releases
+/// with `Disposition::LeaveCard`.
+///
+/// If `SCardDisconnect` itself fails, the returned `Card` is
+/// `std::mem::forget`ten instead of dropped, so the resetting `Drop` never
+/// runs. That leaks one `Context` reference until the process exits and
+/// nothing else: the handle is already unusable, and pcscd's own cleanup of
+/// an abandoned handle leaves the card.
+pub(crate) struct SharedCard(Option<Card>);
+
+impl SharedCard {
+    /// Connects to `reader` in shared mode with any protocol. The raw
+    /// `pcsc::Error` is kept so callers can still match on it
+    /// (`pcsc_list` treats `NoSmartcard` as "no card").
+    pub(crate) fn connect(ctx: &Context, reader: &CStr) -> Result<SharedCard, pcsc::Error> {
+        ctx.connect(reader, ShareMode::Shared, Protocols::ANY)
+            .map(|card| SharedCard(Some(card)))
+    }
+}
+
+impl Deref for SharedCard {
+    type Target = Card;
+
+    fn deref(&self) -> &Card {
+        self.0.as_ref().expect("SharedCard used after release")
+    }
+}
+
+impl DerefMut for SharedCard {
+    fn deref_mut(&mut self) -> &mut Card {
+        self.0.as_mut().expect("SharedCard used after release")
+    }
+}
+
+impl Drop for SharedCard {
+    fn drop(&mut self) {
+        if let Some(card) = self.0.take() {
+            if let Err((card, _)) = card.disconnect(Disposition::LeaveCard) {
+                std::mem::forget(card);
+            }
+        }
+    }
+}
+
 pub struct PcscTransport {
-    card: Card,
+    card: SharedCard,
 }
 
 /// Every reader name that isn't a vpcd virtual slot — the candidates worth
@@ -68,13 +122,17 @@ impl PcscTransport {
         }
 
         let mut imsis_seen = Vec::new();
+        // Every candidate this loop rejects (no match, unreadable card, failed
+        // transaction) is released leaving its card when its `SharedCard`
+        // drops at the end of the iteration: another line may be mid-AKA on
+        // it (#232).
         for reader_name in &candidates {
             let reader_cstr = std::ffi::CString::new(reader_name.as_bytes()).map_err(|e| {
                 BridgeError::Ims(format!(
                     "reader name {reader_name:?} has an embedded NUL: {e}"
                 ))
             })?;
-            let mut card = match ctx.connect(&reader_cstr, ShareMode::Shared, Protocols::ANY) {
+            let mut card = match SharedCard::connect(&ctx, &reader_cstr) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(reader = %reader_name, error = %e, "PC/SC connect failed, trying next reader");
@@ -233,5 +291,153 @@ mod tests {
     #[test]
     fn empty_when_no_readers_at_all() {
         assert!(real_reader_candidates(&[]).is_empty());
+    }
+}
+
+/// Hardware-gated tests against the real pcscd and a real reader with a SIM
+/// (#232). No mocks: the point is the release disposition pcscd sees. They
+/// share one physical card, so run them with `--test-threads=1`:
+/// `cargo test -p gsm-sip-bridge pcsc_card::hardware -- --ignored --test-threads=1`.
+#[cfg(test)]
+mod hardware {
+    use super::*;
+    use std::ffi::CString;
+
+    /// SELECT MF asking for the FCP: a harmless read-only command whose
+    /// answer is `9000` (T=1) or `61xx` (T=0).
+    const SELECT_MF: [u8; 7] = [0x00, 0xA4, 0x00, 0x04, 0x02, 0x3F, 0x00];
+
+    fn context() -> Context {
+        Context::establish(Scope::User).expect("pcscd is not running")
+    }
+
+    fn first_real_reader(ctx: &Context) -> CString {
+        let mut buf = [0u8; 2048];
+        let readers: Vec<String> = ctx
+            .list_readers(&mut buf)
+            .expect("PC/SC list_readers failed")
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        let reader = real_reader_candidates(&readers)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("no real PC/SC reader attached; readers seen: {readers:?}"))
+            .clone();
+        CString::new(reader).expect("reader name has an embedded NUL")
+    }
+
+    /// Another program's session on the card: a bare `Card` (deliberately not
+    /// `SharedCard`, so it does not depend on the code under test), connected
+    /// shared, with one command already sent inside a transaction.
+    fn holder(ctx: &Context, reader: &CStr) -> Card {
+        let mut card = ctx
+            .connect(reader, ShareMode::Shared, Protocols::ANY)
+            .expect("holder connect failed: is a SIM in the reader?");
+        let tx = card.transaction().expect("holder transaction failed");
+        let mut buf = [0u8; MAX_BUFFER_SIZE];
+        tx.transmit(&SELECT_MF, &mut buf)
+            .expect("holder's first transmit failed");
+        tx.end(Disposition::LeaveCard)
+            .map_err(|(_, e)| e)
+            .expect("holder end transaction failed");
+        card
+    }
+
+    /// The holder's next command, as status words or the PC/SC error.
+    fn holder_transmit(holder: &Card) -> Result<String, pcsc::Error> {
+        let mut buf = [0u8; MAX_BUFFER_SIZE];
+        holder
+            .transmit(&SELECT_MF, &mut buf)
+            .map(crate::modules::usim::hex_encode)
+    }
+
+    fn assert_holder_still_works(holder: &Card) {
+        let resp = holder_transmit(holder).expect("the holder's session was disturbed");
+        let sw = &resp[resp.len().saturating_sub(4)..];
+        assert!(
+            sw == "9000" || sw.starts_with("61"),
+            "unexpected SW from the holder's SELECT MF: {resp}"
+        );
+    }
+
+    /// Releases the holder leaving the card, so the test itself does not
+    /// reset the SIM for whatever runs next.
+    fn release(holder: Card) {
+        if let Err((card, _)) = holder.disconnect(Disposition::LeaveCard) {
+            std::mem::forget(card);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a PC/SC reader with a SIM; run with --ignored on the reader host"]
+    fn bare_card_drop_resets_other_handles() {
+        // The control: proves this rig can see the bug the other tests guard.
+        let holder_ctx = context();
+        let reader = first_real_reader(&holder_ctx);
+        let holder = holder(&holder_ctx, &reader);
+
+        let other_ctx = context();
+        let bare = other_ctx
+            .connect(&reader, ShareMode::Shared, Protocols::ANY)
+            .expect("second connect failed");
+        drop(bare);
+
+        assert_eq!(holder_transmit(&holder), Err(pcsc::Error::ResetCard));
+        release(holder);
+    }
+
+    #[test]
+    #[ignore = "needs a PC/SC reader with a SIM; run with --ignored on the reader host"]
+    fn shared_card_drop_leaves_other_handles_working() {
+        let holder_ctx = context();
+        let reader = first_real_reader(&holder_ctx);
+        let holder = holder(&holder_ctx, &reader);
+
+        let other_ctx = context();
+        let shared = SharedCard::connect(&other_ctx, &reader).expect("second connect failed");
+        drop(shared);
+
+        assert_holder_still_works(&holder);
+        release(holder);
+    }
+
+    #[test]
+    #[ignore = "needs a PC/SC reader with a SIM; run with --ignored on the reader host"]
+    fn shared_card_released_by_panic_leaves_the_card() {
+        let holder_ctx = context();
+        let reader = first_real_reader(&holder_ctx);
+        let holder = holder(&holder_ctx, &reader);
+
+        let other_ctx = context();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _shared = SharedCard::connect(&other_ctx, &reader).expect("second connect failed");
+            panic!("deliberate panic while the SharedCard is held");
+        }));
+        assert!(unwound.is_err());
+
+        assert_holder_still_works(&holder);
+        release(holder);
+    }
+
+    #[test]
+    #[ignore = "needs a PC/SC reader with a SIM; run with --ignored on the reader host"]
+    fn connect_for_another_imsi_leaves_the_card() {
+        // A sibling line's search: it probes this card, finds the wrong IMSI
+        // and moves on. The rejected candidate must be released leaving it.
+        let holder_ctx = context();
+        let reader = first_real_reader(&holder_ctx);
+        let holder = holder(&holder_ctx, &reader);
+
+        let Err(e) = PcscTransport::connect("001010000000001") else {
+            panic!("a card with the synthetic test IMSI is in the reader");
+        };
+        assert!(
+            e.to_string()
+                .contains("no PC/SC reader has a card matching"),
+            "unexpected error: {e}"
+        );
+
+        assert_holder_still_works(&holder);
+        release(holder);
     }
 }
