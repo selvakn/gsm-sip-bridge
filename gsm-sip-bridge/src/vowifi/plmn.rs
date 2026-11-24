@@ -123,15 +123,28 @@ pub fn run(modem_port: Option<&Path>, pcsc_imsi: Option<&str>) -> ExitCode {
             "vowifi-plmn needs either --modem <port> or --pcsc-imsi <IMSI>".into(),
         )),
     };
+    match &result {
+        Ok(plmn) => println!("{} {}", plmn.mcc, plmn.mnc),
+        Err(e) => eprintln!("error: {e}"),
+    }
+    ExitCode::from(exit_status_for(&result))
+}
+
+/// `vowifi-plmn`'s exit status when the card-reader SIM it was asked to read
+/// cannot be reached (`BridgeError::CardUnreachable`: no reader, no reader
+/// holding that IMSI, reset, removed, pcscd down; #233 follow-up). The
+/// supervisor's card check (`supervise::card_outage::card_check`) reads it as
+/// "the card is out"; every other failure stays `1`, and the start-up PLMN
+/// read treats any non-zero status as a failed attempt, as before.
+pub(crate) const EXIT_CARD_UNREACHABLE: u8 = 3;
+
+/// The exit status [`run`] returns for `result`: 0 on success,
+/// [`EXIT_CARD_UNREACHABLE`] for a card that cannot be reached, 1 otherwise.
+fn exit_status_for<T>(result: &BridgeResult<T>) -> u8 {
     match result {
-        Ok(plmn) => {
-            println!("{} {}", plmn.mcc, plmn.mnc);
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::FAILURE
-        }
+        Ok(_) => 0,
+        Err(e) if e.is_card_unreachable() => EXIT_CARD_UNREACHABLE,
+        Err(_) => 1,
     }
 }
 
@@ -179,6 +192,20 @@ mod tests {
 
     fn scripted(responses: &[&str]) -> AtCommander {
         AtCommander::from_stream(ScriptedStream::new(responses), Duration::from_secs(1))
+    }
+
+    /// The supervisor's card check tells "the card is out" from every other
+    /// failure by this status alone, never by stderr text.
+    #[test]
+    fn an_unreachable_card_exits_3_and_other_errors_exit_1() {
+        let out: BridgeResult<()> = Err(BridgeError::CardUnreachable("reader gone".into()));
+        assert_eq!(exit_status_for(&out), EXIT_CARD_UNREACHABLE);
+        assert_eq!(EXIT_CARD_UNREACHABLE, 3);
+        let ims: BridgeResult<()> = Err(BridgeError::Ims("SIM card unreachable: x".into()));
+        assert_eq!(exit_status_for(&ims), 1);
+        let disc: BridgeResult<()> = Err(BridgeError::Discovery("no EF_AD".into()));
+        assert_eq!(exit_status_for(&disc), 1);
+        assert_eq!(exit_status_for(&Ok::<_, BridgeError>(())), 0);
     }
 
     #[test]
