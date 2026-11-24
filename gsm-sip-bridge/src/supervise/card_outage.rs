@@ -318,6 +318,11 @@ pub enum WaitEnd {
 /// card is out: `delay` in [`CARD_CHECK_INTERVAL`] steps, each starting with a
 /// card check when one is due, returning early when the card is back or the
 /// supervisor is shutting down (FR-006).
+///
+/// `delay` is measured on `clock` against a deadline, not as the sum of the
+/// sleeps: a check can itself take up to [`CARD_CHECK_TIMEOUT`], and counting
+/// only the sleeps let a 120 s delay stretch to about 240 s while checks kept
+/// timing out (PR #236 review).
 pub fn wait_for_card_or(
     runner: &dyn CommandRunner,
     outage: &Mutex<CardOutage>,
@@ -326,10 +331,14 @@ pub fn wait_for_card_or(
     check: &dyn Fn() -> CardVerdict,
     shutting_down: &dyn Fn() -> bool,
 ) -> WaitEnd {
-    let mut waited = Duration::ZERO;
-    while waited < delay {
+    let deadline = clock() + delay;
+    loop {
         if shutting_down() {
             return WaitEnd::Shutdown;
+        }
+        // Before the check, so none starts at or past the deadline.
+        if clock() >= deadline {
+            return WaitEnd::Elapsed;
         }
         match poll_during_outage(outage, clock, check) {
             Some((CardVerdict::Present, ended)) => return WaitEnd::CardBack { ended },
@@ -341,11 +350,12 @@ pub fn wait_for_card_or(
             }
             None => {}
         }
-        let step = CARD_CHECK_INTERVAL.min(delay - waited);
-        runner.sleep(step);
-        waited += step;
+        let left = deadline.saturating_duration_since(clock());
+        if left.is_zero() {
+            return WaitEnd::Elapsed;
+        }
+        runner.sleep(CARD_CHECK_INTERVAL.min(left));
     }
-    WaitEnd::Elapsed
 }
 
 #[cfg(test)]
@@ -572,6 +582,31 @@ mod tests {
         assert_eq!(end, WaitEnd::Elapsed);
         assert_eq!(*mock.sleeps.lock().unwrap(), vec![secs(5); 4]);
         assert!(outage.lock().unwrap().is_out());
+    }
+
+    #[test]
+    fn slow_checks_count_towards_the_delay() {
+        // Every check runs into its 5 s timeout: the 20 s delay still ends
+        // at 20 s, not after 20 s of sleeping plus the checks.
+        let t0 = Instant::now();
+        let mock = MockCommandRunner::new();
+        let checking = std::cell::Cell::new(Duration::ZERO);
+        let clock = || t0 + checking.get() + mock.sleeps.lock().unwrap().iter().sum::<Duration>();
+        let outage = out_since(t0);
+        let end = wait_for_card_or(
+            &mock,
+            &outage,
+            secs(20),
+            &clock,
+            &|| {
+                checking.set(checking.get() + CARD_CHECK_TIMEOUT);
+                CardVerdict::Unknown
+            },
+            &|| false,
+        );
+        assert_eq!(end, WaitEnd::Elapsed);
+        assert_eq!(clock() - t0, secs(20));
+        assert_eq!(*mock.sleeps.lock().unwrap(), vec![secs(5), secs(5)]);
     }
 
     #[test]

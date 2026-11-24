@@ -1555,15 +1555,16 @@ fn tick_underlay(
             // and the first tick after the id frees recreates it and recovers
             // normally — an 11s startup once the old namespaces are gone,
             // against 163s and 195s when they are not.
-            if !engine.recreate_interface(runner) {
-                return SteadyOutcome::Recovered {
-                    reason: DegradeReason::TunUnavailable,
-                    ike_sa_loss_cause: None,
-                };
-            }
+            //
             // Structural, so never held for the uplink, but the
-            // terminate+reinitiate needs the SIM: the interface is back, and
-            // the IKE_SA is kept until the card is too (FR-009).
+            // terminate+reinitiate needs the SIM, so the IKE_SA is kept until
+            // the card is back (FR-009). Gated *before* the interface is
+            // recreated: the recreation consumes the trigger (the next tick
+            // no longer sees the interface missing) without restoring the
+            // carrier address, which only the renegotiation brings, so a
+            // rebuild held after it would be forgotten and leave the line
+            // without a data path once the card returned (PR #236 review).
+            // The missing interface is the held rebuild's pending state.
             if let Some(outcome) = card_gate(
                 engine,
                 runner,
@@ -1573,6 +1574,12 @@ fn tick_underlay(
                 tracking,
             ) {
                 return outcome;
+            }
+            if !engine.recreate_interface(runner) {
+                return SteadyOutcome::Recovered {
+                    reason: DegradeReason::TunUnavailable,
+                    ike_sa_loss_cause: None,
+                };
             }
             engine.terminate(runner);
             engine.reinitiate(runner);
@@ -6687,7 +6694,8 @@ mod tests {
                 assert!(!tracking.agent_restart_owed, "{reason:?}");
             }
         }
-        // The interface itself is still put back: that needs no SIM.
+        // Nor is the interface recreated: that would consume the trigger
+        // without bringing the carrier address back.
         let (engine, mut tracking, _) = due(DegradeReason::TunVanished);
         carded(
             &engine,
@@ -6697,7 +6705,44 @@ mod tests {
             &never_checked,
             None,
         );
-        assert_eq!(*engine.recreate_interface_calls.borrow(), 1);
+        assert_eq!(*engine.recreate_interface_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn a_held_interface_rebuild_is_still_due_when_the_card_is_back() {
+        // PR #236 review: the held rebuild must not be forgotten. The missing
+        // interface stays the trigger until the card returns, then the whole
+        // recovery runs in its usual order.
+        let (engine, mut tracking, _) = due(DegradeReason::TunVanished);
+        for _ in 0..3 {
+            assert!(matches!(
+                carded(
+                    &engine,
+                    &mut tracking,
+                    &UnderlayView::disabled(),
+                    &card_out(false),
+                    &never_checked,
+                    None,
+                ),
+                SteadyOutcome::CardHeld {
+                    skipped: DegradeReason::TunVanished,
+                    initiated: false
+                }
+            ));
+        }
+        let outcome = carded(
+            &engine,
+            &mut tracking,
+            &UnderlayView::disabled(),
+            &CARD_FINE,
+            &|| CardVerdict::Present,
+            None,
+        );
+        assert_eq!(recovered(&outcome), Some(DegradeReason::TunVanished));
+        assert_eq!(
+            *engine.call_order.borrow(),
+            ["recreate_interface", "terminate", "reinitiate"]
+        );
     }
 
     #[test]
