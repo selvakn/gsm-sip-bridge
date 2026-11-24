@@ -27,9 +27,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// How often the card is checked while it is out, whichever of the line's two
-/// threads asks. The same as [`super::underlay::HELD_POLL_INTERVAL`], the
-/// pace the steady loop already polls at around an uplink hold.
-pub const CARD_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// threads asks. It is [`super::underlay::HELD_POLL_INTERVAL`], the pace the
+/// steady loop already polls at around an uplink hold, because that loop
+/// polls at this pace while the card is out ([`steady_pause`]).
+pub const CARD_CHECK_INTERVAL: Duration = super::underlay::HELD_POLL_INTERVAL;
 
 /// The bound on one card check (`timeout` in its argv). A healthy read takes
 /// about 100 ms; charon in the middle of EAP-AKA holds the card for about 1 s.
@@ -719,11 +720,7 @@ mod tests {
     #[test]
     fn the_loop_polls_every_five_seconds_while_the_card_is_out() {
         let steady = crate::supervise::line_supervisor::STEADY_STATE_POLL_INTERVAL;
-        assert_eq!(steady_pause(steady, true), CARD_CHECK_INTERVAL);
-        assert_eq!(
-            CARD_CHECK_INTERVAL,
-            crate::supervise::underlay::HELD_POLL_INTERVAL
-        );
+        assert_eq!(steady_pause(steady, true), secs(5));
         assert_eq!(steady_pause(steady, false), steady);
         // An uplink hold's quicker pause is kept either way.
         let held = crate::supervise::underlay::HELD_POLL_INTERVAL;
