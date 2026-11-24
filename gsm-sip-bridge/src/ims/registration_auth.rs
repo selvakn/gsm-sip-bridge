@@ -334,6 +334,51 @@ mod tests {
     }
 
     #[test]
+    fn run_aka_goes_through_the_transports_authenticate_hook() {
+        // No SIM in CI, so this transport stands in for one. It pins that AKA
+        // reaches the card only through `authenticate_usim`, the hook a
+        // card-reader line overrides to select and authenticate in one PC/SC
+        // transaction (#232): a direct `usim::authenticate` would bypass it.
+        type Seen = Arc<std::sync::Mutex<Option<([u8; 16], [u8; 16])>>>;
+        struct Hooked(Seen);
+        impl ApduTransport for Hooked {
+            fn transmit_apdu(&mut self, apdu: &str) -> BridgeResult<String> {
+                panic!("AKA bypassed authenticate_usim and sent {apdu}");
+            }
+            fn authenticate_usim(
+                &mut self,
+                rand: &[u8; 16],
+                autn: &[u8; 16],
+            ) -> BridgeResult<AkaResult> {
+                *self.0.lock().unwrap() = Some((*rand, *autn));
+                Ok(AkaResult::Success {
+                    res: vec![0x11; 8],
+                    ck: vec![0x22; 16],
+                    ik: vec![0x33; 16],
+                })
+            }
+        }
+
+        let mut nonce = [0u8; 32];
+        nonce[..16].fill(0xA1);
+        nonce[16..].fill(0xB2);
+        let nonce = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce);
+        let header = format!(
+            "Digest realm=\"ims.example\", nonce=\"{nonce}\", algorithm=AKAv1-MD5, qop=\"auth\""
+        );
+        let challenge = extract_challenge(&parse_digest_challenge(&header).unwrap()).unwrap();
+
+        let seen: Seen = Arc::default();
+        let mut card = Hooked(Arc::clone(&seen));
+        let AkaResult::Success { res, .. } = crate::ims::run_aka(&mut card, &challenge).unwrap()
+        else {
+            panic!("expected the hook's scripted success");
+        };
+        assert_eq!(res, vec![0x11; 8]);
+        assert_eq!(*seen.lock().unwrap(), Some(([0xA1; 16], [0xB2; 16])));
+    }
+
+    #[test]
     fn work_is_overdue_after_the_timeout() {
         let work = Reauthentication::spawn(job(), card(vec![success_reply()], Duration::ZERO));
         assert!(!work.overdue(Instant::now()));

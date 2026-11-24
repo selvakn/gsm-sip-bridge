@@ -1078,16 +1078,21 @@ fn open_modem_waiting<T, E: std::fmt::Display>(
     }
 }
 
-/// The SIM, opened and with its USIM application selected, plus the identities
-/// read alongside it.
+/// The SIM, opened, plus the identities read alongside it. A modem line's USIM
+/// application is selected at open. A card-reader line's is not: it selects
+/// the USIM inside each AKA's own PC/SC transaction
+/// (`PcscTransport::authenticate_usim`), because another program sharing the
+/// card could re-select in between (#232).
 pub(crate) struct OpenedCard {
     pub(crate) card: Box<dyn ApduTransport>,
     pub(crate) imsi: String,
     pub(crate) imei: String,
 }
 
-/// Opens the line's SIM, whichever way it is reached, and selects the USIM.
-/// The initial registration and a background re-authentication both start here.
+/// Opens the line's SIM, whichever way it is reached. On a modem line it also
+/// selects the USIM; a card-reader line selects inside each AKA instead (see
+/// [`OpenedCard`]). The initial registration and a background
+/// re-authentication both start here.
 pub(crate) fn open_card(cfg: &ImsRegisterConfig) -> BridgeResult<OpenedCard> {
     // A pcsc_reader line's SIM sits in a real PC/SC reader, not the modem at
     // `modem_port` (specs/023-omnikey-pcsc-vowifi). Only one `AtCommander` is
@@ -1134,9 +1139,14 @@ pub(crate) fn open_card(cfg: &ImsRegisterConfig) -> BridgeResult<OpenedCard> {
     tracing::info!(imsi = %imsi, "read IMSI from SIM");
     tracing::info!(imei = %imei, "read IMEI from modem");
 
-    let aid = usim::discover_usim_aid(card.as_mut())?;
-    usim::select_usim(card.as_mut(), &aid)?;
-    tracing::info!(aid = %aid.iter().map(|b| format!("{b:02X}")).collect::<String>(), "selected USIM application");
+    // A card-reader line found its USIM AID while identifying the card and
+    // selects it inside each AKA's transaction; selecting it here, outside
+    // one, would protect nothing.
+    if !cfg.pcsc_reader {
+        let aid = usim::discover_usim_aid(card.as_mut())?;
+        usim::select_usim(card.as_mut(), &aid)?;
+        tracing::info!(aid = %aid.iter().map(|b| format!("{b:02X}")).collect::<String>(), "selected USIM application");
+    }
 
     Ok(OpenedCard { card, imsi, imei })
 }
@@ -1160,7 +1170,7 @@ pub(crate) fn run_aka(
     let mut autn_arr = [0u8; 16];
     rand_arr.copy_from_slice(&nonce_bytes[0..16]);
     autn_arr.copy_from_slice(&nonce_bytes[16..32]);
-    usim::authenticate(card, &rand_arr, &autn_arr)
+    card.authenticate_usim(&rand_arr, &autn_arr)
 }
 
 pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<RegisteredSession> {

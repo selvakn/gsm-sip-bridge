@@ -80,6 +80,11 @@ impl Drop for SharedCard {
 
 pub struct PcscTransport {
     card: SharedCard,
+    /// The USIM application's AID, found by the probe that identified this
+    /// card in `connect`. `authenticate_usim` selects it inside each AKA
+    /// transaction. It never changes: a swapped card fails the next command
+    /// whatever we cached.
+    aid: Vec<u8>,
 }
 
 /// Every reader name that isn't a vpcd virtual slot — the candidates worth
@@ -151,7 +156,7 @@ impl PcscTransport {
             // access to the card for its duration.
             let probe = match card.transaction() {
                 Ok(mut tx) => {
-                    let result = Self::read_transport_imsi(&mut tx);
+                    let result = Self::read_transport_identity(&mut tx);
                     let _ = tx.end(Disposition::LeaveCard);
                     result
                 }
@@ -160,11 +165,11 @@ impl PcscTransport {
                 ))),
             };
             match probe {
-                Ok(imsi) if imsi == target_imsi => {
+                Ok((aid, imsi)) if imsi == target_imsi => {
                     tracing::info!(reader = %reader_name, "connected to PC/SC reader");
-                    return Ok(Self { card });
+                    return Ok(Self { card, aid });
                 }
-                Ok(other_imsi) => {
+                Ok((_, other_imsi)) => {
                     tracing::debug!(
                         reader = %reader_name,
                         imsi = %other_imsi,
@@ -184,23 +189,27 @@ impl PcscTransport {
         )))
     }
 
-    fn read_transport_imsi(t: &mut dyn ApduTransport) -> BridgeResult<String> {
+    /// The card's USIM AID and its IMSI, read in one pass: the AID is what
+    /// `authenticate_usim` selects later, the IMSI is what `connect` matches.
+    fn read_transport_identity(t: &mut dyn ApduTransport) -> BridgeResult<(Vec<u8>, String)> {
         let aid = usim::discover_usim_aid(t)?;
         usim::select_usim(t, &aid)?;
-        usim::read_imsi(t)
+        let imsi = usim::read_imsi(t)?;
+        Ok((aid, imsi))
     }
 
-    /// Runs `f` with exclusive access to the card, for a multi-step
-    /// SELECT-then-READ sequence whose correctness depends on nothing else
-    /// re-selecting a file in between.
+    /// Runs `f` with exclusive access to the card, for a multi-step sequence
+    /// whose correctness depends on nothing else re-selecting a file in
+    /// between.
     ///
     /// `ShareMode::Shared` means charon's `eap-sim-pcsc` (or a sibling line)
     /// can be mid-EAP on this same card; an interleaved SELECT landing
     /// between our own SELECT and READ BINARY would have us read the wrong
     /// file and believe it — the same hazard the candidate probe in
-    /// `connect` already holds a transaction for. Single-APDU work
-    /// (AUTHENTICATE during registration, which carries its own data and
-    /// depends on no prior selection surviving) does not need this.
+    /// `connect` already holds a transaction for. AUTHENTICATE has the same
+    /// need: it is addressed to the selected USIM ADF, and its GET RESPONSE
+    /// must follow on the same channel, which is why `authenticate_usim`
+    /// runs SELECT and AUTHENTICATE inside one transaction (#232).
     pub fn with_transaction<T>(
         &mut self,
         f: impl FnOnce(&mut dyn ApduTransport) -> BridgeResult<T>,
@@ -224,6 +233,20 @@ impl ApduTransport for PcscTransport {
             .transmit(&apdu, &mut recv_buf)
             .map_err(|e| BridgeError::Ims(format!("PC/SC transmit failed: {e}")))?;
         Ok(crate::modules::usim::hex_encode(rapdu))
+    }
+
+    /// Selects the USIM and authenticates inside one PC/SC transaction, so
+    /// no other program's SELECT (or reset) can land between our SELECT,
+    /// AUTHENTICATE and GET RESPONSE. Other programs wait for the
+    /// transaction, which lasts only for these four commands. Each call is
+    /// its own transaction, so a resynchronisation gets a fresh one.
+    fn authenticate_usim(
+        &mut self,
+        rand: &[u8; 16],
+        autn: &[u8; 16],
+    ) -> BridgeResult<usim::AkaResult> {
+        let aid = self.aid.clone();
+        self.with_transaction(|t| usim::select_and_authenticate(t, &aid, rand, autn))
     }
 }
 
@@ -436,6 +459,44 @@ mod hardware {
                 .contains("no PC/SC reader has a card matching"),
             "unexpected error: {e}"
         );
+
+        assert_holder_still_works(&holder);
+        release(holder);
+    }
+
+    #[test]
+    #[ignore = "needs a PC/SC reader with a SIM; run with --ignored on the reader host"]
+    fn authenticate_usim_runs_in_one_window_and_leaves_the_card() {
+        let holder_ctx = context();
+        let reader = first_real_reader(&holder_ctx);
+
+        // The card's own IMSI, read at run time: never hard-coded.
+        let imsi = {
+            let mut card = SharedCard::connect(&holder_ctx, &reader).expect("connect failed");
+            let mut tx = card.transaction().expect("transaction failed");
+            let (_, imsi) =
+                PcscTransport::read_transport_identity(&mut tx).expect("reading the IMSI failed");
+            let _ = tx.end(Disposition::LeaveCard);
+            imsi
+        };
+
+        // Held across the whole AKA: a reset at the window's end or at the
+        // transport's release would break its next command.
+        let holder = holder(&holder_ctx, &reader);
+
+        let mut transport = PcscTransport::connect(&imsi).expect("connect by IMSI failed");
+        // A bogus AUTN: the card answers with a MAC failure, which is harmless
+        // (no SQN change). What matters is that the error comes from the card
+        // inside the window, not from starting it or from a transmit.
+        let Err(e) = transport.authenticate_usim(&[0x11; 16], &[0x22; 16]) else {
+            panic!("the card accepted a bogus AUTN");
+        };
+        let msg = e.to_string();
+        assert!(
+            msg.contains("AUTHENTICATE failed"),
+            "unexpected error: {msg}"
+        );
+        drop(transport);
 
         assert_holder_still_works(&holder);
         release(holder);

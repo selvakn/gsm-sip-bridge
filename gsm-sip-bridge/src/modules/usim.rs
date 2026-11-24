@@ -22,6 +22,19 @@ const SW_SUCCESS: &str = "9000";
 /// RECORD/AUTHENTICATE logic below runs unchanged over either one.
 pub trait ApduTransport {
     fn transmit_apdu(&mut self, apdu_hex: &str) -> BridgeResult<String>;
+
+    /// Runs AKA AUTHENTICATE for a network challenge. This is the only way
+    /// AKA reaches the card (`ims::run_aka` calls it).
+    ///
+    /// The default authenticates against the USIM ADF the caller already
+    /// selected (a modem line selects it when the card is opened).
+    /// `PcscTransport` overrides it to select the USIM and authenticate inside
+    /// one PC/SC transaction, because a shared card-reader SIM can be
+    /// re-selected by another program between our SELECT and AUTHENTICATE, or
+    /// between AUTHENTICATE and its GET RESPONSE (#232).
+    fn authenticate_usim(&mut self, rand: &[u8; 16], autn: &[u8; 16]) -> BridgeResult<AkaResult> {
+        authenticate(self, rand, autn)
+    }
 }
 
 impl ApduTransport for AtCommander {
@@ -281,12 +294,18 @@ pub fn select_usim(at: &mut dyn ApduTransport, aid: &[u8]) -> BridgeResult<()> {
 /// currently-selected USIM ADF, given a 16-byte RAND and 16-byte AUTN from
 /// the network challenge.
 ///
+/// AUTHENTICATE is addressed to the selected ADF, and a `61XX` answer's
+/// GET RESPONSE must follow on the same channel, so nothing may re-select a
+/// file in between. On a modem line nothing else talks to the card through
+/// this port. A card-reader line runs this inside a PC/SC transaction,
+/// through [`select_and_authenticate`] (`PcscTransport::authenticate_usim`).
+///
 /// Handles both the classic two-step flow (SW=61XX "more data available" ->
 /// follow-up GET RESPONSE) and modems that auto-chain GET RESPONSE and
 /// return the full result directly with SW=9000 (observed on the Quectel
 /// EC200U).
-pub fn authenticate(
-    at: &mut dyn ApduTransport,
+pub fn authenticate<T: ApduTransport + ?Sized>(
+    at: &mut T,
     rand: &[u8; 16],
     autn: &[u8; 16],
 ) -> BridgeResult<AkaResult> {
@@ -307,6 +326,21 @@ pub fn authenticate(
     }
     let data = hex_decode(&resp[..resp.len() - 4])?;
     parse_authenticate_response(&data)
+}
+
+/// Selects the USIM ADF by `aid`, then runs AUTHENTICATE (with its GET
+/// RESPONSE) against it: SELECT MF, SELECT AID, AUTHENTICATE, GET RESPONSE on
+/// `61XX`. A failed SELECT returns before AUTHENTICATE is sent. The caller
+/// holds exclusive access to the card for the whole sequence
+/// (`PcscTransport::authenticate_usim` runs it inside one PC/SC transaction).
+pub(crate) fn select_and_authenticate(
+    t: &mut dyn ApduTransport,
+    aid: &[u8],
+    rand: &[u8; 16],
+    autn: &[u8; 16],
+) -> BridgeResult<AkaResult> {
+    select_usim(t, aid)?;
+    authenticate(t, rand, autn)
 }
 
 /// Parse the AUTHENTICATE response data object (TS 31.102 §7.1.2.1):
@@ -467,6 +501,68 @@ mod tests {
                 .pop_front()
                 .ok_or_else(|| BridgeError::Ims("no more scripted responses".into()))
         }
+    }
+
+    /// Like `QueuedTransport`, but also records every APDU it was sent, so a
+    /// test can pin the exact command order.
+    struct RecordingTransport {
+        replies: std::collections::VecDeque<String>,
+        sent: Vec<String>,
+    }
+
+    impl RecordingTransport {
+        fn new(replies: &[&str]) -> Self {
+            Self {
+                replies: replies.iter().map(|r| r.to_string()).collect(),
+                sent: Vec::new(),
+            }
+        }
+    }
+
+    impl ApduTransport for RecordingTransport {
+        fn transmit_apdu(&mut self, apdu_hex: &str) -> BridgeResult<String> {
+            self.sent.push(apdu_hex.to_string());
+            self.replies
+                .pop_front()
+                .ok_or_else(|| BridgeError::Ims("no more scripted responses".into()))
+        }
+    }
+
+    const TEST_AID: &str = "A0000000871002FFF605FF89000001FF";
+
+    #[test]
+    fn select_and_authenticate_selects_then_authenticates_in_order() {
+        let success = format!(
+            "DB08{}10{}10{}9000",
+            "11".repeat(8),
+            "22".repeat(16),
+            "33".repeat(16)
+        );
+        let mut t = RecordingTransport::new(&["9000", "9000", "6135", &success]);
+        let aid = hex_decode(TEST_AID).unwrap();
+        let result = select_and_authenticate(&mut t, &aid, &[0x11; 16], &[0x22; 16]).unwrap();
+        assert!(matches!(result, AkaResult::Success { .. }));
+        assert_eq!(
+            t.sent,
+            vec![
+                "00A4000C023F00".to_string(),
+                format!("00A4040C10{TEST_AID}"),
+                format!("008800812210{}10{}", "11".repeat(16), "22".repeat(16)),
+                "00C0000035".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn select_and_authenticate_stops_when_select_fails() {
+        let mut t = RecordingTransport::new(&["9000", "6A82"]);
+        let aid = hex_decode(TEST_AID).unwrap();
+        assert!(select_and_authenticate(&mut t, &aid, &[0x11; 16], &[0x22; 16]).is_err());
+        assert!(
+            !t.sent.iter().any(|apdu| apdu.starts_with("0088")),
+            "AUTHENTICATE sent after a failed SELECT: {:?}",
+            t.sent
+        );
     }
 
     #[test]
