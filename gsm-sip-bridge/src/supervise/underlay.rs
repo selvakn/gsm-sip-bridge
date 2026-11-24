@@ -505,6 +505,11 @@ impl UnderlayTracker {
                 self.pending_check = None;
                 started
             }
+            // A recovery held for a card-reader line's SIM (#233 follow-up)
+            // says nothing about the uplink: no hold starts, and a liveness
+            // check that is out keeps its mark and clock, so the recovery it
+            // was for does not send a second one when the card is back.
+            SteadyOutcome::CardHeld { .. } => None,
             // Whatever made the check necessary is gone or has been acted on.
             SteadyOutcome::StillUp
             | SteadyOutcome::PcscfChanged { .. }
@@ -1186,6 +1191,34 @@ mod tests {
                 DegradeReason::ChildSaStuck
             ]
         );
+    }
+
+    #[test]
+    fn a_card_hold_starts_no_uplink_hold() {
+        // specs/163 FR-011a: a recovery held for a card-reader SIM leaves the
+        // uplink surface alone, and the liveness check that is out keeps its
+        // mark and clock.
+        let mut clock = Clock::new();
+        let mut t = tracker();
+        clock.begin(&mut t, &quiet());
+        let (now, at) = clock.next();
+        let deferred = SteadyOutcome::Deferred {
+            reason: DegradeReason::PcscfPoolExhausted,
+        };
+        assert!(t.end_tick(&deferred, mark(), now, at).is_none());
+        let pending = t.pending_check;
+        assert!(pending.is_some());
+        let (now, at) = clock.next();
+        for initiated in [false, true] {
+            let card = SteadyOutcome::CardHeld {
+                skipped: DegradeReason::PcscfPoolExhausted,
+                initiated,
+            };
+            assert!(t.end_tick(&card, mark(), now, at).is_none());
+        }
+        assert_eq!(t.state(), UplinkState::Up);
+        assert!(t.hold.is_none());
+        assert_eq!(t.pending_check, pending);
     }
 
     #[test]

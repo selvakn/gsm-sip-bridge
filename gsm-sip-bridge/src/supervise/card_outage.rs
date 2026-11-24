@@ -248,6 +248,59 @@ pub fn poll_during_outage(
     Some((verdict, transition))
 }
 
+/// What the steady loop does with one tick's outcome on a card-reader line,
+/// for its log and report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CardTickReport {
+    /// The outage began or ended on this tick's check.
+    pub transition: Option<CardTransition>,
+    /// The tick made a paced initiation; the next may go after this long.
+    pub next_try_in: Option<Duration>,
+}
+
+/// The steady loop's bookkeeping after a tick on a card-reader line:
+/// records what the card gate's own check found (`gate_verdict`, `None` when
+/// the tick did not check), then a paced initiation the tick made. In that
+/// order, so an outage the check just found counts the initiation it allowed
+/// as its first.
+pub fn after_card_tick(
+    outcome: &super::line_supervisor::SteadyOutcome,
+    gate_verdict: Option<CardVerdict>,
+    outage: &mut CardOutage,
+    now: Instant,
+) -> CardTickReport {
+    let transition = gate_verdict.and_then(|v| outage.record(v, now));
+    let next_try_in = match outcome {
+        super::line_supervisor::SteadyOutcome::CardHeld {
+            initiated: true, ..
+        } => Some(outage.tunnel_attempted(now)),
+        _ => None,
+    };
+    CardTickReport {
+        transition,
+        next_try_in,
+    }
+}
+
+/// The steady loop's pause before its next tick: no longer than
+/// [`CARD_CHECK_INTERVAL`] while the card is out, so its return is noticed
+/// within seconds (research D10), and `pause` otherwise.
+pub fn steady_pause(pause: Duration, card_out: bool) -> Duration {
+    if card_out {
+        pause.min(CARD_CHECK_INTERVAL)
+    } else {
+        pause
+    }
+}
+
+/// The log line for a paced initiation (contracts/operator-surface.md).
+pub fn paced_initiation_line(idx: u32, next_try_in: Duration) -> String {
+    format!(
+        "[supervise] line {idx}: SIM card still out of reach; trying the tunnel once (next try in {}s)",
+        next_try_in.as_secs()
+    )
+}
+
 /// How a [`wait_for_card_or`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitEnd {
@@ -589,6 +642,101 @@ mod tests {
         );
         assert_eq!(end, WaitEnd::CardBack { ended: None });
         assert!(mock.sleeps.lock().unwrap().is_empty());
+    }
+
+    use crate::supervise::line_supervisor::{DegradeReason, SteadyOutcome};
+
+    fn card_held(initiated: bool) -> SteadyOutcome {
+        SteadyOutcome::CardHeld {
+            skipped: DegradeReason::IkeSaLost,
+            initiated,
+        }
+    }
+
+    #[test]
+    fn a_paced_initiation_is_recorded_after_the_tick() {
+        let t0 = Instant::now();
+        let mut o = out_since(t0).into_inner().unwrap();
+        let report = after_card_tick(&card_held(true), None, &mut o, t0);
+        assert_eq!(
+            report,
+            CardTickReport {
+                transition: None,
+                next_try_in: Some(secs(60)),
+            }
+        );
+        assert!(!o.tunnel_attempt_due(t0 + secs(59)));
+        // A held tick with nothing initiated changes nothing.
+        let before = o.clone();
+        let report = after_card_tick(&card_held(false), None, &mut o, t0 + secs(5));
+        assert_eq!(report, CardTickReport::default());
+        assert_eq!(o, before);
+    }
+
+    #[test]
+    fn the_gates_own_out_begins_the_outage_and_counts_its_first_attempt() {
+        let t0 = Instant::now();
+        let mut o = CardOutage::default();
+        let report = after_card_tick(&card_held(true), Some(CardVerdict::Out), &mut o, t0);
+        assert_eq!(report.transition, Some(CardTransition::Began));
+        assert_eq!(report.next_try_in, Some(secs(60)));
+        assert!(o.is_out());
+        assert!(!o.check_due(t0), "the gate's check counts as one");
+        // A present or unknown check on a tick that ran the recovery.
+        let recovered = SteadyOutcome::Recovered {
+            reason: DegradeReason::IkeSaLost,
+            ike_sa_loss_cause: None,
+        };
+        let mut fine = CardOutage::default();
+        let report = after_card_tick(&recovered, Some(CardVerdict::Unknown), &mut fine, t0);
+        assert_eq!(report, CardTickReport::default());
+        assert!(!fine.is_out());
+        let report = after_card_tick(&recovered, Some(CardVerdict::Present), &mut o, t0 + secs(9));
+        assert_eq!(
+            report.transition,
+            Some(CardTransition::Ended { held_for: secs(9) })
+        );
+    }
+
+    #[test]
+    fn the_held_initiation_restart_is_left_to_the_tick() {
+        // `HeldInitiationEstablished` restarts the agent through the loop's
+        // existing handling; the card's bookkeeping neither blocks nor
+        // repeats it, and the outage stays until a check or a registration.
+        let t0 = Instant::now();
+        let mut o = out_since(t0).into_inner().unwrap();
+        let established = SteadyOutcome::HeldInitiationEstablished {
+            new_pcscf: "10.0.0.11".into(),
+        };
+        assert!(crate::supervise::line_supervisor::outcome_restarts_agent(
+            &established
+        ));
+        let report = after_card_tick(&established, None, &mut o, t0 + secs(30));
+        assert_eq!(report, CardTickReport::default());
+        assert!(o.is_out());
+    }
+
+    #[test]
+    fn the_loop_polls_every_five_seconds_while_the_card_is_out() {
+        let steady = crate::supervise::line_supervisor::STEADY_STATE_POLL_INTERVAL;
+        assert_eq!(steady_pause(steady, true), CARD_CHECK_INTERVAL);
+        assert_eq!(
+            CARD_CHECK_INTERVAL,
+            crate::supervise::underlay::HELD_POLL_INTERVAL
+        );
+        assert_eq!(steady_pause(steady, false), steady);
+        // An uplink hold's quicker pause is kept either way.
+        let held = crate::supervise::underlay::HELD_POLL_INTERVAL;
+        assert_eq!(steady_pause(held, true), held);
+        assert_eq!(steady_pause(held, false), held);
+    }
+
+    #[test]
+    fn the_paced_initiation_line_carries_its_delay() {
+        assert_eq!(
+            paced_initiation_line(1, secs(120)),
+            "[supervise] line 1: SIM card still out of reach; trying the tunnel once (next try in 120s)"
+        );
     }
 
     #[test]

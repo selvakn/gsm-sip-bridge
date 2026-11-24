@@ -2060,7 +2060,7 @@ fn start_vowifi_line_strongswan(
     // Shared with the agent loop too: whether this card-reader line's SIM is
     // out of reach, and the pacing that follows (#233 follow-up). Never built
     // for a modem line (FR-003).
-    let card_outage = line
+    let card_state = line
         .pcsc_reader
         .then(|| Arc::new(Mutex::new(CardOutage::default())));
     // Before the agent starts, so its first marks count (specs/097 R3).
@@ -2073,7 +2073,7 @@ fn start_vowifi_line_strongswan(
         &usim_holder,
         pcscf.clone(),
         Arc::clone(&rebuild_gate),
-        card_outage.clone(),
+        card_state.clone(),
     );
 
     // Steady-state supervision loop — runs for the container's lifetime.
@@ -2113,10 +2113,23 @@ fn start_vowifi_line_strongswan(
             &mut written_uplink,
         );
     }
+    // This line's card check, for the card gate and the polling while its
+    // card is out. Config validation guarantees a card-reader line names its
+    // card; a modem line never runs it.
+    let card_imsi = line.config.imsi_override.clone().unwrap_or_default();
+    let card_check = || card_outage::card_check(runner.as_ref(), ctx.bin, &card_imsi);
+    // Whether the agent restart a held initiation owes was owed by a card
+    // hold's paced initiation rather than an uplink hold's, for its log line.
+    let mut owed_by_card = false;
     loop {
         // Quicker while a hold is on, so the path coming back is noticed within
-        // seconds instead of up to a whole tick later (specs/100 SC-003).
-        let pause = underlay.poll_after(std::time::Instant::now());
+        // seconds instead of up to a whole tick later (specs/100 SC-003), and
+        // while the card is out, for the same reason (specs/163 D10).
+        let card_out = card_state
+            .as_ref()
+            .is_some_and(|o| o.lock().unwrap().is_out());
+        let pause =
+            card_outage::steady_pause(underlay.poll_after(std::time::Instant::now()), card_out);
         runner.sleep(pause);
         // Held across the whole tick_steady_state call, not just a one-off
         // check before it: Greptile P1 (round 2) caught that a plain
@@ -2204,6 +2217,40 @@ fn start_vowifi_line_strongswan(
         } else {
             line_supervisor::UnderlayView::disabled()
         };
+        // While the card is out it is checked here every 5 s, shared with the
+        // agent thread, so its return is noticed with no recovery due
+        // (specs/163 D10); then the view the tick's card gate works from.
+        let card_view = match &card_state {
+            Some(outage) => {
+                if let Some((_, Some(transition))) =
+                    card_outage::poll_during_outage(outage, &std::time::Instant::now, &card_check)
+                {
+                    println!("{}", card_outage::transition_line(idx, &transition));
+                }
+                let o = outage.lock().unwrap();
+                line_supervisor::CardView {
+                    pcsc_reader: true,
+                    outage: o.is_out(),
+                    attempt_due: o.tunnel_attempt_due(std::time::Instant::now()),
+                }
+            }
+            None => line_supervisor::CardView::none(),
+        };
+        // The card gate's own check, made when a recovery that needs the SIM
+        // is due with no outage yet; recorded after the tick. Rate-limited
+        // with the agent thread's checks, and never run under the lock.
+        let gate_verdict = std::cell::Cell::new(None);
+        let gate_check = || {
+            let claimed = card_state
+                .as_ref()
+                .is_some_and(|o| o.lock().unwrap().claim_check(std::time::Instant::now()));
+            if !claimed {
+                return card_outage::CardVerdict::Unknown;
+            }
+            let verdict = card_check();
+            gate_verdict.set(Some(verdict));
+            verdict
+        };
         // Closed before the tick, not after it: a teardown inside the tick can
         // take many seconds, and an agent that exits meanwhile must not be
         // respawned against the old P-CSCF (specs/087 R5). Released below
@@ -2222,7 +2269,23 @@ fn start_vowifi_line_strongswan(
             &|| line_in_call(runner.as_ref(), &line.pcscf_source_path),
             &|| line_pool_state(runner.as_ref(), &line.pcscf_source_path),
             &underlay_view,
+            &card_view,
+            &gate_check,
         );
+        if let Some(outage) = &card_state {
+            let report = card_outage::after_card_tick(
+                &outcome,
+                gate_verdict.get(),
+                &mut outage.lock().unwrap(),
+                std::time::Instant::now(),
+            );
+            if let Some(transition) = report.transition {
+                println!("{}", card_outage::transition_line(idx, &transition));
+            }
+            if let Some(next) = report.next_try_in {
+                println!("{}", card_outage::paced_initiation_line(idx, next));
+            }
+        }
         if underlay_enabled {
             if let Some(start) = underlay.end_tick(&outcome, mark, tick_started, tick_started_at) {
                 println!(
@@ -2329,10 +2392,22 @@ fn start_vowifi_line_strongswan(
             // The tick queued a liveness check and said so (specs/100); the
             // recovery it is for waits for the answer.
             line_supervisor::SteadyOutcome::Deferred { .. } => drop(guard),
+            // Held for the card, or paced: logged with the card's report
+            // above (specs/163 FR-013). A paced initiation owes the agent
+            // restart, as an uplink hold's does.
+            line_supervisor::SteadyOutcome::CardHeld { initiated, .. } => {
+                drop(guard);
+                if initiated {
+                    owed_by_card = true;
+                }
+            }
             line_supervisor::SteadyOutcome::Held {
                 cause, initiated, ..
             } => {
                 drop(guard);
+                if initiated {
+                    owed_by_card = false;
+                }
                 // What a hold held back is summarised once, on the line that
                 // ends it, not logged on every tick.
                 if initiated {
@@ -2352,8 +2427,14 @@ fn start_vowifi_line_strongswan(
                 if after_held_initiation {
                     println!(
                         "{}",
-                        held_initiation_established_line(idx, &current_pcscf, &new_pcscf)
+                        held_initiation_established_line(
+                            idx,
+                            &current_pcscf,
+                            &new_pcscf,
+                            owed_by_card
+                        )
                     );
+                    owed_by_card = false;
                 } else {
                     println!("[supervise] line {idx}: P-CSCF changed ({current_pcscf} -> {new_pcscf}); refreshing");
                 }
@@ -2557,14 +2638,26 @@ fn observe_underlay(
 /// FR-010a) is up and the agent is restarted onto it. Says whether the
 /// selection moved, because when it did not this restart is the only thing
 /// that puts the agent on the new tunnel.
-fn held_initiation_established_line(idx: u32, previous: &str, selection: &str) -> String {
+fn held_initiation_established_line(
+    idx: u32,
+    previous: &str,
+    selection: &str,
+    for_the_card: bool,
+) -> String {
+    // The same restart is owed after an initiation paced for a card-reader
+    // SIM out of reach (specs/163), and the line says which hold made it.
+    let hold = if for_the_card {
+        "a SIM card hold"
+    } else {
+        "an uplink hold"
+    };
     let pcscf = if previous == selection {
         format!("P-CSCF {selection} unchanged")
     } else {
         format!("P-CSCF {previous} -> {selection}")
     };
     format!(
-        "[supervise] line {idx}: IKE_SA re-established after an uplink hold ({pcscf}); restarting the IMS agent on the new tunnel"
+        "[supervise] line {idx}: IKE_SA re-established after {hold} ({pcscf}); restarting the IMS agent on the new tunnel"
     )
 }
 
@@ -3154,7 +3247,7 @@ fn start_line_tail(
     usim_holder: &Arc<Mutex<Option<Arc<ChildHandle>>>>,
     initial_pcscf: String,
     rebuild_gate: Arc<RebuildGate>,
-    card_outage: Option<Arc<Mutex<CardOutage>>>,
+    card_state: Option<Arc<Mutex<CardOutage>>>,
 ) {
     let runner = ctx.runner;
     let bin = ctx.bin;
@@ -3296,7 +3389,7 @@ fn start_line_tail(
                 // began it.
                 let mut registered_seen = false;
                 while runner.is_alive(&handle) {
-                    if (had_restart || card_outage.is_some())
+                    if (had_restart || card_state.is_some())
                         && !registered_seen
                         && runner
                             .read_file(&agent_log)
@@ -3308,7 +3401,7 @@ fn start_line_tail(
                                 "[supervise] line {idx}: vowifi-ims-agent registered after restart loop"
                             );
                         }
-                        if let Some(outage) = &card_outage {
+                        if let Some(outage) = &card_state {
                             let ended = outage
                                 .lock()
                                 .unwrap()
@@ -3324,13 +3417,13 @@ fn start_line_tail(
                 had_restart = true;
 
                 let log_content = runner.read_file(&agent_log).unwrap_or_default();
-                let outcome = sim_recovery::classify_exit(&log_content, card_outage.is_some());
+                let outcome = sim_recovery::classify_exit(&log_content, card_state.is_some());
                 let action = csim_fails.observe(outcome);
                 // A card that cannot be reached is paced by the line's shared
                 // outage, and waited out with checks so the agent restarts as
                 // soon as the card is back (FR-004, FR-006). `None` for
                 // every other exit, which keeps the plain wait.
-                let card_wait = match (&card_outage, outcome) {
+                let card_wait = match (&card_state, outcome) {
                     (Some(outage), sim_recovery::AgentExitOutcome::CardUnreachable) => {
                         let (began, delay) = {
                             let mut o = outage.lock().unwrap();
@@ -3721,10 +3814,12 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
             }
             // Only the strongSwan engine has a half-open IKE_SA to wait on, or
             // a hold to initiate under.
+            // Nor a card-reader SIM to hold for: an SWu line never has one.
             line_supervisor::SteadyOutcome::WaitingForNegotiation
             | line_supervisor::SteadyOutcome::HeldInitiationEstablished { .. }
             | line_supervisor::SteadyOutcome::Deferred { .. }
-            | line_supervisor::SteadyOutcome::Held { .. } => drop(guard),
+            | line_supervisor::SteadyOutcome::Held { .. }
+            | line_supervisor::SteadyOutcome::CardHeld { .. } => drop(guard),
             line_supervisor::SteadyOutcome::Recovered { reason, .. } => {
                 println!("[supervise] line {idx}: recovered from {reason:?}");
                 if !tracking.pool_exhausted.is_empty() {
@@ -3757,12 +3852,16 @@ mod tests {
     #[test]
     fn the_restart_after_a_held_initiation_says_whether_the_selection_moved() {
         assert_eq!(
-            held_initiation_established_line(0, "10.0.0.11", "10.0.0.11"),
+            held_initiation_established_line(0, "10.0.0.11", "10.0.0.11", false),
             "[supervise] line 0: IKE_SA re-established after an uplink hold (P-CSCF 10.0.0.11 unchanged); restarting the IMS agent on the new tunnel"
         );
         assert_eq!(
-            held_initiation_established_line(1, "10.0.0.11", "10.0.0.12"),
+            held_initiation_established_line(1, "10.0.0.11", "10.0.0.12", false),
             "[supervise] line 1: IKE_SA re-established after an uplink hold (P-CSCF 10.0.0.11 -> 10.0.0.12); restarting the IMS agent on the new tunnel"
+        );
+        assert_eq!(
+            held_initiation_established_line(2, "10.0.0.11", "10.0.0.11", true),
+            "[supervise] line 2: IKE_SA re-established after a SIM card hold (P-CSCF 10.0.0.11 unchanged); restarting the IMS agent on the new tunnel"
         );
     }
 

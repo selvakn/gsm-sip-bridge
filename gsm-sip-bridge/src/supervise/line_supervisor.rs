@@ -6,6 +6,7 @@
 //! control flow, not a redesign: see the per-branch comments below for the
 //! exact bash this replaces.
 
+use super::card_outage::CardVerdict;
 use super::engines::{LogMark, VICI_UNRESPONSIVE_STRIKES};
 use super::runner::CommandRunner;
 pub use crate::control::protocol::DeadPeerVerdict;
@@ -754,6 +755,17 @@ pub enum SteadyOutcome {
     Deferred {
         reason: DegradeReason,
     },
+    /// A recovery that needs the SIM was due on a card-reader line whose card
+    /// is out of reach, so it was not issued, or was paced (#233 follow-up,
+    /// specs/163 FR-007, FR-009). Not an uplink hold: it starts none and
+    /// restarts nothing.
+    CardHeld {
+        /// The recovery that was held back or paced.
+        skipped: DegradeReason,
+        /// Whether this tick made the paced initiation a line with no IKE_SA
+        /// to lose is allowed while its card is out ([`card_gate`]).
+        initiated: bool,
+    },
     /// The process/tunnel was unhealthy and a recovery action was already
     /// issued by the time this returns.
     Recovered {
@@ -891,6 +903,114 @@ pub fn is_reachability_inferred(reason: DegradeReason) -> bool {
         // A refresh, not a recovery.
         | DegradeReason::PcscfChanged => false,
     }
+}
+
+/// What the loop tells one steady-state tick about this line's SIM card
+/// (#233 follow-up, specs/163). Built before the tick from the line's shared
+/// `supervise::card_outage::CardOutage` and never changed by it, like
+/// [`UnderlayView`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CardView {
+    /// A card-reader line. When false the card gate is never consulted.
+    pub pcsc_reader: bool,
+    /// The card is out of reach, as far as the line knew before the tick.
+    pub outage: bool,
+    /// A paced initiation may go on this tick.
+    pub attempt_due: bool,
+}
+
+impl CardView {
+    /// A line with no card reader: every branch behaves as before.
+    pub fn none() -> Self {
+        Self {
+            pcsc_reader: false,
+            outage: false,
+            attempt_due: false,
+        }
+    }
+}
+
+/// Whether a recovery needs the line's SIM: it starts a new IKE_SA, whose
+/// EAP-AKA the card answers (#233 follow-up, specs/163 D5). No wildcard: a new
+/// reason must be classified here too.
+///
+/// It is [`recovery_renegotiates`] minus the daemon-wide restarts
+/// (`ProcessDied`, `ViciBroken`), which affect every line on the shared charon
+/// and after which each line's missing IKE_SA is gated on its own, and minus
+/// `PcscfChanged`, a refresh that is never issued as a recovery.
+pub fn needs_the_sim(reason: DegradeReason) -> bool {
+    match reason {
+        DegradeReason::IkeSaLost
+        | DegradeReason::IkeSaNegotiationStuck
+        | DegradeReason::PcscfPoolExhausted
+        | DegradeReason::PcscfUnreachable
+        | DegradeReason::ChildSaStuck
+        | DegradeReason::ChildSaRekeyStuck
+        | DegradeReason::TunVanished => true,
+        DegradeReason::ProcessDied
+        | DegradeReason::ViciBroken
+        | DegradeReason::ChildSaMissing
+        | DegradeReason::TunUnavailable
+        | DegradeReason::DefaultRouteMissing
+        | DegradeReason::PcscfChanged => false,
+    }
+}
+
+/// What the card says about a recovery that needs the SIM (#233 follow-up,
+/// specs/163 D5): `Some` to return instead of issuing it, `None` to go ahead.
+///
+/// Called after [`underlay_gate`], so an uplink hold wins and this is not
+/// consulted then (FR-010). On a card-reader line with no outage yet, `check`
+/// asks the card once first; only `Out` holds, `Unknown` never does.
+///
+/// While the card is out:
+/// - **No IKE_SA to lose** (`IkeSaLost`, `IkeSaNegotiationStuck`): one
+///   initiation when the outage's pacing allows it (at once, then every 60 s,
+///   then every 120 s; FR-007), with an agent restart owed for when it builds
+///   an IKE_SA, as under an uplink hold. Otherwise nothing.
+/// - **An established IKE_SA the recovery would tear down** (every other
+///   reason [`needs_the_sim`]): held until the card is back (FR-009,
+///   Clarification 2026-11-24). Rebuilding needs the SIM, so tearing down
+///   could only replace a working or half-working IKE_SA with none, as seen
+///   live on 2026-11-24.
+fn card_gate(
+    engine: &dyn TunnelEngine,
+    runner: &dyn CommandRunner,
+    card: &CardView,
+    check: &dyn Fn() -> CardVerdict,
+    reason: DegradeReason,
+    tracking: &mut SteadyTracking,
+) -> Option<SteadyOutcome> {
+    if !card.pcsc_reader || !needs_the_sim(reason) {
+        return None;
+    }
+    if !card.outage && check() != CardVerdict::Out {
+        return None;
+    }
+    if !matches!(
+        reason,
+        DegradeReason::IkeSaLost | DegradeReason::IkeSaNegotiationStuck
+    ) {
+        return Some(SteadyOutcome::CardHeld {
+            skipped: reason,
+            initiated: false,
+        });
+    }
+    // An outage this tick's own check found has made no attempt yet, so its
+    // first goes at once.
+    let initiated = !card.outage || card.attempt_due;
+    if initiated {
+        tracking.agent_restart_owed = true;
+        if reason == DegradeReason::IkeSaNegotiationStuck {
+            tracking.half_open = None;
+            engine.terminate(runner);
+        }
+        engine.reinitiate(runner);
+    }
+    Some(SteadyOutcome::CardHeld {
+        skipped: reason,
+        initiated,
+    })
 }
 
 /// How recently the ePDG must have been heard from for a recovery to go ahead
@@ -1249,6 +1369,8 @@ pub fn tick_steady_state_with_pool(
         call_active,
         agent_pool,
         &UnderlayView::disabled(),
+        &CardView::none(),
+        &|| unreachable!("no card reader, so the card is never checked"),
     )
 }
 
@@ -1262,6 +1384,12 @@ pub fn tick_steady_state_with_pool(
 /// returned as [`SteadyOutcome::Deferred`] (FR-004). Structural recoveries
 /// (FR-009) never consult it. With [`UnderlayView::disabled`] every branch
 /// below behaves exactly as it did before the guard existed.
+///
+/// `card` says whether a card-reader line's SIM is out of reach, and `check`
+/// asks the card ([`card_gate`]). Every gate site returns, so it is asked at
+/// most once per tick. With
+/// [`CardView::none`] `check` is never called and every branch behaves as it
+/// did before the card gate existed.
 #[allow(clippy::too_many_arguments)]
 pub fn tick_steady_state_underlay(
     engine: &dyn TunnelEngine,
@@ -1273,6 +1401,8 @@ pub fn tick_steady_state_underlay(
     call_active: &dyn Fn() -> bool,
     agent_pool: &dyn Fn() -> Option<PoolState>,
     underlay: &UnderlayView,
+    card: &CardView,
+    check: &dyn Fn() -> CardVerdict,
 ) -> SteadyOutcome {
     let outcome = tick_underlay(
         engine,
@@ -1284,6 +1414,8 @@ pub fn tick_steady_state_underlay(
         call_active,
         agent_pool,
         underlay,
+        card,
+        check,
     );
     // Here rather than at each return: an agent restarted for any reason
     // starts on the tunnel as it is now, so the restart a held initiation owed
@@ -1305,6 +1437,7 @@ pub fn outcome_restarts_agent(outcome: &SteadyOutcome) -> bool {
         SteadyOutcome::StillUp
         | SteadyOutcome::WaitingForNegotiation
         | SteadyOutcome::Held { .. }
+        | SteadyOutcome::CardHeld { .. }
         | SteadyOutcome::Deferred { .. } => false,
     }
 }
@@ -1321,6 +1454,8 @@ fn tick_underlay(
     call_active: &dyn Fn() -> bool,
     agent_pool: &dyn Fn() -> Option<PoolState>,
     underlay: &UnderlayView,
+    card: &CardView,
+    check: &dyn Fn() -> CardVerdict,
 ) -> SteadyOutcome {
     tracking.pool_exhausted.clear();
     tracking.dead_peer = None;
@@ -1426,6 +1561,19 @@ fn tick_underlay(
                     ike_sa_loss_cause: None,
                 };
             }
+            // Structural, so never held for the uplink, but the
+            // terminate+reinitiate needs the SIM: the interface is back, and
+            // the IKE_SA is kept until the card is too (FR-009).
+            if let Some(outcome) = card_gate(
+                engine,
+                runner,
+                card,
+                check,
+                DegradeReason::TunVanished,
+                tracking,
+            ) {
+                return outcome;
+            }
             engine.terminate(runner);
             engine.reinitiate(runner);
             return SteadyOutcome::Recovered {
@@ -1473,6 +1621,19 @@ fn tick_underlay(
                     ike_sa_loss_cause: initiated.then_some(cause),
                 };
             }
+            // A card that is out of reach cannot answer the new IKE_SA's
+            // EAP-AKA, so initiations are paced instead of made every tick
+            // (FR-007).
+            if let Some(outcome) = card_gate(
+                engine,
+                runner,
+                card,
+                check,
+                DegradeReason::IkeSaLost,
+                tracking,
+            ) {
+                return outcome;
+            }
             if cause == IkeSaLossCause::DeadPeer {
                 tracking.dead_peer = Some(classify_dead_peer(
                     last_inbound,
@@ -1487,7 +1648,7 @@ fn tick_underlay(
             };
         }
         SteadyStateHealth::IkeSaConnecting { ike_id } => {
-            return tick_half_open(engine, runner, ike_id, tracking, underlay);
+            return tick_half_open(engine, runner, ike_id, tracking, underlay, card, check);
         }
         SteadyStateHealth::ChildSaMissing => {
             let stuck = tracking.child_sa_missing.would_reach(
@@ -1515,6 +1676,12 @@ fn tick_underlay(
                 }
                 return outcome;
             }
+            // Only the rebuild needs the SIM; a first miss's CHILD_SA
+            // re-initiate inside the live IKE_SA does not. The streak is kept,
+            // so the rebuild goes on the first tick the card is back.
+            if let Some(outcome) = card_gate(engine, runner, card, check, reason, tracking) {
+                return outcome;
+            }
             tracking.child_sa_missing.hit(poll_interval);
             if tracking
                 .child_sa_missing
@@ -1539,13 +1706,24 @@ fn tick_underlay(
         }
         SteadyStateHealth::Ok(None) => {}
         SteadyStateHealth::Ok(Some(child)) => {
-            if let Some(outcome) =
-                check_rekey_stuck(engine, runner, child, tracking, call_active, underlay)
-            {
+            if let Some(outcome) = check_rekey_stuck(
+                engine,
+                runner,
+                child,
+                tracking,
+                call_active,
+                underlay,
+                card,
+                check,
+            ) {
                 // A held rebuild must not hold back the route repair below
                 // too: that one is structural and never held (FR-009), and
-                // the hold can last 15 minutes.
-                if matches!(outcome, SteadyOutcome::Held { .. }) {
+                // the hold can last 15 minutes. Nor does a card hold: the
+                // repair needs no SIM.
+                if matches!(
+                    outcome,
+                    SteadyOutcome::Held { .. } | SteadyOutcome::CardHeld { .. }
+                ) {
                     if let Some(repaired) =
                         repair_default_route(engine, runner, current_pcscf, tracking)
                     {
@@ -1627,6 +1805,16 @@ fn tick_underlay(
             {
                 return outcome;
             }
+            if let Some(outcome) = card_gate(
+                engine,
+                runner,
+                card,
+                check,
+                DegradeReason::PcscfPoolExhausted,
+                tracking,
+            ) {
+                return outcome;
+            }
             tracking.pool_exhausted_deferral_logged = false;
             tracking.pcscf_unreachable.reset();
             let outcome = rebuild_tunnel(engine, runner, DegradeReason::PcscfPoolExhausted);
@@ -1698,6 +1886,18 @@ fn tick_underlay(
                 if matches!(outcome, SteadyOutcome::Held { .. }) {
                     tracking.pcscf_unreachable.reset();
                 }
+                return outcome;
+            }
+            // The streak is kept: it was earned with the path up, and the
+            // rebuild goes on the first tick the card is back.
+            if let Some(outcome) = card_gate(
+                engine,
+                runner,
+                card,
+                check,
+                DegradeReason::PcscfUnreachable,
+                tracking,
+            ) {
                 return outcome;
             }
             tracking.pcscf_unreachable.reset();
@@ -1807,8 +2007,33 @@ fn tick_half_open(
     ike_id: u32,
     tracking: &mut SteadyTracking,
     underlay: &UnderlayView,
+    card: &CardView,
+    check: &dyn Fn() -> CardVerdict,
 ) -> SteadyOutcome {
     let (mut half_open, idle) = observe_half_open(engine, runner, &mut tracking.half_open, ike_id);
+    // A re-initiate below needs the SIM. While the card is out it is paced
+    // ([`card_gate`]), and a tick that does not make it keeps the record: it
+    // is still the same half-open IKE_SA.
+    let card_held = |tracking: &mut SteadyTracking, half_open: HalfOpen| {
+        let outcome = card_gate(
+            engine,
+            runner,
+            card,
+            check,
+            DegradeReason::IkeSaNegotiationStuck,
+            tracking,
+        )?;
+        if !matches!(
+            outcome,
+            SteadyOutcome::CardHeld {
+                initiated: true,
+                ..
+            }
+        ) {
+            tracking.half_open = Some(half_open);
+        }
+        Some(outcome)
+    };
     // The no-route hold that kept this IKE_SA's retransmits from reaching the
     // ePDG has just ended. charon backs off up to ~76s between retransmits, so
     // waiting for its next one can leave the line down for a minute with the
@@ -1816,6 +2041,9 @@ fn tick_half_open(
     // SC-003). A hold that ended because the ePDG was heard from does not get
     // here: an IKE_SA that answered is progressing, not waiting.
     if underlay.enabled && underlay.restored {
+        if let Some(outcome) = card_held(tracking, half_open.clone()) {
+            return outcome;
+        }
         println!(
             "{} IKE_SA #{ike_id} was half-open across a no-route hold that has just ended; re-initiating it now rather than waiting out charon's backoff",
             engine.log_prefix()
@@ -1837,6 +2065,9 @@ fn tick_half_open(
         ) {
             // The record stays: it is still the same half-open IKE_SA.
             tracking.half_open = Some(half_open);
+            return outcome;
+        }
+        if let Some(outcome) = card_held(tracking, half_open.clone()) {
             return outcome;
         }
         println!(
@@ -1872,6 +2103,7 @@ fn tick_half_open(
 /// tick would almost never catch it `REKEYING` (#107: 105 refusals in 11
 /// minutes). Being the same `#N` with less than [`REKEY_STUCK_THRESHOLD`] left
 /// is what every failed rekey has in common, whatever the carrier answered.
+#[allow(clippy::too_many_arguments)]
 fn check_rekey_stuck(
     engine: &dyn TunnelEngine,
     runner: &dyn CommandRunner,
@@ -1879,6 +2111,8 @@ fn check_rekey_stuck(
     tracking: &mut SteadyTracking,
     call_active: &dyn Fn() -> bool,
     underlay: &UnderlayView,
+    card: &CardView,
+    check: &dyn Fn() -> CardVerdict,
 ) -> Option<SteadyOutcome> {
     let id = child.unique_id;
     // A guard set for an earlier CHILD_SA means nothing for this one.
@@ -1926,6 +2160,18 @@ fn check_rekey_stuck(
 
     if let Some(outcome) = underlay_gate(engine, runner, underlay, DegradeReason::ChildSaRekeyStuck)
     {
+        return Some(outcome);
+    }
+    // The old CHILD_SA still carries traffic until its hard expiry; a rebuild
+    // the card cannot answer would end that sooner.
+    if let Some(outcome) = card_gate(
+        engine,
+        runner,
+        card,
+        check,
+        DegradeReason::ChildSaRekeyStuck,
+        tracking,
+    ) {
         return Some(outcome);
     }
     let rejection = engine
@@ -4976,6 +5222,32 @@ mod tests {
         underlay: &UnderlayView,
         agent: Option<&PoolState>,
     ) -> SteadyOutcome {
+        // A line with no card reader: the check panics if it is ever called,
+        // so every underlay test also proves `CardView::none()` never asks.
+        carded(
+            engine,
+            tracking,
+            underlay,
+            &CardView::none(),
+            &never_checked,
+            agent,
+        )
+    }
+
+    fn never_checked() -> CardVerdict {
+        panic!("a line with no card reader is never checked")
+    }
+
+    /// [`guarded`], on a line whose card is as `card` says and is checked by
+    /// `check`.
+    fn carded(
+        engine: &FakeEngine,
+        tracking: &mut SteadyTracking,
+        underlay: &UnderlayView,
+        card: &CardView,
+        check: &dyn Fn() -> CardVerdict,
+        agent: Option<&PoolState>,
+    ) -> SteadyOutcome {
         let current_pool = pool(&["10.0.0.11"]);
         super::tick_steady_state_underlay(
             engine,
@@ -4987,6 +5259,8 @@ mod tests {
             &|| false,
             &|| agent.cloned(),
             underlay,
+            card,
+            check,
         )
     }
 
@@ -6151,5 +6425,566 @@ mod tests {
             guarded(&engine, &mut SteadyTracking::default(), &off, None),
             SteadyOutcome::WaitingForNegotiation
         );
+    }
+
+    // ---- specs/163: the card gate --------------------------------------
+
+    const EVERY_REASON: [DegradeReason; 13] = [
+        DegradeReason::ProcessDied,
+        DegradeReason::ViciBroken,
+        DegradeReason::TunVanished,
+        DegradeReason::TunUnavailable,
+        DegradeReason::ChildSaMissing,
+        DegradeReason::IkeSaLost,
+        DegradeReason::ChildSaStuck,
+        DegradeReason::ChildSaRekeyStuck,
+        DegradeReason::PcscfChanged,
+        DegradeReason::PcscfUnreachable,
+        DegradeReason::DefaultRouteMissing,
+        DegradeReason::PcscfPoolExhausted,
+        DegradeReason::IkeSaNegotiationStuck,
+    ];
+
+    /// A card-reader line whose card is out, with a paced initiation due or
+    /// not.
+    fn card_out(attempt_due: bool) -> CardView {
+        CardView {
+            pcsc_reader: true,
+            outage: true,
+            attempt_due,
+        }
+    }
+
+    /// A card-reader line with no outage known.
+    const CARD_FINE: CardView = CardView {
+        pcsc_reader: true,
+        outage: false,
+        attempt_due: false,
+    };
+
+    /// One line in the state that makes `reason` due on its next tick (with
+    /// the guard off): the engine, the tracking and what the agent reports.
+    fn due(reason: DegradeReason) -> (FakeEngine, SteadyTracking, Option<PoolState>) {
+        match reason {
+            DegradeReason::IkeSaLost => (
+                FakeEngine {
+                    health: RefCell::new(SteadyStateHealth::IkeSaMissing),
+                    ..Default::default()
+                },
+                SteadyTracking::default(),
+                None,
+            ),
+            DegradeReason::IkeSaNegotiationStuck => (
+                half_open_engine(7),
+                idle_for(7, HALF_OPEN_STUCK_AFTER.as_secs() + 1),
+                None,
+            ),
+            DegradeReason::PcscfPoolExhausted => {
+                (FakeEngine::default(), negotiated(), Some(exhausted_agent()))
+            }
+            DegradeReason::PcscfUnreachable => (
+                FakeEngine {
+                    pcscf_reachable: RefCell::new(false),
+                    ..Default::default()
+                },
+                SteadyTracking {
+                    pcscf_unreachable: Streak {
+                        count: 2,
+                        covered: STEADY_STATE_POLL_INTERVAL * 2,
+                    },
+                    ..Default::default()
+                },
+                None,
+            ),
+            DegradeReason::ChildSaStuck => (
+                FakeEngine {
+                    health: RefCell::new(SteadyStateHealth::ChildSaMissing),
+                    ..Default::default()
+                },
+                SteadyTracking {
+                    child_sa_missing: Streak {
+                        count: 1,
+                        covered: STEADY_STATE_POLL_INTERVAL,
+                    },
+                    ..Default::default()
+                },
+                None,
+            ),
+            DegradeReason::ChildSaMissing => (
+                FakeEngine {
+                    health: RefCell::new(SteadyStateHealth::ChildSaMissing),
+                    ..Default::default()
+                },
+                SteadyTracking::default(),
+                None,
+            ),
+            DegradeReason::ChildSaRekeyStuck => (
+                FakeEngine {
+                    health: RefCell::new(lifetime(4, 200)),
+                    ..Default::default()
+                },
+                SteadyTracking::default(),
+                None,
+            ),
+            DegradeReason::TunVanished => (
+                FakeEngine {
+                    health: RefCell::new(SteadyStateHealth::TunVanished),
+                    ..Default::default()
+                },
+                SteadyTracking::default(),
+                None,
+            ),
+            other => unreachable!("no fixture for {other:?}"),
+        }
+    }
+
+    const HELD_FOR_THE_CARD: [DegradeReason; 5] = [
+        DegradeReason::PcscfPoolExhausted,
+        DegradeReason::PcscfUnreachable,
+        DegradeReason::ChildSaStuck,
+        DegradeReason::ChildSaRekeyStuck,
+        DegradeReason::TunVanished,
+    ];
+    const PACED_FOR_THE_CARD: [DegradeReason; 2] = [
+        DegradeReason::IkeSaLost,
+        DegradeReason::IkeSaNegotiationStuck,
+    ];
+
+    fn recovered(outcome: &SteadyOutcome) -> Option<DegradeReason> {
+        match outcome {
+            SteadyOutcome::Recovered { reason, .. } => Some(*reason),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn needs_the_sim_is_recovery_renegotiates_minus_the_shared_daemon() {
+        for reason in EVERY_REASON {
+            let expected = recovery_renegotiates(reason)
+                && !matches!(
+                    reason,
+                    DegradeReason::ProcessDied
+                        | DegradeReason::ViciBroken
+                        | DegradeReason::PcscfChanged
+                );
+            assert_eq!(needs_the_sim(reason), expected, "{reason:?}");
+        }
+        // Every reason the gate holds or paces needs the SIM.
+        for reason in HELD_FOR_THE_CARD.into_iter().chain(PACED_FOR_THE_CARD) {
+            assert!(needs_the_sim(reason), "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn card_view_none_never_calls_the_check() {
+        // Every recovery that needs the SIM, on a line with no card reader:
+        // taken exactly as before, and the check (which panics) never asked.
+        for reason in HELD_FOR_THE_CARD.into_iter().chain(PACED_FOR_THE_CARD) {
+            let (engine, mut tracking, agent) = due(reason);
+            let outcome = guarded(
+                &engine,
+                &mut tracking,
+                &UnderlayView::disabled(),
+                agent.as_ref(),
+            );
+            assert_eq!(recovered(&outcome), Some(reason), "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn card_out_paces_initiations_for_a_missing_ike_sa() {
+        for reason in PACED_FOR_THE_CARD {
+            // Due: one initiation, and the agent restart it owes.
+            let (engine, mut tracking, agent) = due(reason);
+            let outcome = carded(
+                &engine,
+                &mut tracking,
+                &UnderlayView::disabled(),
+                &card_out(true),
+                &never_checked,
+                agent.as_ref(),
+            );
+            assert_eq!(
+                outcome,
+                SteadyOutcome::CardHeld {
+                    skipped: reason,
+                    initiated: true
+                },
+                "{reason:?}"
+            );
+            assert_eq!(*engine.reinitiate_calls.borrow(), 1, "{reason:?}");
+            assert_eq!(*engine.restart_calls.borrow(), 0, "{reason:?}");
+            assert!(tracking.agent_restart_owed, "{reason:?}");
+            // Not due: nothing at all.
+            let (engine, mut tracking, agent) = due(reason);
+            let outcome = carded(
+                &engine,
+                &mut tracking,
+                &UnderlayView::disabled(),
+                &card_out(false),
+                &never_checked,
+                agent.as_ref(),
+            );
+            assert_eq!(
+                outcome,
+                SteadyOutcome::CardHeld {
+                    skipped: reason,
+                    initiated: false
+                },
+                "{reason:?}"
+            );
+            nothing_was_issued(&engine);
+            assert!(!tracking.agent_restart_owed, "{reason:?}");
+        }
+        // The half-open IKE_SA is terminated only by the tick that
+        // re-initiates; a tick that does not keeps its record.
+        let (engine, mut tracking, _) = due(DegradeReason::IkeSaNegotiationStuck);
+        carded(
+            &engine,
+            &mut tracking,
+            &UnderlayView::disabled(),
+            &card_out(false),
+            &never_checked,
+            None,
+        );
+        assert_eq!(tracking.half_open.as_ref().map(|h| h.ike_id), Some(7));
+        carded(
+            &engine,
+            &mut tracking,
+            &UnderlayView::disabled(),
+            &card_out(true),
+            &never_checked,
+            None,
+        );
+        assert_eq!(*engine.terminate_calls.borrow(), 1);
+        assert!(tracking.half_open.is_none());
+    }
+
+    #[test]
+    fn card_out_holds_a_rebuild_of_an_established_ike_sa() {
+        for reason in HELD_FOR_THE_CARD {
+            for attempt_due in [false, true] {
+                let (engine, mut tracking, agent) = due(reason);
+                let outcome = carded(
+                    &engine,
+                    &mut tracking,
+                    &UnderlayView::disabled(),
+                    &card_out(attempt_due),
+                    &never_checked,
+                    agent.as_ref(),
+                );
+                assert_eq!(
+                    outcome,
+                    SteadyOutcome::CardHeld {
+                        skipped: reason,
+                        initiated: false
+                    },
+                    "{reason:?}"
+                );
+                assert_eq!(*engine.terminate_calls.borrow(), 0, "{reason:?}");
+                assert_eq!(*engine.reinitiate_calls.borrow(), 0, "{reason:?}");
+                assert_eq!(*engine.restart_calls.borrow(), 0, "{reason:?}");
+                assert!(!tracking.agent_restart_owed, "{reason:?}");
+            }
+        }
+        // The interface itself is still put back: that needs no SIM.
+        let (engine, mut tracking, _) = due(DegradeReason::TunVanished);
+        carded(
+            &engine,
+            &mut tracking,
+            &UnderlayView::disabled(),
+            &card_out(false),
+            &never_checked,
+            None,
+        );
+        assert_eq!(*engine.recreate_interface_calls.borrow(), 1);
+    }
+
+    #[test]
+    fn a_held_rebuild_goes_on_the_first_tick_the_card_is_back() {
+        // The streaks that made it due are kept through the hold.
+        for reason in [DegradeReason::PcscfUnreachable, DegradeReason::ChildSaStuck] {
+            let (engine, mut tracking, agent) = due(reason);
+            for _ in 0..3 {
+                carded(
+                    &engine,
+                    &mut tracking,
+                    &UnderlayView::disabled(),
+                    &card_out(false),
+                    &never_checked,
+                    agent.as_ref(),
+                );
+            }
+            let outcome = carded(
+                &engine,
+                &mut tracking,
+                &UnderlayView::disabled(),
+                &CARD_FINE,
+                &|| CardVerdict::Present,
+                agent.as_ref(),
+            );
+            assert_eq!(recovered(&outcome), Some(reason), "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn a_recovery_that_needs_the_sim_checks_the_card_first() {
+        for reason in HELD_FOR_THE_CARD.into_iter().chain(PACED_FOR_THE_CARD) {
+            // The check finds it out: held, or the first paced initiation,
+            // which goes at once.
+            let (engine, mut tracking, agent) = due(reason);
+            let checks = std::cell::Cell::new(0);
+            let outcome = carded(
+                &engine,
+                &mut tracking,
+                &UnderlayView::disabled(),
+                &CARD_FINE,
+                &|| {
+                    checks.set(checks.get() + 1);
+                    CardVerdict::Out
+                },
+                agent.as_ref(),
+            );
+            assert_eq!(
+                outcome,
+                SteadyOutcome::CardHeld {
+                    skipped: reason,
+                    initiated: PACED_FOR_THE_CARD.contains(&reason),
+                },
+                "{reason:?}"
+            );
+            assert_eq!(checks.get(), 1, "{reason:?}: once per tick");
+            // Present or Unknown: the recovery runs exactly as today.
+            for verdict in [CardVerdict::Present, CardVerdict::Unknown] {
+                let (engine, mut tracking, agent) = due(reason);
+                let checks = std::cell::Cell::new(0);
+                let outcome = carded(
+                    &engine,
+                    &mut tracking,
+                    &UnderlayView::disabled(),
+                    &CARD_FINE,
+                    &|| {
+                        checks.set(checks.get() + 1);
+                        verdict
+                    },
+                    agent.as_ref(),
+                );
+                assert_eq!(recovered(&outcome), Some(reason), "{verdict:?} {outcome:?}");
+                assert_eq!(checks.get(), 1, "{reason:?} {verdict:?}");
+            }
+        }
+        // A healthy tick never checks the card.
+        let engine = FakeEngine::default();
+        assert_eq!(
+            carded(
+                &engine,
+                &mut SteadyTracking::default(),
+                &UnderlayView::disabled(),
+                &CARD_FINE,
+                &never_checked,
+                None,
+            ),
+            SteadyOutcome::StillUp
+        );
+    }
+
+    #[test]
+    fn a_card_hold_does_not_hold_back_the_route_repair() {
+        // A rekey rebuild held for the card, then the route repair the same
+        // tick still makes, with one check.
+        let engine = FakeEngine {
+            health: RefCell::new(lifetime(4, 200)),
+            route_missing: RefCell::new(true),
+            ..Default::default()
+        };
+        let checks = std::cell::Cell::new(0);
+        let current_pool = pool(&["10.0.0.11"]);
+        let outcome = super::tick_steady_state_underlay(
+            &engine,
+            &MockCommandRunner::new(),
+            "10.0.0.11",
+            &current_pool,
+            &mut SteadyTracking::default(),
+            STEADY_STATE_POLL_INTERVAL,
+            &|| false,
+            &|| None,
+            &UnderlayView::disabled(),
+            &CARD_FINE,
+            &|| {
+                checks.set(checks.get() + 1);
+                CardVerdict::Out
+            },
+        );
+        // The repair needs no SIM, so a card hold does not hold it back.
+        assert_eq!(
+            recovered(&outcome),
+            Some(DegradeReason::DefaultRouteMissing)
+        );
+        assert_eq!(checks.get(), 1);
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn the_uplink_hold_wins_and_the_card_gate_is_not_consulted() {
+        let down = view(UnderlayVerdict::NoRoute);
+        for reason in [
+            DegradeReason::PcscfPoolExhausted,
+            DegradeReason::ChildSaStuck,
+            DegradeReason::ChildSaRekeyStuck,
+            DegradeReason::IkeSaLost,
+        ] {
+            let (engine, mut tracking, agent) = due(reason);
+            let outcome = carded(
+                &engine,
+                &mut tracking,
+                &down,
+                &CARD_FINE,
+                &never_checked,
+                agent.as_ref(),
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    SteadyOutcome::Held {
+                        cause: NO_ROUTE,
+                        ..
+                    }
+                ),
+                "{reason:?}: {outcome:?}"
+            );
+            // And with the card already out, still the uplink's hold.
+            let (engine, mut tracking, agent) = due(reason);
+            let outcome = carded(
+                &engine,
+                &mut tracking,
+                &down,
+                &card_out(true),
+                &never_checked,
+                agent.as_ref(),
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    SteadyOutcome::Held {
+                        cause: NO_ROUTE,
+                        ..
+                    }
+                ),
+                "{reason:?}: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_modem_line_recovers_exactly_as_before() {
+        // The same fixtures through the guard-off wrapper every pre-card test
+        // uses and through the card-aware tick with `CardView::none()`: the
+        // same outcome and the same engine calls.
+        for reason in HELD_FOR_THE_CARD.into_iter().chain(PACED_FOR_THE_CARD) {
+            let (before, mut before_tracking, agent) = due(reason);
+            let current_pool = pool(&["10.0.0.11"]);
+            let old = super::tick_steady_state_with_pool(
+                &before,
+                &MockCommandRunner::new(),
+                "10.0.0.11",
+                &current_pool,
+                &mut before_tracking,
+                STEADY_STATE_POLL_INTERVAL,
+                &|| false,
+                &|| agent.clone(),
+            );
+            let (after, mut after_tracking, agent) = due(reason);
+            let new = guarded(
+                &after,
+                &mut after_tracking,
+                &UnderlayView::disabled(),
+                agent.as_ref(),
+            );
+            assert_eq!(old, new, "{reason:?}");
+            assert_eq!(
+                *before.call_order.borrow(),
+                *after.call_order.borrow(),
+                "{reason:?}"
+            );
+            assert_eq!(before_tracking, after_tracking, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn child_sa_missing_is_never_card_gated() {
+        // A CHILD_SA re-initiate inside a live IKE_SA needs no SIM.
+        let (engine, mut tracking, _) = due(DegradeReason::ChildSaMissing);
+        let outcome = carded(
+            &engine,
+            &mut tracking,
+            &UnderlayView::disabled(),
+            &card_out(false),
+            &never_checked,
+            None,
+        );
+        assert_eq!(recovered(&outcome), Some(DegradeReason::ChildSaMissing));
+        assert_eq!(*engine.reinitiate_calls.borrow(), 1);
+        // Nor are the daemon-wide restarts.
+        let engine = FakeEngine {
+            alive: RefCell::new(false),
+            ..Default::default()
+        };
+        let outcome = carded(
+            &engine,
+            &mut SteadyTracking::default(),
+            &UnderlayView::disabled(),
+            &card_out(false),
+            &never_checked,
+            None,
+        );
+        assert_eq!(recovered(&outcome), Some(DegradeReason::ProcessDied));
+    }
+
+    #[test]
+    fn a_card_held_initiation_that_establishes_restarts_the_agent_once() {
+        let (engine, mut tracking, _) = due(DegradeReason::IkeSaLost);
+        *engine.pcscf.borrow_mut() = Some("10.0.0.11".to_string());
+        carded(
+            &engine,
+            &mut tracking,
+            &UnderlayView::disabled(),
+            &card_out(true),
+            &never_checked,
+            None,
+        );
+        // The card answered: the IKE_SA is up, the outage not yet ended.
+        *engine.health.borrow_mut() = SteadyStateHealth::Ok(None);
+        assert_eq!(
+            carded(
+                &engine,
+                &mut tracking,
+                &UnderlayView::disabled(),
+                &card_out(false),
+                &never_checked,
+                None,
+            ),
+            established("10.0.0.11")
+        );
+        assert_eq!(
+            carded(
+                &engine,
+                &mut tracking,
+                &UnderlayView::disabled(),
+                &card_out(false),
+                &never_checked,
+                None,
+            ),
+            SteadyOutcome::StillUp
+        );
+    }
+
+    #[test]
+    fn a_card_hold_restarts_nothing() {
+        for initiated in [false, true] {
+            assert!(!outcome_restarts_agent(&SteadyOutcome::CardHeld {
+                skipped: DegradeReason::IkeSaLost,
+                initiated,
+            }));
+        }
     }
 }
