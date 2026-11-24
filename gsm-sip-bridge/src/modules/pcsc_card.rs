@@ -22,6 +22,58 @@ use pcsc::{Card, Context, Disposition, Protocols, Scope, ShareMode, Transaction,
 use std::ffi::CStr;
 use std::ops::{Deref, DerefMut};
 
+/// The PC/SC failures that mean the card cannot be reached right now, as
+/// opposed to a fault in how we called PC/SC (#233):
+///
+/// - the card was reset by another program, pulled, is unpowered or does
+///   not answer (`ResetCard`, `RemovedCard`, `NoSmartcard`, `UnpoweredCard`,
+///   `UnresponsiveCard`);
+/// - its reader went away or the link to it broke (`ReaderUnavailable`,
+///   `UnknownReader`, `CommError`, `CommDataLost`, `NoReadersAvailable`);
+/// - pcscd is not running or is shutting down (`NoService`,
+///   `ServiceStopped`, `Shutdown`), which also invalidates our handle
+///   (`InvalidHandle`);
+/// - another program holds the card exclusively (`SharingViolation`).
+///
+/// Every other error (a timeout we asked for, a bad parameter, a protocol
+/// mismatch, an internal error) is not about reachability and keeps today's
+/// untyped handling.
+fn means_unreachable(e: pcsc::Error) -> bool {
+    use pcsc::Error as E;
+    matches!(
+        e,
+        E::ResetCard
+            | E::RemovedCard
+            | E::NoSmartcard
+            | E::UnpoweredCard
+            | E::UnresponsiveCard
+            | E::ReaderUnavailable
+            | E::UnknownReader
+            | E::CommError
+            | E::CommDataLost
+            | E::NoReadersAvailable
+            | E::NoService
+            | E::ServiceStopped
+            | E::Shutdown
+            | E::InvalidHandle
+            | E::SharingViolation
+    )
+}
+
+/// The `BridgeError` for a failed PC/SC call, `context: e` either way: a
+/// [`BridgeError::CardUnreachable`] when the failure means the card cannot be
+/// reached ([`means_unreachable`]), otherwise the untyped `Ims` error the
+/// transport always returned. Every PC/SC failure the transport returns goes
+/// through here, so the type is decided in one place (#233).
+pub(crate) fn pcsc_failure(context: &str, e: pcsc::Error) -> BridgeError {
+    let text = format!("{context}: {e}");
+    if means_unreachable(e) {
+        BridgeError::CardUnreachable(text)
+    } else {
+        BridgeError::Ims(text)
+    }
+}
+
 /// Reader names pcscd assigns its virtual vpcd slots — never a real reader
 /// we should connect to for IMS-AKA.
 const VPCD_READER_MARKER: &str = "Virtual PCD";
@@ -109,18 +161,20 @@ impl PcscTransport {
     /// fatal, since `pcscd` legitimately reports many candidates.
     pub fn connect(target_imsi: &str) -> BridgeResult<Self> {
         let ctx = Context::establish(Scope::User)
-            .map_err(|e| BridgeError::Ims(format!("PC/SC context establish failed: {e}")))?;
+            .map_err(|e| pcsc_failure("PC/SC context establish failed", e))?;
 
         let mut readers_buf = [0u8; 2048];
         let readers: Vec<String> = ctx
             .list_readers(&mut readers_buf)
-            .map_err(|e| BridgeError::Ims(format!("PC/SC list_readers failed: {e}")))?
+            .map_err(|e| pcsc_failure("PC/SC list_readers failed", e))?
             .map(|name| name.to_string_lossy().into_owned())
             .collect();
 
         let candidates = real_reader_candidates(&readers);
+        // No reader at all is an unreachable card too: the reader may be
+        // re-enumerating, or unplugged until the operator puts it back.
         if candidates.is_empty() {
-            return Err(BridgeError::Ims(format!(
+            return Err(BridgeError::CardUnreachable(format!(
                 "no real PC/SC reader found (pcscd sees only vpcd virtual slots \
                  or nothing at all); readers seen: {readers:?}"
             )));
@@ -183,7 +237,9 @@ impl PcscTransport {
             }
         }
 
-        Err(BridgeError::Ims(format!(
+        // Our card is not in any reader right now (pulled, or a reader that
+        // failed to answer the probe): unreachable, not a fault.
+        Err(BridgeError::CardUnreachable(format!(
             "no PC/SC reader has a card matching IMSI {target_imsi} \
              (readers checked: {candidates:?}, IMSIs seen: {imsis_seen:?})"
         )))
@@ -217,7 +273,7 @@ impl PcscTransport {
         let mut tx = self
             .card
             .transaction()
-            .map_err(|e| BridgeError::Ims(format!("PC/SC transaction begin failed: {e}")))?;
+            .map_err(|e| pcsc_failure("PC/SC transaction begin failed", e))?;
         let result = f(&mut tx);
         let _ = tx.end(Disposition::LeaveCard);
         result
@@ -231,7 +287,7 @@ impl ApduTransport for PcscTransport {
         let rapdu = self
             .card
             .transmit(&apdu, &mut recv_buf)
-            .map_err(|e| BridgeError::Ims(format!("PC/SC transmit failed: {e}")))?;
+            .map_err(|e| pcsc_failure("PC/SC transmit failed", e))?;
         Ok(crate::modules::usim::hex_encode(rapdu))
     }
 
@@ -260,7 +316,7 @@ impl ApduTransport for Transaction<'_> {
         let mut recv_buf = [0u8; MAX_BUFFER_SIZE];
         let rapdu = self
             .transmit(&apdu, &mut recv_buf)
-            .map_err(|e| BridgeError::Ims(format!("PC/SC transmit failed: {e}")))?;
+            .map_err(|e| pcsc_failure("PC/SC transmit failed", e))?;
         Ok(crate::modules::usim::hex_encode(rapdu))
     }
 }
@@ -314,6 +370,87 @@ mod tests {
     #[test]
     fn empty_when_no_readers_at_all() {
         assert!(real_reader_candidates(&[]).is_empty());
+    }
+
+    /// The PC/SC errors that mean the card cannot be reached (#233).
+    const UNREACHABLE: [pcsc::Error; 15] = [
+        pcsc::Error::ResetCard,
+        pcsc::Error::RemovedCard,
+        pcsc::Error::NoSmartcard,
+        pcsc::Error::UnpoweredCard,
+        pcsc::Error::UnresponsiveCard,
+        pcsc::Error::ReaderUnavailable,
+        pcsc::Error::UnknownReader,
+        pcsc::Error::CommError,
+        pcsc::Error::CommDataLost,
+        pcsc::Error::NoReadersAvailable,
+        pcsc::Error::NoService,
+        pcsc::Error::ServiceStopped,
+        pcsc::Error::Shutdown,
+        pcsc::Error::InvalidHandle,
+        pcsc::Error::SharingViolation,
+    ];
+
+    #[test]
+    fn unreachable_pcsc_errors_are_typed() {
+        for e in UNREACHABLE {
+            let err = pcsc_failure("PC/SC transmit failed", e);
+            assert!(err.is_card_unreachable(), "{e:?} -> {err:?}");
+            assert!(
+                err.to_string()
+                    .ends_with(&format!("PC/SC transmit failed: {e}")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_pcsc_errors_stay_untyped() {
+        for e in [
+            pcsc::Error::Timeout,
+            pcsc::Error::InvalidParameter,
+            pcsc::Error::ProtoMismatch,
+            pcsc::Error::NotTransacted,
+            pcsc::Error::InternalError,
+        ] {
+            match pcsc_failure("PC/SC transmit failed", e) {
+                BridgeError::Ims(text) => assert_eq!(text, format!("PC/SC transmit failed: {e}")),
+                other => panic!("{e:?} became {other:?}"),
+            }
+        }
+    }
+
+    /// The registration paths classify failures by their text. The typed
+    /// error must get the same verdict from each classifier as the untyped
+    /// one it replaces, or a reader outage would change how a failure is
+    /// reported or which P-CSCF is blamed.
+    #[test]
+    fn typed_text_keeps_every_classifier_verdict() {
+        use crate::ims::{classify_register_failure, session::map_registration_error};
+        let mut texts: Vec<String> = UNREACHABLE
+            .iter()
+            .map(|e| format!("PC/SC transmit failed: {e}"))
+            .collect();
+        texts.push(
+            "no PC/SC reader has a card matching IMSI 001010000000001 \
+             (readers checked: [\"OMNIKEY\"], IMSIs seen: [])"
+                .to_string(),
+        );
+        texts.push("no real PC/SC reader found; readers seen: []".to_string());
+        for text in texts {
+            let before = BridgeError::Ims(text.clone());
+            let after = BridgeError::CardUnreachable(text);
+            assert_eq!(
+                map_registration_error(&after),
+                map_registration_error(&before),
+                "{after}"
+            );
+            assert_eq!(
+                classify_register_failure(&after),
+                classify_register_failure(&before),
+                "{after}"
+            );
+        }
     }
 }
 
@@ -463,6 +600,40 @@ mod hardware {
                 let _ = thread.join();
             }
         }
+    }
+
+    #[test]
+    #[ignore = "needs a PC/SC reader with a SIM; run with --ignored on the reader host"]
+    fn a_reset_by_another_program_is_card_unreachable() {
+        // #233: another program resetting the card is the commonest way a
+        // card-reader line loses its SIM for a moment. Our next command must
+        // say "unreachable", so the line retries instead of giving up.
+        let ctx = context();
+        let reader = first_real_reader(&ctx);
+        let imsi = card_imsi(&ctx, &reader);
+        let mut transport = PcscTransport::connect(&imsi).expect("connect by IMSI failed");
+
+        let other = context();
+        let resetter = other
+            .connect(&reader, ShareMode::Shared, Protocols::ANY)
+            .expect("second connect failed");
+        // A bare `Card` drop releases with `SCARD_RESET_CARD`.
+        drop(resetter);
+
+        let err = transport
+            .transmit_apdu("00A4000C023F00")
+            .expect_err("a command after another program's reset succeeded");
+        assert!(err.is_card_unreachable(), "{err:?}");
+    }
+
+    #[test]
+    #[ignore = "needs a PC/SC reader with a SIM; run with --ignored on the reader host"]
+    fn no_reader_with_this_imsi_is_card_unreachable() {
+        let err = match PcscTransport::connect("001010000000001") {
+            Ok(_) => panic!("a reader holds the synthetic test IMSI"),
+            Err(e) => e,
+        };
+        assert!(err.is_card_unreachable(), "{err:?}");
     }
 
     /// Rounds of each sequence run against the competitor.
