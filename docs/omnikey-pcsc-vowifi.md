@@ -193,6 +193,26 @@ pcscd accepts connections on its control socket, and a line whose MCC/MNC is
 read from the card retries that read every 5 seconds for about 70 seconds
 (logging the reason each time) before the line is skipped.
 
+**The card was out of reach.** Another program reset the card, the card was
+pulled, the reader dropped off USB, or pcscd stopped. If this happens while the
+carrier challenges a registration refresh, the line asks the card the same
+challenge again every 2 seconds for 30 seconds (`the SIM is out of reach; asking
+it the same challenge again`). If the card is still out of reach, the line
+keeps the registration it has (`the SIM stayed out of reach; keeping the
+registration and waiting for the card`, and `vowifi-status` shows
+`last_refresh: awaiting-card`). It checks the card locally, at most once a
+minute, and refreshes the registration in place when the card answers. It
+registers in full only when the registration is about to end and no call is up.
+A full registration that fails because the card is out of reach is retried on
+the usual backoff (at most every 2 minutes), and does not count toward the
+agent's exit after six failed registrations: expect `the SIM is out of reach; retrying the registration without counting
+toward the restart budget` and `last_failure: … SIM card unreachable: …`. A
+card that is out of reach when the agent starts still makes the agent exit, and
+the supervisor restarts it. The ePDG tunnel also needs the card (EAP-AKA): if it
+has to be rebuilt while the card is out (`SCardConnect: No smart card
+inserted`), the line restarts every few seconds until the card is back, then
+registers within seconds.
+
 ## Running on a host with its own pcscd
 
 Inside the Docker image nothing else provides pcscd, so the bridge starts its

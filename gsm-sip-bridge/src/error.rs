@@ -18,6 +18,19 @@ pub enum BridgeError {
     Sms(String),
     #[error("IMS error: {0}")]
     Ims(String),
+    /// A card-reader SIM that the bridge cannot reach right now: reset by
+    /// another program, pulled, unpowered, its reader gone, or pcscd itself
+    /// down (#233). Built only by the PC/SC transport
+    /// (`modules::pcsc_card::pcsc_failure` and `PcscTransport::connect`), so
+    /// it never describes a modem line or an answer from the card itself.
+    ///
+    /// Recognise it with [`BridgeError::is_card_unreachable`], never by its
+    /// text. The text keeps the `IMS error:` prefix and adds no word the
+    /// existing text classifiers (`map_registration_error`,
+    /// `classify_register_failure`) look for, so they classify it exactly as
+    /// they did the untyped error it replaces.
+    #[error("IMS error: SIM card unreachable: {0}")]
+    CardUnreachable(String),
     /// An I/O failure that is not attributable to a more specific subsystem.
     ///
     /// This variant exists because `From<std::io::Error>` used to map *every*
@@ -41,6 +54,14 @@ impl From<rusqlite::Error> for BridgeError {
 impl From<toml::de::Error> for BridgeError {
     fn from(e: toml::de::Error) -> Self {
         BridgeError::Config(e.to_string())
+    }
+}
+
+impl BridgeError {
+    /// Whether this is a card-reader SIM the bridge cannot reach right now
+    /// (#233), rather than a failure the card or the network reported.
+    pub fn is_card_unreachable(&self) -> bool {
+        matches!(self, BridgeError::CardUnreachable(_))
     }
 }
 
@@ -78,6 +99,14 @@ mod tests {
             }
             other => panic!("expected Io, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_unreachable_card_keeps_the_ims_prefix_and_is_typed() {
+        let e = BridgeError::CardUnreachable("x".to_string());
+        assert_eq!(e.to_string(), "IMS error: SIM card unreachable: x");
+        assert!(e.is_card_unreachable());
+        assert!(!BridgeError::Ims("SIM card unreachable: x".to_string()).is_card_unreachable());
     }
 
     /// A genuine config parse failure still reports as one.

@@ -1196,6 +1196,7 @@ impl Rig {
         rig.st.reauth_env = registration_refresh::ReauthEnv {
             open_card: Arc::new(card(replies, sim_delay)),
             xfrm: Arc::new(move || Box::new(table.clone())),
+            timing: crate::ims::registration_auth::CardTiming::default(),
         };
         (rig, kernel)
     }
@@ -1819,4 +1820,413 @@ fn a_call_declined_busy_from_the_ring_wait_is_the_loops_decline() {
         ack_disposition(&ack, None, &rig.st.recent_declines, Instant::now()),
         AckDisposition::DeclinedCall
     );
+}
+
+// --- a card-reader SIM out of reach during a challenged refresh (#233) -------
+
+use crate::ims::registration_auth::gated::{card_after, card_when, Opener};
+use crate::ims::registration_auth::scripted::UNREACHABLE;
+use crate::ims::registration_auth::CardTiming;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+/// A card-reader line on a registration with a Gm association, with the
+/// shortened card timing and `opener` as its card.
+fn reader_rig(opener: Opener) -> (Rig, Kernel, Arc<AtomicUsize>) {
+    let (mut rig, kernel) = Rig::with_sa(vec![success_reply()], Duration::ZERO);
+    rig.cfg.pcsc_reader = true;
+    rig.st.reauth_env.timing = CardTiming::fast();
+    let (open, opens) = opener;
+    rig.st.reauth_env.open_card = Arc::from(open);
+    (rig, kernel, opens)
+}
+
+/// Sends the due refresh and has the network challenge it.
+fn challenge_the_refresh(rig: &mut Rig) {
+    rig.drive().unwrap();
+    let refresh = rig.received().expect("the refresh was sent");
+    rig.answer(&rig.challenge(&refresh));
+}
+
+/// Drives passes until `done` holds, for at most five seconds.
+fn drive_until(rig: &mut Rig, what: &str, done: impl Fn(&Rig) -> bool) {
+    let until = Instant::now() + Duration::from_secs(5);
+    while !done(rig) {
+        rig.drive().unwrap();
+        assert!(Instant::now() < until, "never: {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Drives passes for `span`.
+fn drive_for(rig: &mut Rig, span: Duration) {
+    let until = Instant::now() + span;
+    while Instant::now() < until {
+        rig.drive().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A card-reader line whose challenge has run out of time to reach the card,
+/// now waiting for it.
+fn reader_rig_waiting(opener: Opener) -> (Rig, Kernel, Arc<AtomicUsize>) {
+    let (mut rig, kernel, opens) = reader_rig(opener);
+    challenge_the_refresh(&mut rig);
+    drive_until(&mut rig, "waiting for the card", |r| {
+        r.st.awaiting_card.is_some()
+    });
+    (rig, kernel, opens)
+}
+
+/// A card that is out of reach until the returned flag is set.
+fn card_until_flipped() -> (Opener, Arc<AtomicBool>) {
+    let back = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&back);
+    (
+        card_when(
+            move |_| flag.load(Ordering::SeqCst),
+            vec![success_reply()],
+            Duration::ZERO,
+        ),
+        back,
+    )
+}
+
+fn set_expiry(rig: &Rig, at: SystemTime) {
+    rig.status.lock().unwrap().expires_at = Some(at);
+}
+
+#[test]
+fn card_reader_challenge_survives_two_resets() {
+    let (mut rig, _kernel, opens) =
+        reader_rig(card_after(2, vec![success_reply()], Duration::ZERO));
+    rig.st.active_call = Some(test_active_call("c1", "our-to-tag", CALLER_FROM));
+    challenge_the_refresh(&mut rig);
+    let (answer, _) = rig.next_register();
+    assert!(answer.contains("response=\""), "{answer}");
+    assert!(
+        !answer.contains("last-response"),
+        "the answer, not the cached one"
+    );
+    assert!(!answer.contains("auts="));
+    assert!(!rig.st.force_renewal);
+    assert!(rig.st.challenged.is_none());
+    assert!(rig.st.awaiting_card.is_none());
+    assert_eq!(opens.load(Ordering::SeqCst), 3);
+    assert!(rig.st.active_call.is_some(), "the call is untouched");
+}
+
+#[test]
+fn card_reader_reset_mid_aka_is_retried() {
+    let (mut rig, _kernel, opens) = reader_rig(card_after(
+        0,
+        vec![UNREACHABLE.into(), success_reply()],
+        Duration::ZERO,
+    ));
+    challenge_the_refresh(&mut rig);
+    let (answer, _) = rig.next_register();
+    assert!(answer.contains("response=\"") && !answer.contains("last-response"));
+    assert!(!rig.st.force_renewal);
+    assert_eq!(opens.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn card_reader_retry_that_finds_the_sqn_moved_resynchronises() {
+    let (mut rig, _kernel, _opens) = reader_rig(card_after(
+        1,
+        vec![sync_failure_reply(), success_reply()],
+        Duration::ZERO,
+    ));
+    challenge_the_refresh(&mut rig);
+    let (resync, _) = rig.next_register();
+    assert!(resync.contains("auts=\""), "{resync}");
+    assert!(!rig.st.force_renewal);
+}
+
+#[test]
+fn card_reader_card_error_is_not_retried() {
+    let (mut rig, _kernel, opens) = reader_rig(card_after(0, vec!["6982".into()], Duration::ZERO));
+    challenge_the_refresh(&mut rig);
+    drive_until(&mut rig, "a full registration", |r| r.st.force_renewal);
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    assert!(rig.st.awaiting_card.is_none());
+    assert!(rig.received().is_none(), "no answer was sent");
+}
+
+#[test]
+fn modem_line_unreachable_error_still_falls_back_at_once() {
+    let (mut rig, _kernel, opens) =
+        reader_rig(card_after(5, vec![success_reply()], Duration::ZERO));
+    rig.cfg.pcsc_reader = false;
+    challenge_the_refresh(&mut rig);
+    drive_until(&mut rig, "a full registration", |r| r.st.force_renewal);
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    assert!(rig.st.awaiting_card.is_none());
+}
+
+#[test]
+fn card_reader_stuck_card_ends_the_challenge_at_its_deadline_and_blocks_the_next_check() {
+    // The SIM takes 1.2 s inside the AKA: longer than the shortened window
+    // plus its bound (500 ms).
+    let (mut rig, _kernel, opens) = reader_rig(card_after(
+        0,
+        vec![success_reply()],
+        Duration::from_millis(1200),
+    ));
+    rig.drive().unwrap();
+    let refresh = rig.received().unwrap();
+    let challenged_at = Instant::now();
+    rig.answer(&rig.challenge(&refresh));
+    drive_until(&mut rig, "waiting for the card", |r| {
+        r.st.awaiting_card.is_some()
+    });
+    assert!(
+        challenged_at.elapsed() < Duration::from_millis(900),
+        "given up after {:?}, not at its deadline",
+        challenged_at.elapsed()
+    );
+    assert!(!rig.st.force_renewal, "the registration is kept");
+    // The stuck attempt still holds the card. No check starts beside it,
+    // although checks are due every 20 to 80 ms.
+    while challenged_at.elapsed() < Duration::from_millis(1000) {
+        rig.drive().unwrap();
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            1,
+            "a second worker went to the card"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Once it returns, a check finds the card and the refresh goes out.
+    let (request, _) = rig.next_register();
+    assert_eq!(opens.load(Ordering::SeqCst), 2);
+    assert!(request.contains("last-response"), "an ordinary refresh");
+}
+
+#[test]
+fn card_reader_outage_past_the_window_keeps_the_registration() {
+    let (mut rig, kernel, _opens) =
+        reader_rig_waiting(card_after(usize::MAX, vec![], Duration::ZERO));
+    let states = kernel.states();
+    let local = rig.session.local_addr;
+    let spi = rig.session.gm_state.as_ref().unwrap().theirs.spi_c;
+    assert!(!rig.st.force_renewal);
+    assert!(rig.st.challenged.is_none());
+    assert!(rig.st.registration_refresh.is_none());
+    assert_eq!(rig.st.last_refresh.as_ref().unwrap().1, "awaiting-card");
+    // The refresh is overdue the whole time, and checks keep failing.
+    drive_for(&mut rig, Duration::from_millis(300));
+    assert!(rig.received().is_none(), "no REGISTER while waiting");
+    assert!(rig.st.awaiting_card.is_some());
+    assert!(!rig.st.force_renewal);
+    assert_eq!(rig.session.local_addr, local);
+    assert_eq!(rig.session.gm_state.as_ref().unwrap().theirs.spi_c, spi);
+    assert_eq!(kernel.states(), states);
+}
+
+#[test]
+fn card_reader_card_back_sends_one_in_place_refresh() {
+    let (opener, back) = card_until_flipped();
+    let (mut rig, _kernel, _opens) = reader_rig_waiting(opener);
+    drive_for(&mut rig, Duration::from_millis(50));
+    back.store(true, Ordering::SeqCst);
+    let (request, _) = rig.next_register();
+    assert!(
+        request.contains("last-response"),
+        "the cached authorization"
+    );
+    assert!(!request.contains("auts="));
+    assert!(rig.st.awaiting_card.is_none());
+    assert!(!rig.st.force_renewal);
+    drive_for(&mut rig, Duration::from_millis(200));
+    assert!(rig.received().is_none(), "only one refresh");
+    let ok = rig.reply_to(&request, 200, &[("Contact", &rig.contact(3600))]);
+    assert!(rig.answer(&ok));
+    assert_eq!(rig.st.last_refresh.as_ref().unwrap().1, "ok");
+}
+
+#[test]
+fn card_reader_margin_or_lapse_when_idle_registers_in_full() {
+    for (how, at) in [
+        ("margin", SystemTime::now() + Duration::from_secs(30)),
+        ("lapsed", SystemTime::now() - Duration::from_secs(1)),
+    ] {
+        let (mut rig, _kernel, _opens) =
+            reader_rig_waiting(card_after(usize::MAX, vec![], Duration::ZERO));
+        set_expiry(&rig, at);
+        rig.drive().unwrap();
+        assert!(rig.st.force_renewal, "{how}");
+        assert!(rig.st.awaiting_card.is_none(), "{how}");
+        rig.drive().unwrap();
+        assert!(rig.received().is_none(), "{how}: no REGISTER");
+    }
+}
+
+#[test]
+fn card_reader_margin_during_a_call_keeps_waiting_and_refreshes_in_place() {
+    let (opener, back) = card_until_flipped();
+    let (mut rig, _kernel, _opens) = reader_rig_waiting(opener);
+    rig.st.active_call = Some(test_active_call("c1", "our-to-tag", CALLER_FROM));
+    set_expiry(&rig, SystemTime::now() - Duration::from_secs(1));
+    drive_for(&mut rig, Duration::from_millis(100));
+    assert!(
+        !rig.st.force_renewal,
+        "a full registration would cut the call"
+    );
+    assert!(rig.st.awaiting_card.is_some());
+    back.store(true, Ordering::SeqCst);
+    let (request, _) = rig.next_register();
+    assert!(request.contains("last-response"), "an in-place refresh");
+    assert!(rig.st.active_call.is_some());
+}
+
+/// A path that asks for a full registration, by name.
+type Takeover = (&'static str, fn(&mut Rig));
+
+#[test]
+fn card_reader_waiting_ends_on_every_takeover() {
+    let takeovers: [Takeover; 4] = [
+        ("force_renewal", |r| r.st.force_renewal = true),
+        ("refresh_fallback", |r| r.st.refresh_fallback = true),
+        ("network deregistration", |r| {
+            let _ = r.st.on_network_deregistration(
+                Instant::now(),
+                false,
+                &Deregistration {
+                    event: DeregEvent::Unregistered,
+                    retry_after: None,
+                    scope: crate::ims::session::DeregScope::BindingRemoved,
+                },
+                Duration::from_secs(60),
+            );
+        }),
+        ("P-CSCF failover", |r| {
+            r.pool("127.0.0.2");
+            let failure = RegisterFailure {
+                error: BridgeError::Ims(
+                    "IMS registration refresh timed out waiting for a SIP response (Timer F)"
+                        .into(),
+                ),
+                status: None,
+                retry_after: None,
+            };
+            let addr = r.session.pcscf_addr.ip();
+            r.st.on_renewal_failure(addr, &failure, true, SystemTime::now())
+                .unwrap();
+            assert!(
+                r.st.force_renewal,
+                "the failover asks for a full registration"
+            );
+        }),
+    ];
+    for (how, take_over) in takeovers {
+        let (mut rig, _kernel, _opens) =
+            reader_rig_waiting(card_after(usize::MAX, vec![], Duration::ZERO));
+        take_over(&mut rig);
+        rig.drive().unwrap();
+        assert!(rig.st.awaiting_card.is_none(), "{how}");
+        rig.drive().unwrap();
+        assert!(rig.received().is_none(), "{how}: no REGISTER");
+    }
+}
+
+#[test]
+fn card_reader_check_card_error_falls_back() {
+    let (mut rig, _kernel, _opens) =
+        reader_rig_waiting(card_after(usize::MAX, vec![], Duration::ZERO));
+    rig.st.reauth_env.open_card = Arc::new(|_| Err(BridgeError::Ims("card answered 6F00".into())));
+    drive_until(&mut rig, "a full registration", |r| r.st.force_renewal);
+    assert!(rig.st.awaiting_card.is_none());
+    assert_eq!(rig.st.last_refresh.as_ref().unwrap().1, "error");
+}
+
+// --- a full registration while the card reader's SIM is out of reach (#233) --
+//
+// `on_idle_tick`'s full registration calls the real `attempt_renewal`, which
+// needs a SIM CI does not have, so these tests hand `on_full_renewal_failure`
+// the failure `attempt_renewal` returns.
+
+fn card_unreachable_failure() -> RegisterFailure {
+    RegisterFailure {
+        error: crate::ims::registration_auth::scripted::reset_error(),
+        status: None,
+        retry_after: None,
+    }
+}
+
+fn forbidden_failure() -> RegisterFailure {
+    RegisterFailure {
+        error: BridgeError::Ims("renewal REGISTER rejected: 403 Forbidden".into()),
+        status: Some(403),
+        retry_after: None,
+    }
+}
+
+#[test]
+fn card_reader_unreachable_full_registration_never_spends_the_budget() {
+    let mut rig = Rig::new();
+    rig.pool("127.0.0.2");
+    let target = rig.session.pcscf_addr.ip();
+    for n in 1..=2 * MAX_CONSECUTIVE_RENEWAL_FAILURES {
+        rig.st
+            .on_full_renewal_failure(target, &card_unreachable_failure(), true, true)
+            .unwrap_or_else(|e| panic!("failure {n} exited the agent: {e}"));
+    }
+    assert_eq!(rig.st.consecutive_renewal_failures, 0);
+    assert!(rig.st.next_renewal_attempt.is_some());
+    assert_eq!(rig.st.backoff, RETRY_MAX_BACKOFF);
+    assert!(!rig.st.force_renewal, "no failover");
+    assert!(!rig.st.pool.is_marked(target, SystemTime::now()));
+    assert_eq!(rig.st.pool.candidates(SystemTime::now()).len(), 2);
+}
+
+#[test]
+fn card_reader_other_failures_still_count() {
+    let mut rig = Rig::new();
+    let target = rig.session.pcscf_addr.ip();
+    for n in 1..=MAX_CONSECUTIVE_RENEWAL_FAILURES {
+        rig.st
+            .on_full_renewal_failure(target, &card_unreachable_failure(), true, true)
+            .unwrap();
+        let result = rig
+            .st
+            .on_full_renewal_failure(target, &forbidden_failure(), true, true);
+        assert_eq!(rig.st.consecutive_renewal_failures, n);
+        assert_eq!(
+            result.is_err(),
+            n == MAX_CONSECUTIVE_RENEWAL_FAILURES,
+            "403 number {n}"
+        );
+    }
+}
+
+#[test]
+fn modem_line_unreachable_failures_still_count() {
+    let mut rig = Rig::new();
+    let target = rig.session.pcscf_addr.ip();
+    for n in 1..=MAX_CONSECUTIVE_RENEWAL_FAILURES {
+        let result =
+            rig.st
+                .on_full_renewal_failure(target, &card_unreachable_failure(), true, false);
+        assert_eq!(
+            result.is_err(),
+            n == MAX_CONSECUTIVE_RENEWAL_FAILURES,
+            "failure {n}"
+        );
+    }
+}
+
+#[test]
+fn card_reader_success_after_exempt_failures_clears_the_ladder() {
+    let mut rig = Rig::new();
+    let target = rig.session.pcscf_addr.ip();
+    for _ in 0..3 {
+        rig.st
+            .on_full_renewal_failure(target, &card_unreachable_failure(), true, true)
+            .unwrap();
+    }
+    assert!(rig.st.backoff > RETRY_INITIAL_BACKOFF);
+    rig.st.on_renewal_success();
+    assert_eq!(rig.st.backoff, RETRY_INITIAL_BACKOFF);
+    assert!(rig.st.next_renewal_attempt.is_none());
+    assert_eq!(rig.st.consecutive_renewal_failures, 0);
 }

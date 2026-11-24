@@ -159,6 +159,11 @@ Greptile has *actually* found here, at least once, and usually more.
       `Card::drop` resets the card (`SCARD_RESET_CARD`), which breaks every
       other program's session on that SIM: charon, a sibling line, or this
       line's own re-authentication (#232).
+- [ ] A card-reader line's "card out of reach" is
+      `BridgeError::CardUnreachable`: test it with `is_card_unreachable()`,
+      never with PC/SC message text, and build every new PC/SC failure
+      through `pcsc_card::pcsc_failure` so the type is decided in one place
+      (#233).
 - [ ] Device selection is bound to the **line's identity** (match on IMSI), not
       "the first reader that isn't vpcd" — otherwise line 1 authenticates with
       line 0's SIM.
