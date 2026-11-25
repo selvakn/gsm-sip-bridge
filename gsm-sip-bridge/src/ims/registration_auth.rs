@@ -309,11 +309,16 @@ fn answer_once<F>(
 where
     F: FnOnce(&ImsRegisterConfig) -> BridgeResult<OpenedCard>,
 {
-    let OpenedCard { mut card, imsi, .. } = open(&job.cfg)?;
+    let OpenedCard {
+        mut card,
+        imsi,
+        opened,
+        ..
+    } = open(&job.cfg)?;
     if cancelled.load(Ordering::SeqCst) {
         return Err(abandoned());
     }
-    answer_challenge(card.as_mut(), &imsi, job, challenge)
+    answer_challenge(card.as_mut(), &imsi, &opened, job, challenge)
 }
 
 fn abandoned() -> BridgeError {
@@ -324,13 +329,17 @@ fn abandoned() -> BridgeError {
 fn answer_challenge(
     card: &mut dyn crate::modules::usim::ApduTransport,
     imsi: &str,
+    opened: &crate::ims::OpenTimings,
     job: &ChallengeJob,
     challenge: &DigestChallenge,
 ) -> BridgeResult<Answer> {
     // The private identity is always IMSI-based (TS 33.203), whatever public
     // identity the registration uses.
     let impi_uri = format!("{imsi}@{}", job.realm);
-    match run_aka(card, challenge)? {
+    let authenticating = Instant::now();
+    let aka = run_aka(card, challenge);
+    crate::ims::log_aka_timings(opened, authenticating.elapsed(), &aka);
+    match aka? {
         AkaResult::Success { res, ck, ik } => Ok(Answer::Authenticated {
             authorization: build_authorization(&impi_uri, challenge, &job.uri, &res),
             ik,
@@ -430,6 +439,7 @@ pub(crate) mod scripted {
                 }),
                 imsi: "001010000000001".into(),
                 imei: "350000000000001".into(),
+                opened: Default::default(),
             })
         }
     }
@@ -445,6 +455,7 @@ impl scripted::Sim {
             }),
             imsi: "001010000000001".into(),
             imei: "350000000000001".into(),
+            opened: Default::default(),
         }
     }
 }
@@ -586,6 +597,7 @@ mod tests {
                 card: Box::new(Probe(saw)),
                 imsi: "001010000000001".into(),
                 imei: "350000000000001".into(),
+                opened: Default::default(),
             })
         });
         work.cancel();
@@ -780,5 +792,87 @@ mod tests {
             assert!(Instant::now() < until, "the worker never finished");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::scripted::*;
+    use super::*;
+    use crate::modules::at_worker::test_log;
+
+    fn job() -> ChallengeJob {
+        ChallengeJob {
+            cfg: crate::ims::test_register_config(),
+            realm: "ims.example".into(),
+            uri: "sip:ims.example".into(),
+            www_authenticate: challenge_header(),
+        }
+    }
+
+    fn answer(open: impl FnOnce(&ImsRegisterConfig) -> BridgeResult<OpenedCard>) -> String {
+        let job = job();
+        let params = parse_digest_challenge(&job.www_authenticate).unwrap();
+        let challenge = extract_challenge(&params).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let (result, logs) = test_log::capture(|| answer_once(&job, open, &cancelled, &challenge));
+        result.expect("answered");
+        logs
+    }
+
+    fn timing_line(logs: &str) -> &str {
+        let lines: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("SIM challenge timings"))
+            .collect();
+        assert_eq!(lines.len(), 1, "one timing line per AKA run: {logs}");
+        assert!(lines[0].contains("DEBUG"), "{}", lines[0]);
+        lines[0]
+    }
+
+    fn ms_field(line: &str, name: &str) -> u64 {
+        let at = line
+            .find(&format!("{name}="))
+            .unwrap_or_else(|| panic!("no {name}: {line}"));
+        line[at + name.len() + 1..]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn each_aka_run_logs_one_timing_line() {
+        let delay = Duration::from_millis(50);
+        let open_ms = Duration::from_millis(7);
+        let logs = answer(move |cfg| {
+            let mut opened = card(vec![success_reply()], delay)(cfg)?;
+            opened.opened = crate::ims::OpenTimings {
+                open: open_ms,
+                select: Some(Duration::from_millis(3)),
+            };
+            Ok(opened)
+        });
+        let line = timing_line(&logs);
+        assert!(ms_field(line, "authenticate_ms") >= 50, "{line}");
+        assert_eq!(ms_field(line, "open_ms"), 7, "{line}");
+        assert_eq!(ms_field(line, "select_ms"), 3, "{line}");
+        assert!(line.contains("outcome=\"success\""), "{line}");
+
+        let logs = answer(card(vec![sync_failure_reply()], Duration::ZERO));
+        assert!(
+            timing_line(&logs).contains("outcome=\"sync-failure\""),
+            "{logs}"
+        );
+    }
+
+    /// Pinned to `contracts/operator-surface.md`: a card reader selects inside
+    /// its AKA, so the line carries no `select_ms` at all.
+    #[test]
+    fn a_card_reader_aka_logs_no_select_time() {
+        let logs = answer(card(vec![success_reply()], Duration::ZERO));
+        let line = timing_line(&logs);
+        assert!(!line.contains("select_ms"), "{line}");
     }
 }

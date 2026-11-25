@@ -1098,6 +1098,42 @@ pub(crate) struct OpenedCard {
     pub(crate) card: Box<dyn ApduTransport>,
     pub(crate) imsi: String,
     pub(crate) imei: String,
+    /// How long opening the card took, for the AKA timing line.
+    pub(crate) opened: OpenTimings,
+}
+
+/// How long [`open_card`] took, logged with each AKA run's own time
+/// ([`log_aka_timings`], #237).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct OpenTimings {
+    /// Opening the port or reader (a modem's includes its sync) and reading
+    /// the identities.
+    pub(crate) open: std::time::Duration,
+    /// A modem's EF_DIR walk plus SELECT. `None` on a card-reader line, which
+    /// selects inside each AKA.
+    pub(crate) select: Option<std::time::Duration>,
+}
+
+/// One debug line per AKA run: how long the card took to open, to select the
+/// USIM, and to answer the challenge, and how it answered. The data for
+/// judging the AKA budget (`usim::AKA_RESPONSE_BUDGET`) on a real SIM.
+pub(crate) fn log_aka_timings(
+    opened: &OpenTimings,
+    aka: std::time::Duration,
+    outcome: &BridgeResult<AkaResult>,
+) {
+    let outcome = match outcome {
+        Ok(AkaResult::Success { .. }) => "success",
+        Ok(AkaResult::SyncFailure { .. }) => "sync-failure",
+        Err(_) => "error",
+    };
+    tracing::debug!(
+        open_ms = opened.open.as_millis() as u64,
+        select_ms = opened.select.map(|d| d.as_millis() as u64),
+        authenticate_ms = aka.as_millis() as u64,
+        outcome,
+        "SIM challenge timings"
+    );
 }
 
 /// Opens the line's SIM, whichever way it is reached. On a modem line it also
@@ -1105,6 +1141,7 @@ pub(crate) struct OpenedCard {
 /// [`OpenedCard`]). The initial registration and a background
 /// re-authentication both start here.
 pub(crate) fn open_card(cfg: &ImsRegisterConfig) -> BridgeResult<OpenedCard> {
+    let started = std::time::Instant::now();
     // A pcsc_reader line's SIM sits in a real PC/SC reader, not the modem at
     // `modem_port` (specs/023-omnikey-pcsc-vowifi). Only one `AtCommander` is
     // ever opened on `modem_port` per call — it must serve both the
@@ -1152,16 +1189,26 @@ pub(crate) fn open_card(cfg: &ImsRegisterConfig) -> BridgeResult<OpenedCard> {
     tracing::info!(imsi = %imsi, "read IMSI from SIM");
     tracing::info!(imei = %imei, "read IMEI from modem");
 
+    let open = started.elapsed();
+
     // A card-reader line found its USIM AID while identifying the card and
     // selects it inside each AKA's transaction; selecting it here, outside
     // one, would protect nothing.
+    let mut select = None;
     if !cfg.pcsc_reader {
+        let selecting = std::time::Instant::now();
         let aid = usim::discover_usim_aid(card.as_mut())?;
         usim::select_usim(card.as_mut(), &aid)?;
+        select = Some(selecting.elapsed());
         tracing::info!(aid = %aid.iter().map(|b| format!("{b:02X}")).collect::<String>(), "selected USIM application");
     }
 
-    Ok(OpenedCard { card, imsi, imei })
+    Ok(OpenedCard {
+        card,
+        imsi,
+        imei,
+        opened: OpenTimings { open, select },
+    })
 }
 
 /// Runs the SIM's AKA on a challenge: the nonce is RAND followed by AUTN,
@@ -1191,6 +1238,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
         mut card,
         imsi,
         imei,
+        opened,
     } = open_card(cfg)?;
 
     let realm = format!("ims.mnc{}.mcc{}.3gppnetwork.org", cfg.mnc, cfg.mcc);
@@ -1320,7 +1368,10 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
             );
         }
 
-        let aka = run_aka(card.as_mut(), &challenge)?;
+        let authenticating = std::time::Instant::now();
+        let aka = run_aka(card.as_mut(), &challenge);
+        log_aka_timings(&opened, authenticating.elapsed(), &aka);
+        let aka = aka?;
 
         cseq += 1;
         // RFC 2617 requires this to match the Request-URI of the message it's

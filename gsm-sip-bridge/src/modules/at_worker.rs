@@ -98,6 +98,27 @@ pub struct ResponseBudget {
     pub timeout: Duration,
 }
 
+/// Why a sync ran, for its stale-bytes warning (`contracts/operator-surface.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncContext {
+    /// A freshly opened or reopened port (`Request::Sync`).
+    Open,
+    /// Suspect-channel recovery (`Request::Resync`).
+    Resync,
+    /// The next command after a timeout in the same session.
+    AfterTimeout,
+}
+
+impl SyncContext {
+    fn as_str(self) -> &'static str {
+        match self {
+            SyncContext::Open => "open",
+            SyncContext::Resync => "resync",
+            SyncContext::AfterTimeout => "after-timeout",
+        }
+    }
+}
+
 /// One request to the worker. Each carries its own reply channel, so a caller
 /// that gives up simply drops the receiver and the worker discovers the
 /// abandonment when its send fails.
@@ -260,7 +281,7 @@ impl Session {
         // healthy path the channel is already in step and a sync would cost
         // two round trips on every command.
         if self.desynced {
-            self.sync(self.timeout)?;
+            self.sync(self.timeout, SyncContext::AfterTimeout)?;
         }
 
         let full = format!("{cmd}\r\n");
@@ -370,7 +391,10 @@ impl Session {
     /// The whole exchange runs against one deadline, `now + bound`. On the
     /// deadline it leaves `desynced` set and returns the same
     /// `AT command timeout` every classifier already reads as a timeout.
-    pub(crate) fn sync(&mut self, bound: Duration) -> BridgeResult<usize> {
+    ///
+    /// A sync that discarded anything logs one warning naming the port and
+    /// `context`; a clean one logs at debug only.
+    pub(crate) fn sync(&mut self, bound: Duration, context: SyncContext) -> BridgeResult<usize> {
         let deadline = Instant::now() + bound;
         let mut discarded = self.rx.len();
         self.rx.clear();
@@ -383,7 +407,20 @@ impl Session {
             discarded += self.read_sync_reply(query, prefix, deadline)?;
         }
         self.desynced = false;
-        tracing::debug!(port = %self.label, discarded_bytes = discarded, "AT channel in step");
+        if discarded > 0 {
+            tracing::warn!(
+                port = %self.label,
+                discarded_bytes = discarded,
+                context = context.as_str(),
+                "discarded stale bytes before the AT channel was in step"
+            );
+        } else {
+            tracing::debug!(
+                port = %self.label,
+                context = context.as_str(),
+                "AT channel in step"
+            );
+        }
         Ok(discarded)
     }
 
@@ -458,8 +495,13 @@ pub(crate) fn run(mut session: Session, rx: mpsc::Receiver<Request>) {
             Request::ReadLine { reply } => {
                 let _ = reply.send(session.read_line_raw());
             }
-            Request::Resync { reply } | Request::Sync { reply } => {
-                let _ = reply.send(session.sync(session.timeout).map(|_| ()));
+            Request::Resync { reply } => {
+                let result = session.sync(session.timeout, SyncContext::Resync);
+                let _ = reply.send(result.map(|_| ()));
+            }
+            Request::Sync { reply } => {
+                let result = session.sync(session.timeout, SyncContext::Open);
+                let _ = reply.send(result.map(|_| ()));
             }
         }
     }
@@ -811,7 +853,7 @@ mod tests {
         let _events = test_modem::spawn(modem, script);
         let err = s.send_command("AT+CIMI").expect_err("provoke a timeout");
         assert!(err.to_string().contains("AT command timeout"), "{err}");
-        s.sync(s.timeout).expect("resync");
+        s.sync(s.timeout, SyncContext::Resync).expect("resync");
         assert!(!s.desynced, "a successful sync clears the desync");
     }
 
@@ -819,7 +861,7 @@ mod tests {
     fn resync_fails_on_a_silent_modem() {
         let (mut s, _modem) = port(Duration::from_millis(100));
         let err = s
-            .sync(s.timeout)
+            .sync(s.timeout, SyncContext::Resync)
             .expect_err("a silent modem cannot be in step");
         assert!(err.to_string().contains("AT command timeout"), "{err}");
     }
@@ -838,7 +880,7 @@ mod tests {
             .reply("AT+CSQ", Duration::ZERO, "\r\n+CSQ: 30,99\r\n\r\nOK\r\n");
         let _events = test_modem::spawn(modem, script);
         assert!(s.send_command("AT+CIMI").is_err(), "provoke a timeout");
-        s.sync(s.timeout).expect("resync");
+        s.sync(s.timeout, SyncContext::Resync).expect("resync");
         match s.send_command("AT+CSQ").unwrap() {
             AtResponse::Ok(lines) => assert_eq!(lines, vec!["+CSQ: 30,99".to_string()]),
             other => panic!("unexpected: {other:?}"),
@@ -875,7 +917,9 @@ mod tests {
         let (mut s, mut modem) = port(Duration::from_millis(500));
         modem.write_all(STALE_CSIM.as_bytes()).expect("stale");
         let _events = csq_modem(modem, test_modem::Script::default());
-        let discarded = s.sync(Duration::from_secs(2)).expect("sync");
+        let discarded = s
+            .sync(Duration::from_secs(2), SyncContext::Open)
+            .expect("sync");
         assert_eq!(discarded, STALE_CSIM.len(), "every stale byte is counted");
         assert_in_step(&mut s);
     }
@@ -887,7 +931,11 @@ mod tests {
         let (mut s, mut modem) = port(Duration::from_millis(500));
         modem.write_all(b"\r\nOK\r\n").expect("stale");
         let _events = csq_modem(modem, test_modem::Script::default());
-        assert_eq!(s.sync(Duration::from_secs(2)).expect("sync"), 6);
+        assert_eq!(
+            s.sync(Duration::from_secs(2), SyncContext::Open)
+                .expect("sync"),
+            6
+        );
         assert_in_step(&mut s);
     }
 
@@ -901,7 +949,9 @@ mod tests {
             ..Default::default()
         };
         let _events = csq_modem(modem, script);
-        let discarded = s.sync(Duration::from_secs(2)).expect("sync");
+        let discarded = s
+            .sync(Duration::from_secs(2), SyncContext::Open)
+            .expect("sync");
         assert_eq!(discarded, STALE_CSIM.len());
         assert_in_step(&mut s);
     }
@@ -916,7 +966,8 @@ mod tests {
             .write_all(test_modem::CMEE_REPLY.as_bytes())
             .expect("stale");
         let _events = csq_modem(modem, test_modem::Script::default());
-        s.sync(Duration::from_secs(2)).expect("sync");
+        s.sync(Duration::from_secs(2), SyncContext::Open)
+            .expect("sync");
         assert_in_step(&mut s);
     }
 
@@ -927,7 +978,9 @@ mod tests {
             .write_all(test_modem::CSCS_REPLY.as_bytes())
             .expect("stale");
         let _events = csq_modem(modem, test_modem::Script::default());
-        let discarded = s.sync(Duration::from_secs(2)).expect("sync");
+        let discarded = s
+            .sync(Duration::from_secs(2), SyncContext::Open)
+            .expect("sync");
         assert_eq!(discarded, test_modem::CSCS_REPLY.len());
         assert_in_step(&mut s);
     }
@@ -942,14 +995,22 @@ mod tests {
             ..Default::default()
         };
         let _events = test_modem::spawn(modem, script);
-        assert_eq!(s.sync(Duration::from_secs(2)).expect("sync"), 0);
+        assert_eq!(
+            s.sync(Duration::from_secs(2), SyncContext::Open)
+                .expect("sync"),
+            0
+        );
     }
 
     #[test]
     fn sync_with_nothing_stale_reports_zero_and_sends_exactly_two_queries() {
         let (mut s, modem) = port(Duration::from_millis(500));
         let events = test_modem::spawn(modem, test_modem::Script::default());
-        assert_eq!(s.sync(Duration::from_secs(2)).expect("sync"), 0);
+        assert_eq!(
+            s.sync(Duration::from_secs(2), SyncContext::Open)
+                .expect("sync"),
+            0
+        );
         // Let the far end log anything else we might have sent.
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(
@@ -965,7 +1026,9 @@ mod tests {
         let bound = Duration::from_millis(300);
         let (mut s, _modem) = port(read_timeout);
         let started = Instant::now();
-        let err = s.sync(bound).expect_err("a silent port cannot be in step");
+        let err = s
+            .sync(bound, SyncContext::Open)
+            .expect_err("a silent port cannot be in step");
         let took = started.elapsed();
         assert!(err.to_string().contains("AT command timeout"), "{err}");
         assert!(took >= bound, "gave up early: {took:?}");
@@ -986,7 +1049,9 @@ mod tests {
         let _events = test_modem::spawn(modem, script);
         let bound = Duration::from_millis(400);
         let started = Instant::now();
-        let err = s.sync(bound).expect_err("ERROR is not the sync's reply");
+        let err = s
+            .sync(bound, SyncContext::Open)
+            .expect_err("ERROR is not the sync's reply");
         assert!(err.to_string().contains("AT command timeout"), "{err}");
         assert!(started.elapsed() < bound + Duration::from_millis(200));
     }
@@ -1001,7 +1066,8 @@ mod tests {
             ..Default::default()
         };
         let events = test_modem::spawn(modem, script);
-        s.sync(Duration::from_secs(2)).expect("sync");
+        s.sync(Duration::from_secs(2), SyncContext::Open)
+            .expect("sync");
         let events = events.lock().unwrap().clone();
         let cmee_tx = events.iter().position(|e| e == "tx:AT+CMEE?");
         let cscs_rx = events.iter().position(|e| e == "rx:AT+CSCS?");
@@ -1009,6 +1075,110 @@ mod tests {
             matches!((cmee_tx, cscs_rx), (Some(tx), Some(rx)) if tx < rx),
             "AT+CSCS? must arrive after the +CMEE reply was written: {events:?}"
         );
+    }
+
+    // ---- #237: the stale-bytes warning (FR-012) ----
+
+    #[test]
+    fn a_sync_that_discarded_bytes_warns_once_with_port_and_count() {
+        let (mut s, mut modem) = port(Duration::from_millis(500));
+        modem.write_all(STALE_CSIM.as_bytes()).expect("stale");
+        let _events = test_modem::spawn(modem, test_modem::Script::default());
+        let (result, logs) =
+            test_log::capture(|| s.sync(Duration::from_secs(2), SyncContext::Open));
+        result.expect("sync");
+        let warnings: Vec<&str> = logs.lines().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{logs}");
+        let w = warnings[0];
+        assert!(
+            w.contains("discarded stale bytes before the AT channel was in step"),
+            "{w}"
+        );
+        assert!(
+            w.contains(&format!("discarded_bytes={}", STALE_CSIM.len())),
+            "{w}"
+        );
+        assert!(w.contains("port=test"), "{w}");
+        assert!(w.contains("context=\"open\""), "{w}");
+    }
+
+    #[test]
+    fn a_clean_sync_logs_nothing_above_debug() {
+        let (mut s, modem) = port(Duration::from_millis(500));
+        let _events = test_modem::spawn(modem, test_modem::Script::default());
+        let (result, logs) =
+            test_log::capture(|| s.sync(Duration::from_secs(2), SyncContext::Open));
+        assert_eq!(result.expect("sync"), 0);
+        assert!(
+            !logs
+                .lines()
+                .any(|l| l.contains("WARN") || l.contains("ERROR") || l.contains("INFO")),
+            "{logs}"
+        );
+    }
+
+    #[test]
+    fn the_sync_after_a_timeout_reports_context_after_timeout() {
+        let (mut s, modem) = port(Duration::from_millis(100));
+        let script = test_modem::Script {
+            late_after: Some((
+                "AT+CSIM".into(),
+                Duration::from_millis(50),
+                STALE_CSIM.into(),
+            )),
+            ..Default::default()
+        };
+        let _events = csq_modem(modem, script);
+        assert!(s.send_command("AT+CSIM=10,\"00A40004\"").is_err());
+        let (result, logs) = test_log::capture(|| s.send_command("AT+CSQ"));
+        result.expect("the command after the timeout");
+        let w = logs
+            .lines()
+            .find(|l| l.contains("WARN"))
+            .unwrap_or_else(|| panic!("no warning: {logs}"));
+        assert!(w.contains("context=\"after-timeout\""), "{w}");
+    }
+}
+
+/// Capture what this thread logs, for tests that pin a log line's shape
+/// (`contracts/operator-surface.md`).
+#[cfg(test)]
+pub(crate) mod test_log {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Buffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+        type Writer = Buffer;
+        fn make_writer(&'a self) -> Buffer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` with every event on this thread, down to `TRACE`, written to
+    /// a buffer, and return its result with the text logged.
+    pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8_lossy(&buffer.0.lock().unwrap()).into_owned();
+        (out, text)
     }
 }
 
