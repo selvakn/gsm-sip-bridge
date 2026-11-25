@@ -54,7 +54,7 @@ use super::at_commander::{AtResponse, ReadWrite};
 /// that make up almost all AT traffic, where anything past a handful of lines
 /// is a runaway. Bulk listings are the documented exception — see
 /// [`ResponseBudget`].
-const MAX_RESPONSE_LINES: usize = 256;
+pub(crate) const MAX_RESPONSE_LINES: usize = 256;
 /// Cap on unparsed bytes held for one response, for the same reason.
 const MAX_BUFFERED_BYTES: usize = 64 * 1024;
 /// The first of the two read-only queries a sync sends (research D2, F12).

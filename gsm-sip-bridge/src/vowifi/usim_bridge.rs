@@ -111,9 +111,17 @@ fn redirect_select_aid(apdu: &[u8], discovered_aid: &[u8]) -> Vec<u8> {
 /// `AT+CSIM` framing — the same primitive `usim::authenticate`/
 /// `select_usim` already use, exposed at `pub(crate)` visibility for this
 /// module without changing behavior for those existing callers.
-fn send_raw_apdu(at: &mut AtCommander, apdu: &[u8]) -> BridgeResult<Vec<u8>> {
+///
+/// `budget` is `None` for the port's own bounds, or
+/// `usim::AKA_RESPONSE_BUDGET` for an AUTHENTICATE and its GET RESPONSE
+/// (see [`forward_apdu`]).
+fn send_raw_apdu(
+    at: &mut AtCommander,
+    apdu: &[u8],
+    budget: Option<crate::modules::at_commander::ResponseBudget>,
+) -> BridgeResult<Vec<u8>> {
     let hex = usim::hex_encode(apdu);
-    let resp_hex = usim::csim(at, &hex)?;
+    let resp_hex = usim::csim_within(at, &hex, budget)?;
     if resp_hex.len() < 4 {
         return Err(BridgeError::Ims(format!(
             "+CSIM reply too short to contain a status word: {resp_hex}"
@@ -129,13 +137,20 @@ fn send_raw_apdu(at: &mut AtCommander, apdu: &[u8]) -> BridgeResult<Vec<u8>> {
 /// `usim::authenticate`'s existing single-chase behavior, generalized to
 /// every APDU instead of just AUTHENTICATE, since any command could hit
 /// it depending on card/firmware.
+///
+/// An AUTHENTICATE (`INS=0x88`) waits `usim::AKA_RESPONSE_BUDGET` for the
+/// SIM's answer, and so does the GET RESPONSE chased for it here: the SIM can
+/// take longer than the port's timeout to compute it (#237). The client's own
+/// later GET RESPONSE is served from the session cache and never reaches the
+/// modem. Every other APDU, and the SELECT retry, keeps the port's bounds.
 fn forward_apdu(at: &mut AtCommander, apdu: &[u8]) -> BridgeResult<Vec<u8>> {
-    let mut resp = send_raw_apdu(at, apdu)?;
+    let budget = (apdu.len() >= 5 && apdu[1] == 0x88).then_some(usim::AKA_RESPONSE_BUDGET);
+    let mut resp = send_raw_apdu(at, apdu, budget)?;
 
     if is_select_with_p2(apdu, 0x00) && trailing_sw(&resp) == Some(0x6B00) {
         tracing::trace!("SELECT P2=0x00 rejected (SW=6B00); retrying with P2=0x0C");
         let retried = rewrite_select_p2(apdu, 0x0C);
-        resp = send_raw_apdu(at, &retried)?;
+        resp = send_raw_apdu(at, &retried, None)?;
     }
 
     if let Some(sw) = trailing_sw(&resp) {
@@ -143,7 +158,7 @@ fn forward_apdu(at: &mut AtCommander, apdu: &[u8]) -> BridgeResult<Vec<u8>> {
             let le = (sw & 0xFF) as u8;
             tracing::trace!(le, "modem returned SW=61xx; chasing GET RESPONSE");
             let get_response = [0x00, 0xC0, 0x00, 0x00, le];
-            resp = send_raw_apdu(at, &get_response)?;
+            resp = send_raw_apdu(at, &get_response, budget)?;
         }
     }
 
@@ -1037,7 +1052,7 @@ mod tests {
             ScriptedModem::new(&["+CSIM: 4,\"90ZZ\"\r\nOK\r\n"]),
             Duration::from_secs(1),
         );
-        assert!(send_raw_apdu(&mut at, &[0x00, 0xA4, 0x00, 0x0C]).is_err());
+        assert!(send_raw_apdu(&mut at, &[0x00, 0xA4, 0x00, 0x0C], None).is_err());
     }
 
     // --- T017: error mapping -------------------------------------------
@@ -1314,5 +1329,71 @@ mod tests {
             started.elapsed() < OPEN_RETRY_BASE_DELAY,
             "an out-of-step port must not be slept on"
         );
+    }
+
+    // ---- #237: the AKA budget on a relayed AUTHENTICATE ----
+
+    mod aka_budget {
+        use super::*;
+        use crate::modules::at_worker::test_modem;
+        use std::os::unix::net::UnixStream;
+
+        const PORT_TIMEOUT: Duration = Duration::from_millis(200);
+        const SLOW: Duration = Duration::from_secs(1);
+
+        fn slow_modem(script: test_modem::Script) -> AtCommander {
+            let (ours, theirs) = UnixStream::pair().expect("socketpair");
+            ours.set_read_timeout(Some(PORT_TIMEOUT))
+                .expect("read timeout");
+            let _events = test_modem::spawn(theirs, script);
+            AtCommander::start_for_test(ours, PORT_TIMEOUT).expect("open")
+        }
+
+        fn csim_reply(hex: &str) -> String {
+            format!("\r\n+CSIM: {},\"{hex}\"\r\n\r\nOK\r\n", hex.len())
+        }
+
+        /// AUTHENTICATE, as charon's EAP-AKA sends it: `00 88 00 81 22`,
+        /// RAND and AUTN.
+        fn authenticate_apdu() -> Vec<u8> {
+            let mut apdu = vec![0x00, 0x88, 0x00, 0x81, 0x22, 0x10];
+            apdu.extend_from_slice(&[0x11; 16]);
+            apdu.push(0x10);
+            apdu.extend_from_slice(&[0x22; 16]);
+            apdu
+        }
+
+        #[test]
+        fn a_relayed_authenticate_gets_the_aka_budget() {
+            let mut at = slow_modem(test_modem::Script::default().reply(
+                "0088008122",
+                SLOW,
+                &csim_reply("DB9000"),
+            ));
+            let resp = forward_apdu(&mut at, &authenticate_apdu()).expect("relayed");
+            assert_eq!(resp, vec![0xDB, 0x90, 0x00]);
+        }
+
+        #[test]
+        fn the_chased_get_response_after_a_relayed_authenticate_gets_the_aka_budget() {
+            let mut at = slow_modem(
+                test_modem::Script::default()
+                    .reply("0088008122", Duration::ZERO, &csim_reply("6103"))
+                    .reply("00C0000003", SLOW, &csim_reply("DB9000")),
+            );
+            let resp = forward_apdu(&mut at, &authenticate_apdu()).expect("relayed");
+            assert_eq!(resp, vec![0xDB, 0x90, 0x00]);
+        }
+
+        #[test]
+        fn a_relayed_select_keeps_the_port_timeout() {
+            let mut at = slow_modem(test_modem::Script::default().reply(
+                "00A4000C023F00",
+                SLOW,
+                &csim_reply("9000"),
+            ));
+            let select = [0x00, 0xA4, 0x00, 0x0C, 0x02, 0x3F, 0x00];
+            assert!(forward_apdu(&mut at, &select).is_err());
+        }
     }
 }

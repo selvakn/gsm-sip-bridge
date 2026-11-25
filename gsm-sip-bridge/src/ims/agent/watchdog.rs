@@ -677,12 +677,14 @@ mod tests {
         // AT command bounded by the AT layer's default timeout.
         let apdus = 16 + 2 + 2;
         let apdu_time = crate::modules::at_commander::DEFAULT_TIMEOUT * apdus;
+        // AUTHENTICATE and its GET RESPONSE wait the SIM's AKA budget (#237).
+        let aka = crate::modules::usim::AKA_RESPONSE_BUDGET.timeout * 2;
         // Two REGISTER round trips (the challenge and the authenticated
         // retry), each bounded by SIP Timer B.
         let register = Duration::from_secs(32) * 2;
         // Installing the Gm SAs shells out to `ip xfrm` ~20 times.
         let sa_install = Duration::from_secs(20);
-        modem_open + identities + apdu_time + register + sa_install
+        modem_open + identities + apdu_time + aka + register + sa_install
     }
 
     #[test]
