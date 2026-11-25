@@ -274,6 +274,7 @@ impl AtCommander {
         Ok(crate::modules::at_worker::Session::new(
             Box::new(port),
             timeout,
+            path.display().to_string(),
         ))
     }
 
@@ -282,6 +283,7 @@ impl AtCommander {
             transport: Transport::Direct(Box::new(crate::modules::at_worker::Session::new(
                 Box::new(stream),
                 timeout,
+                "stream",
             ))),
             path: None,
         }
@@ -451,7 +453,8 @@ impl AtCommander {
 
     /// Bring a suspect channel back, or conclude it is dead (FR-036/FR-037).
     ///
-    /// Cheapest remedy first. A resync costs one bare `AT` and rescues the
+    /// Cheapest remedy first. A resync costs two read-only round trips (the
+    /// worker's `Session::sync`) and rescues the
     /// common case where the worker was merely slow -- no restart, no
     /// interruption. Only if the worker will not answer at all do we try a
     /// fresh open, which succeeds if the stuck worker has since finished and
