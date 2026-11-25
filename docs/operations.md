@@ -142,6 +142,54 @@ then returns to service unattended.
 suppressed. Do not leave this off in production: it reinstates exactly the
 silent outage the watchdog exists to prevent.
 
+### Modem AT port sync: `discarded stale bytes before the AT channel was in step`
+
+Every time the bridge opens a modem's AT port, and before the next command
+after any AT timeout, it first sends two read-only queries (`AT+CMEE?`, then
+`AT+CSCS?`) and waits for their replies. Anything the modem sends before them is
+a reply to an earlier command that was given up on, and is thrown away:
+
+```
+WARN discarded stale bytes before the AT channel was in step port=/dev/ttyUSB0 discarded_bytes=25 context="open"
+```
+
+- `context="open"`: on open or reopen. Another holder of the port (this line's
+  own challenge thread, `vowifi-usim-bridge`, the SMS sweep) timed out and closed
+  the port mid-command, and the modem delivered its late reply to the next
+  opener. Before #237 that reply was read as the next session's first answer,
+  and every reply after it was off by one (seen as `SELECT 3F00 failed:
+  SW=6A83`).
+- `context="after-timeout"` or `context="resync"`: the same, within one session.
+- An unsolicited result code (`RING`, `+CMTI`) arriving in the sync's few
+  milliseconds is counted too.
+
+An occasional warning is the fix working. Many `context="open"` warnings on one
+port mean some holder keeps timing out: look for `AT command timeout` just
+before them.
+
+**A modem that does not answer now fails at open**, after the port's own timeout
+(5 s; 800 ms in discovery), with `discovery error: AT command timeout: <port> did
+not answer its sync within <N> ms`. The open-retry loops (the agent's open, the
+SMS sweep, `vowifi-usim-bridge`) do not retry it: they wait out another holder of
+the port, not a modem that does not answer. The SMS sweep tries again on its
+next pass. The CS pool's fallback restart is not sent to such a modem: it logs
+`could not open modem port for fallback restart` and the next restart cycle
+tries again.
+
+**A modem SIM gets 20 s to answer an AKA challenge** (AUTHENTICATE and its GET
+RESPONSE; every other command keeps 5 s), on registration, refresh and the
+VoWiFi EAP-AKA relay. `re-authentication failed; registering in full … AT
+command timeout` therefore now means the SIM took more than 20 s. Card-reader
+lines are unchanged. To see how long the SIM really takes, run with
+`RUST_LOG=info,gsm_sip_bridge::ims=debug` and read one line per AKA run:
+
+```
+DEBUG SIM challenge timings open_ms=1412 select_ms=1460 authenticate_ms=6230 outcome="success"
+```
+
+`select_ms` is absent on a card-reader line. `outcome` is `success`,
+`sync-failure` (the SIM answered with AUTS) or `error`.
+
 ### A VoWiFi line dropped for ~20s with "giving up after 5 retransmits"
 
 charon sent a dead-peer-detection request to the ePDG, got no answer to it or
