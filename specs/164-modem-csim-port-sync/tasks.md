@@ -263,7 +263,7 @@
   - every blocking wait (the open's sync wait, the AKA wait) and whether `busy()` or the watchdog phase sees it;
   - every `take()`/drop of `tx` in `start_worker` and `try_reopen`, and who releases the port on error;
   - docs claims against the evidence.
-- [ ] T030 Live verification on the local EC200U, following `quickstart.md` §2, §3, §4 and §6. Build the branch image from `git archive HEAD` (memory: docker build context). Record each result in `quickstart.md` under a "Results (2026-…)" heading:
+- [X] T030 Live verification on the local EC200U, following `quickstart.md` §2, §3, §4 and §6. Build the branch image from `git archive HEAD` (memory: docker build context). Record each result in `quickstart.md` under a "Results (2026-…)" heading:
   - the stale reply discarded and the warning seen;
   - the open overhead median;
   - discovery timings;
@@ -271,7 +271,7 @@
 
   §5 (a slow SIM) can't be reproduced here. Record it as tests-only plus a request to the reporter (the two sync queries, and the timing line).
 
-  **Status:** §2, §3, §4 and FR-010 verified live and §5 recorded as tests-only. §6 was not possible on this rig; see Deviations.
+  **Status:** §2, §3, §4, §6 and FR-010 verified live, after a SIM was put in the modem. §5 is recorded as tests-only. The #237 failure (`SELECT 3F00 failed: SW=6A83`) was reproduced through the line on `main` and does not happen on the branch.
 - [X] T031 Final `make format && make lint && make test` with `CARGO_TARGET_DIR=$PWD/target-161`, and compare with the T001 baseline (more passed, 0 failed). Commit the docs: `docs: modem AT port sync and the AKA budget (#237)`.
 
 ---
@@ -346,4 +346,4 @@ T016 usim.rs tests   T017 usim.rs RecordingTransport test   T018 usim_bridge.rs 
 
 - **The echo of a sync query is not counted as stale** (T003, D2). D2 says echoed command lines are "discarded like anything else", and T003 says "only the two replies count as ours". They are still discarded, but a line equal to the query just sent is not added to `discarded_bytes`. Echo is the power-on default and only the CS pool sends `ATE0`, so counting it would log the stale-bytes warning on every open of an echo-on modem, which contradicts the contract ("frequent `context=open` lines point at another holder"). Blank lines around the sync's own replies are not counted either, so a clean sync reports 0. Pinned by `sync_ignores_command_echo` (0 discarded with echo on).
 - **`start_worker` takes no `path`** (T011). The port label for the error detail is read from the session (`Session::label`), so the path parameter would be unused.
-- **T030 is partly done: §6 (EAP-AKA through the relay) was not run live.** The local EC200U has no SIM, since the line's SIM is in the PC/SC reader, so no modem-backed VoWiFi line can be brought up on this rig. §2, §3, §4 and the branch image registering the line were verified live (`quickstart.md`, "Results (2026-11-25)"). The relayed `0x88` budget is covered by the `usim_bridge` relay test only. §5 is tests-only as the task allows, and the request to the reporter is recorded in the results. T030 stays unticked until §6 runs on a rig with a SIM in the modem, or the maintainer accepts tests-only for it.
+- **§6 was verified once a SIM was put in the modem** (T030). Until then the rig's modem had no SIM, and this was recorded as a deviation. It is now verified live, together with the agent-restart reproduction, in `quickstart.md`, "With a SIM in the modem".

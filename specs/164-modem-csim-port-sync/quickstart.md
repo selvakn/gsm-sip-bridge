@@ -69,7 +69,29 @@ Local rig: EC200U on `ttyUSB0`, no SIM in the modem. The line's SIM is in the PC
   - The card-reader line answered its challenge (`SIM challenge timings open_ms=28 authenticate_ms=135 outcome="success"`) and registered at 16:44:33Z.
   - It refreshed in place at 17:34:34Z (`granted_expires_secs=3600`) and its reg-event subscription refreshed at 17:39Z.
   - No `discarded stale bytes` warning was logged in the first hour.
-- **§5, the AKA budget (SC-002): tests only.** No SIM here answers slower than 5 s, and this line answers AKA through the PC/SC reader, not the modem. Before the fix ships to them, the reporter is asked to:
+- **§5, the AKA budget (SC-002): tests only.** No SIM here answers slower than 5 s: the modem SIM below takes about 135 ms for AUTHENTICATE. Before the fix ships to them, the reporter is asked to:
   - confirm that their EC20 answers `AT+CMEE?` and `AT+CSCS?`;
   - run with `RUST_LOG=info,gsm_sip_bridge::ims=debug` and send the `SIM challenge timings` lines from a slow refresh.
-- **§6, EAP-AKA through the relay: not possible on this rig.** The modem has no SIM, so a modem-backed VoWiFi line cannot be brought up here. The relayed `0x88` budget is covered by the `usim_bridge` relay test only.
+- **§6, EAP-AKA through the relay: verified live with a SIM in the modem** (next section).
+
+### With a SIM in the modem (2026-11-25, later)
+
+The SIM was moved from the PC/SC reader into the EC200U. The modem has SIM hot-swap detection off (`AT+QSIMDET?` → `0,0`), so `AT+CFUN=0` then `AT+CFUN=1` made it read the SIM. The line was switched to a modem-backed VoWiFi line (`modem_port = "/dev/ttyUSB0"`).
+
+- **§2 repeated with a real IMSI: verified live.** Orphan `AT+CSIM=10,"80F2000000"`, then `vowifi-plmn --modem /dev/ttyUSB0`:
+  - `main` failed 3 out of 3 times with `no IMSI in response`.
+  - The branch read `404 043` 3 out of 3 times, each time logging `discarded_bytes=127 context="open"`. The reply is longer now because the SIM answers STATUS with its real FCP.
+  - `main` read `404 043` with nothing stale.
+- **§6, EAP-AKA through `vowifi-usim-bridge`: verified live.** The ePDG tunnel came up with `EAP method EAP_AKA succeeded` through the relay. The IMS registration that followed went through the modem: `SIM challenge timings open_ms=2 select_ms=1526 authenticate_ms=137`. The line registered 13 s after the container was created.
+- **The #237 failure itself, through the line: reproduced on `main`, fixed on the branch.** The IMS agent was stopped with `SIGTERM`. The supervisor restarts it after 5 s, and the restarted agent opens the modem port to answer its challenge. Right after the stop, `AT+CSIM=10,"80F2000000"` was written to the port and the port closed.
+  - **`main` (1 run):** the restarted agent opened the port 14 s later and still got the stale reply. It failed `SELECT 3F00 failed: SW=6A83`, the error in the report, and exited. The supervisor logged four agent exits, one of them the stop, and the line registered again 36 s after the stop.
+  - **Branch:**
+    - **Run 1:** discarded 127 bytes on open; the open, including the discard, took 55 ms. It registered 8 s after the stop with no failed attempt.
+    - **Run 2:** discarded 127 bytes, then was stopped again while answering its challenge (run 3).
+    - **Run 3:** this stop left the agent's own SELECT unanswered on top of the stale STATUS reply. The next agent discarded 178 bytes and registered 8 s after the stop.
+- **No warning when nothing is stale.** No `discarded stale bytes` warning appeared on any open without a stale reply: two container starts, each with the agent's challenge open and the relay's sessions.
+
+**Found along the way (pre-existing; this branch doesn't change either):**
+
+- **With the host's pcscd (`pcscd = "external"`) on this desktop, the line could not register again after an agent restart.** After the first registration the relay started another USIM session, and pcscd never sent it `PowerOff`. So the relay kept the modem port, and the restarted agent waited 30 s (`modem serial busy (vowifi-usim-bridge is probably mid-EAP); waiting`), exited and restarted, over and over. The host pcscd's other clients were Firefox, Cursor and Claude Desktop, and charon was not connected, so a desktop PC/SC client holding the virtual card is the likely cause (not proven). With the container's own pcscd (`managed`, `vpcd_port = 25963`) the relay lets go of the port after EAP-AKA, and every restart above registered.
+- **The container's own pcscd cannot start while the host's pcscd holds a USB reader.** It logs `Failed adding USB device: … OMNIKEY`, and the supervisor reads that as a vpcd bind failure: `FATAL: pcscd's vpcd reader never came up … (DriverBindFailed)`. For these runs the empty OMNIKEY was unbound from USB.
