@@ -187,6 +187,10 @@ fn synthesize_61xx_if_needed(apdu: &[u8], resp: &[u8]) -> Vec<u8> {
 /// Bounded-retry, backing-off attempt to open the modem serial port —
 /// generic over how a fresh `AtCommander` is actually obtained so tests
 /// can inject a scripted transport instead of a real serial device.
+///
+/// It waits out another *holder* of the port. A modem that did not answer
+/// the open's sync (#237, `PortOutOfStep`) is returned at once: retrying it
+/// would cost a full sync bound per attempt.
 fn try_open_with_backoff(
     open_modem: &mut impl FnMut() -> BridgeResult<AtCommander>,
 ) -> BridgeResult<AtCommander> {
@@ -194,6 +198,7 @@ fn try_open_with_backoff(
     for attempt in 0..OPEN_RETRY_ATTEMPTS {
         match open_modem() {
             Ok(at) => return Ok(at),
+            Err(e) if e.is_port_out_of_step() => return Err(e),
             Err(e) => {
                 tracing::warn!(attempt, error = %e, "modem port unavailable, retrying");
                 last_err = Some(e);
@@ -1293,5 +1298,21 @@ mod tests {
         // APDU path where it's rejected there (empty hex -> AT+CSIM
         // failure -> SW=6F00), rather than silently dropped here.
         assert_eq!(VpcdMessage::from_payload(&[]), VpcdMessage::Apdu(vec![]));
+    }
+
+    #[test]
+    fn try_open_with_backoff_gives_up_at_once_on_an_out_of_step_port() {
+        let mut attempts = 0;
+        let started = std::time::Instant::now();
+        let result = try_open_with_backoff(&mut || {
+            attempts += 1;
+            Err(BridgeError::PortOutOfStep("x".into()))
+        });
+        assert!(result.is_err_and(|e| e.is_port_out_of_step()));
+        assert_eq!(attempts, 1);
+        assert!(
+            started.elapsed() < OPEN_RETRY_BASE_DELAY,
+            "an out-of-step port must not be slept on"
+        );
     }
 }

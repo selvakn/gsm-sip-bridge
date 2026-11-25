@@ -118,6 +118,11 @@ pub(crate) enum Request {
     Resync {
         reply: mpsc::Sender<BridgeResult<()>>,
     },
+    /// Prove a freshly opened port is in step before its first command
+    /// ([`Session::sync`]). Sent once, by `AtCommander::start_worker`.
+    Sync {
+        reply: mpsc::Sender<BridgeResult<()>>,
+    },
 }
 
 /// A port plus the buffer that survives across commands.
@@ -153,6 +158,11 @@ impl Session {
             timeout,
             label: label.into(),
         }
+    }
+
+    /// Which port this session drives.
+    pub(crate) fn label(&self) -> &str {
+        &self.label
     }
 
     /// Pull one complete line out of `rx`, if there is one.
@@ -448,7 +458,7 @@ pub(crate) fn run(mut session: Session, rx: mpsc::Receiver<Request>) {
             Request::ReadLine { reply } => {
                 let _ = reply.send(session.read_line_raw());
             }
-            Request::Resync { reply } => {
+            Request::Resync { reply } | Request::Sync { reply } => {
                 let _ = reply.send(session.sync(session.timeout).map(|_| ()));
             }
         }

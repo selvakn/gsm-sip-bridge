@@ -1038,41 +1038,52 @@ pub(crate) const MODEM_OPEN_MAX_WAIT: std::time::Duration = std::time::Duration:
 /// `failed to open serial /dev/ttyUSB0: Unable to acquire exclusive lock`,
 /// crash-looping until it happened to win a race.
 ///
-/// Generic over open and sleep so the policy is testable without a serial port
-/// or a real clock.
+/// Only an error `retryable` accepts is waited out. A port whose modem did not
+/// answer its sync (#237, [`BridgeError::PortOutOfStep`]) is not another
+/// holder, and retrying it would cost a full sync bound per attempt.
+///
+/// The wait is measured on the clock against a deadline, not as the sum of
+/// its sleeps: an attempt can itself take up to the open's sync bound.
+///
+/// Generic over open, the clock and sleep so the policy is testable without a
+/// serial port or a real clock.
 fn open_modem_waiting<T, E: std::fmt::Display>(
     port: &str,
     max_wait: std::time::Duration,
     interval: std::time::Duration,
     mut open: impl FnMut() -> Result<T, E>,
+    retryable: impl Fn(&E) -> bool,
+    mut now: impl FnMut() -> std::time::Instant,
     mut sleep: impl FnMut(std::time::Duration),
 ) -> Result<T, E> {
-    let mut waited = std::time::Duration::ZERO;
+    let started = now();
+    let deadline = started + max_wait;
+    let mut retried = false;
     loop {
         match open() {
             Ok(opened) => {
-                if !waited.is_zero() {
+                if retried {
                     tracing::info!(
                         port = %port,
-                        waited_secs = waited.as_secs(),
+                        waited_secs = (now() - started).as_secs(),
                         "modem serial acquired after waiting out a conflicting holder"
                     );
                 }
                 return Ok(opened);
             }
             Err(e) => {
-                if waited >= max_wait {
+                if !retryable(&e) || now() >= deadline {
                     return Err(e);
                 }
-                if waited.is_zero() {
+                if !retried {
                     tracing::warn!(
                         port = %port,
                         error = %e,
                         "modem serial busy (vowifi-usim-bridge is probably mid-EAP); waiting"
                     );
                 }
+                retried = true;
                 sleep(interval);
-                waited += interval;
             }
         }
     }
@@ -1124,6 +1135,8 @@ pub(crate) fn open_card(cfg: &ImsRegisterConfig) -> BridgeResult<OpenedCard> {
             MODEM_OPEN_MAX_WAIT,
             MODEM_OPEN_RETRY_INTERVAL,
             || AtCommander::open(&cfg.modem_port),
+            |e: &BridgeError| !e.is_port_out_of_step(),
+            std::time::Instant::now,
             std::thread::sleep,
         )?;
         imsi = match &cfg.imsi {
@@ -2322,6 +2335,8 @@ mod tests {
                     Ok("commander")
                 }
             },
+            |_| true,
+            std::time::Instant::now,
             |d| slept.push(d),
         );
         assert_eq!(opened, Ok("commander"));
@@ -2334,6 +2349,7 @@ mod tests {
     #[test]
     fn a_permanently_unavailable_modem_serial_still_gives_up() {
         let mut attempts = 0;
+        let clock = FakeClock::default();
         let mut slept = Vec::new();
         let opened: Result<&str, &str> = open_modem_waiting(
             "/dev/ttyUSB9",
@@ -2343,7 +2359,12 @@ mod tests {
                 attempts += 1;
                 Err("No such file or directory")
             },
-            |d| slept.push(d),
+            |_| true,
+            || clock.now(),
+            |d| {
+                clock.advance(d);
+                slept.push(d);
+            },
         );
         assert_eq!(opened, Err("No such file or directory"));
         assert_eq!(slept.len(), 3, "waits the full budget, then reports");
@@ -2357,10 +2378,86 @@ mod tests {
             std::time::Duration::from_secs(30),
             std::time::Duration::from_secs(2),
             || Ok::<_, String>("commander"),
+            |_| true,
+            std::time::Instant::now,
             |d| slept.push(d),
         );
         assert_eq!(opened, Ok("commander"));
         assert!(slept.is_empty(), "a free port must not delay registration");
+    }
+
+    /// A clock that moves only when a test moves it.
+    struct FakeClock {
+        start: std::time::Instant,
+        elapsed: std::cell::Cell<std::time::Duration>,
+    }
+
+    impl Default for FakeClock {
+        fn default() -> Self {
+            Self {
+                start: std::time::Instant::now(),
+                elapsed: std::cell::Cell::new(std::time::Duration::ZERO),
+            }
+        }
+    }
+
+    impl FakeClock {
+        fn now(&self) -> std::time::Instant {
+            self.start + self.elapsed.get()
+        }
+        fn advance(&self, by: std::time::Duration) {
+            self.elapsed.set(self.elapsed.get() + by);
+        }
+    }
+
+    /// #237: a modem that does not answer its sync is not another holder.
+    /// Retrying it would cost a full sync bound per attempt.
+    #[test]
+    fn open_modem_waiting_does_not_retry_an_out_of_step_port() {
+        let mut attempts = 0;
+        let mut slept = Vec::new();
+        let opened: Result<&str, BridgeError> = open_modem_waiting(
+            "/dev/ttyUSB0",
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(2),
+            || {
+                attempts += 1;
+                Err(BridgeError::PortOutOfStep("x".into()))
+            },
+            |e: &BridgeError| !e.is_port_out_of_step(),
+            std::time::Instant::now,
+            |d| slept.push(d),
+        );
+        assert!(opened.is_err_and(|e| e.is_port_out_of_step()));
+        assert_eq!(attempts, 1);
+        assert!(slept.is_empty());
+    }
+
+    /// Each attempt takes time of its own once the open syncs, so the wait
+    /// is measured on the clock, not as the sum of its sleeps.
+    #[test]
+    fn open_modem_waiting_measures_its_wait_on_the_clock() {
+        let clock = FakeClock::default();
+        let mut attempts = 0;
+        let max_wait = std::time::Duration::from_millis(200);
+        let opened: Result<&str, &str> = open_modem_waiting(
+            "/dev/ttyUSB0",
+            max_wait,
+            std::time::Duration::from_millis(10),
+            || {
+                attempts += 1;
+                clock.advance(std::time::Duration::from_millis(50));
+                Err("Unable to acquire exclusive lock on serial port")
+            },
+            |_| true,
+            || clock.now(),
+            |d| clock.advance(d),
+        );
+        assert!(opened.is_err());
+        // 50, 110, 170, 230 ms: the fourth attempt ends past the deadline.
+        // Summing only the sleeps would have made 21 attempts.
+        assert_eq!(attempts, 4);
+        assert!(clock.elapsed.get() < max_wait + std::time::Duration::from_millis(60));
     }
 
     // ---- Security-Verify wiring (specs/082) --------------------------------

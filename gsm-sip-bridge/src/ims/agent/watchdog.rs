@@ -666,8 +666,12 @@ mod tests {
     /// `budget()` stays a plain table a human can read, while the derivation
     /// remains machine-checked.
     fn derived_renewal_worst_case() -> Duration {
-        // Opening the modem, when another holder has it.
-        let modem_open = crate::ims::MODEM_OPEN_MAX_WAIT;
+        // Opening the modem, when another holder has it, then the open's sync
+        // (#237), bounded by the port's timeout.
+        let modem_open =
+            crate::ims::MODEM_OPEN_MAX_WAIT + crate::modules::at_commander::DEFAULT_TIMEOUT;
+        // `AT+CIMI` and `AT+CGSN`, when the line has no configured identities.
+        let identities = crate::modules::at_commander::DEFAULT_TIMEOUT * 2;
         // The EF_DIR walk selects the MF and EF_DIR, then reads up to 16
         // records, and `select_usim` adds two more selects. Each APDU is one
         // AT command bounded by the AT layer's default timeout.
@@ -678,7 +682,7 @@ mod tests {
         let register = Duration::from_secs(32) * 2;
         // Installing the Gm SAs shells out to `ip xfrm` ~20 times.
         let sa_install = Duration::from_secs(20);
-        modem_open + apdu_time + register + sa_install
+        modem_open + identities + apdu_time + register + sa_install
     }
 
     #[test]
