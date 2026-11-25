@@ -161,7 +161,10 @@ pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// line's first check for a SIM it lost touch with uses the same first step
 /// (`registration_auth::CardTiming`, #233).
 pub(crate) const RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
-const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(120);
+/// The cap of the renewal backoff ladder. `pub(crate)` so the supervisor's
+/// pacing while a card-reader SIM is out of reach stops at the same cap
+/// (`supervise::card_outage::CARD_OUTAGE_MAX_BACKOFF`, #233 follow-up).
+pub(crate) const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(120);
 /// How many consecutive renewal failures this agent absorbs in-process before
 /// exiting and letting the supervisor recover the line.
 ///
@@ -226,10 +229,28 @@ pub fn run(
     match run_inner(card_id, vowifi_config, app_config) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
+            if let Some(marker) = card_unreachable_exit_marker(&e) {
+                tracing::error!(error = %e, "{marker}");
+            }
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// The marker `supervise::sim_recovery::has_card_unreachable` greps for in
+/// this agent's log, to tell an exit caused by a card-reader SIM that cannot
+/// be reached from any other exit (#233 follow-up). Changing this string
+/// breaks that classification, so both sides are pinned by tests, exactly as
+/// for [`watchdog::STALL_MARKER`].
+pub(crate) const CARD_UNREACHABLE_MARKER: &str = "the SIM card is out of reach; exiting";
+
+/// What [`run`] logs before exiting with `e`: the
+/// [`CARD_UNREACHABLE_MARKER`] when the card is out of reach, and nothing
+/// extra otherwise. The marker goes through `tracing`, which the supervisor
+/// captures, not stderr, which it does not.
+fn card_unreachable_exit_marker(e: &BridgeError) -> Option<&'static str> {
+    e.is_card_unreachable().then_some(CARD_UNREACHABLE_MARKER)
 }
 
 /// Whether this line's own modem storage should be swept for SMS the carrier
@@ -4592,6 +4613,23 @@ mod tests {
     // These moved to `ims::session` in the FR-019 extraction; the tests that
     // cover them stay here, exercising the same implementation.
     use crate::ims::session::{build_subscribe, SubscribeParts};
+
+    /// The supervisor tells a card-reader exit from any other by this line
+    /// (`supervise::sim_recovery::has_card_unreachable`, which pins the other
+    /// side), so only a card that cannot be reached may log it.
+    #[test]
+    fn a_card_unreachable_exit_logs_the_marker() {
+        let card = BridgeError::CardUnreachable("no reader holds this card".into());
+        let line = card_unreachable_exit_marker(&card).expect("the marker");
+        assert!(line.contains(CARD_UNREACHABLE_MARKER), "{line}");
+        assert_eq!(
+            card_unreachable_exit_marker(&BridgeError::Ims("x".into())),
+            None
+        );
+        // The same words untyped are not the condition.
+        let text = BridgeError::Ims(format!("SIM card unreachable: {CARD_UNREACHABLE_MARKER}"));
+        assert_eq!(card_unreachable_exit_marker(&text), None);
+    }
 
     #[test]
     fn next_backoff_doubles_each_attempt() {

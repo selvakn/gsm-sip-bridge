@@ -56,6 +56,7 @@ async fn test_observe_report_lands_in_scraped_metrics() {
             tunnel_flapping: None,
             ike_sa_loss_cause: None,
             uplink: None,
+            card_hold: None,
         },
         events: vec![ObservedEvent::CallCompleted {
             status: CallStatus::Answered,

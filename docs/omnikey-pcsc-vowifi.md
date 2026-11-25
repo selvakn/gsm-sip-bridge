@@ -207,11 +207,22 @@ A full registration that fails because the card is out of reach is retried on
 the usual backoff (at most every 2 minutes), and does not count toward the
 agent's exit after six failed registrations: expect `the SIM is out of reach; retrying the registration without counting
 toward the restart budget` and `last_failure: … SIM card unreachable: …`. A
-card that is out of reach when the agent starts still makes the agent exit, and
-the supervisor restarts it. The ePDG tunnel also needs the card (EAP-AKA): if it
-has to be rebuilt while the card is out (`SCardConnect: No smart card
-inserted`), the line restarts every few seconds until the card is back, then
-registers within seconds.
+card that is out of reach when the agent starts still makes the agent exit.
+
+The supervisor then slows down instead of retrying in a tight loop. Look for
+`SIM card out of reach; agent restarts and tunnel attempts are slowed until it
+is back` once, then `vowifi-ims-agent exited (SIM card out of reach);
+restarting in Ns` with the wait growing from 5 s to 120 s. The ePDG tunnel also
+needs the card (EAP-AKA, `SCardConnect: No smart card inserted` in charon's
+log): a missing tunnel is tried once at once, then after 60 s, then every
+120 s (`SIM card still out of reach; trying the tunnel once (next try in
+Ns)`), and a tunnel that is still up is not torn down for a rebuild that could
+not complete. The supervisor checks the card every 5 seconds meanwhile and logs
+`SIM card reachable again after Ns; resuming` when it answers. An agent waiting
+to be restarted then starts at once and registers within seconds. An agent that
+kept running through the outage and is not registered is restarted too (`SIM
+card back but vowifi-ims-agent is not registered; restarting it now`), unless a
+call is up or every P-CSCF it knows is still marked unavailable. The tunnel-failure alert names the card while this lasts.
 
 ## Running on a host with its own pcscd
 

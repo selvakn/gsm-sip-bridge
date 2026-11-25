@@ -21,11 +21,13 @@
 //! | Per-line tunnel state machine and recovery | [`line_supervisor`] |
 //! | Uplink verdict and hold bookkeeping (specs/100) | [`underlay`] |
 //! | SIM power-cycle recovery | [`sim_recovery`] |
+//! | Pacing while a card-reader SIM is out of reach | [`card_outage`] |
 //! | The circuit-switched daemon's respawn loop | [`daemon_supervisor`] |
 //!
 //! Container *health* checking lives in [`crate::commands::healthcheck`],
 //! which is what `HEALTHCHECK` invokes.
 
+pub mod card_outage;
 pub mod daemon_supervisor;
 pub mod engines;
 pub mod epdg_iface;

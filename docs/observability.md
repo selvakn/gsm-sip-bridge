@@ -205,8 +205,39 @@ A card-reader line whose SIM is out of reach (#233) logs:
   (`retry_in_secs`, `error`), when a full registration fails because the card is out of reach. The line shows
   `state: Failed` with `last_failure: … SIM card unreachable: …` and raises the registration-loss alert, but
   these failures do not count toward the agent's exit, because a restart cannot bring a card back. The ePDG
-  tunnel needs the card too, so if the supervisor has to rebuild it while the card is out, the line stays down
-  until the card returns.
+  tunnel needs the card too: see the supervisor's pacing below.
+
+The supervisor stops retrying in a tight loop while a card-reader line's SIM is out of reach (specs/163). It
+learns the card is out from the agent's exit, whose last error line carries `the SIM card is out of reach;
+exiting`, or from its own card check (`timeout 5 … vowifi-plmn --pcsc-imsi <IMSI>`, which exits `3` for a card
+out of reach), made just before a tunnel recovery that needs the SIM. While the card is out:
+
+- the agent is restarted after 5 s, 10 s, 20 s and so on up to 120 s, instead of every 5 s;
+- the card is checked every 5 s, and the agent restarts as soon as it answers;
+- a missing IKE_SA is initiated at once, then after 60 s, then every 120 s, instead of every tick;
+- a rebuild that would tear down an established IKE_SA (P-CSCF pool exhausted or unreachable, CHILD_SA stuck,
+  CHILD_SA rekey stuck, tunnel interface vanished) is held until the card is back, because the new IKE_SA's
+  EAP-AKA needs the card. An uplink hold takes precedence, and route repairs still run.
+
+The supervisor's log lines (stdout, `docker logs`), none of which carries an IMSI:
+
+| Event | Line |
+|---|---|
+| Outage begins | `[supervise] line N: SIM card out of reach; agent restarts and tunnel attempts are slowed until it is back` |
+| Outage ends | `[supervise] line N: SIM card reachable again after Ns; resuming` |
+| Paced agent restart | `[supervise] line N: vowifi-ims-agent exited (SIM card out of reach); restarting in Ns` |
+| Paced tunnel initiation | `[supervise] line N: SIM card still out of reach; trying the tunnel once (next try in Ns)` |
+| That initiation built an IKE_SA | `[supervise] line N: IKE_SA re-established after a SIM card hold (…); restarting the IMS agent on the new tunnel` |
+| Card back, agent alive but not registered | `[supervise] line N: SIM card back but vowifi-ims-agent is not registered; restarting it now` |
+
+A held rebuild logs nothing at the default level. The outage ends when a check finds the card or the agent
+registers, and every delay starts again from its first value next time. An agent that rode the outage out
+without exiting is asked for its registration state when it ends, and restarted if it is not registered, no
+call is up and at least one P-CSCF in its pool is free of a mark, rather than left to its own retry (up to 2
+minutes). With every P-CSCF marked a new agent would wait the marks out first, so it is left alone. While it lasts, the tunnel-failure
+alert reads `…; SIM card out of reach, tunnel attempts slowed until it is back`. `vowifi-status`, the `uplink`
+status file and the metrics are unchanged. The pacing starts once the line's tunnel has first come up; a card
+that is out of reach when the bridge starts is handled by the start-up MCC/MNC read's own retries, as before.
 
 Modem-backed lines are unchanged.
 

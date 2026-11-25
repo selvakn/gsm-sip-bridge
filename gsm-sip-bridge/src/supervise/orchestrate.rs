@@ -13,6 +13,7 @@
 //! modules: `line_supervisor`, `sim_recovery`, `epdg_iface`, `vpcd`, `render`)
 //! keep taking a plain `&dyn CommandRunner`, unchanged.
 
+use super::card_outage::{self, CardOutage};
 use super::engines::{SharedCharon, StrongswanEngine, SwuEngine};
 use super::line_supervisor::{self, TunnelEngine};
 use super::runner::{ChildHandle, ChildSpec, CommandRunner, RealCommandRunner};
@@ -1996,6 +1997,7 @@ fn start_vowifi_line_strongswan(
                 tunnel_flapping: Some(s.flapping),
                 ike_sa_loss_cause: s.loss_cause,
                 uplink: s.uplink,
+                card_hold: s.card_hold,
                 ..Default::default()
             },
             events,
@@ -2007,6 +2009,7 @@ fn start_vowifi_line_strongswan(
         flapping: false,
         loss_cause: None,
         uplink: None,
+        card_hold: None,
     };
     report_tunnel(signal);
 
@@ -2056,6 +2059,12 @@ fn start_vowifi_line_strongswan(
 
     // Shared with the agent loop: set while a rebuild is syncing the P-CSCF.
     let rebuild_gate = Arc::new(RebuildGate::default());
+    // Shared with the agent loop too: whether this card-reader line's SIM is
+    // out of reach, and the pacing that follows (#233 follow-up). Never built
+    // for a modem line (FR-003).
+    let card_state = line
+        .pcsc_reader
+        .then(|| Arc::new(Mutex::new(CardOutage::default())));
     // Before the agent starts, so its first marks count (specs/097 R3).
     let negotiated_at = SystemTime::now();
     start_line_tail(
@@ -2066,6 +2075,7 @@ fn start_vowifi_line_strongswan(
         &usim_holder,
         pcscf.clone(),
         Arc::clone(&rebuild_gate),
+        card_state.clone(),
     );
 
     // Steady-state supervision loop — runs for the container's lifetime.
@@ -2105,10 +2115,23 @@ fn start_vowifi_line_strongswan(
             &mut written_uplink,
         );
     }
+    // This line's card check, for the card gate and the polling while its
+    // card is out. Config validation guarantees a card-reader line names its
+    // card; a modem line never runs it.
+    let card_imsi = line.config.imsi_override.clone().unwrap_or_default();
+    let card_check = || card_outage::card_check(runner.as_ref(), ctx.bin, &card_imsi);
+    // Whether the agent restart a held initiation owes was owed by a card
+    // hold's paced initiation rather than an uplink hold's, for its log line.
+    let mut owed_by_card = false;
     loop {
         // Quicker while a hold is on, so the path coming back is noticed within
-        // seconds instead of up to a whole tick later (specs/100 SC-003).
-        let pause = underlay.poll_after(std::time::Instant::now());
+        // seconds instead of up to a whole tick later (specs/100 SC-003), and
+        // while the card is out, for the same reason (specs/163 D10).
+        let card_out = card_state
+            .as_ref()
+            .is_some_and(|o| o.lock().unwrap().is_out());
+        let pause =
+            card_outage::steady_pause(underlay.poll_after(std::time::Instant::now()), card_out);
         runner.sleep(pause);
         // Held across the whole tick_steady_state call, not just a one-off
         // check before it: Greptile P1 (round 2) caught that a plain
@@ -2196,6 +2219,40 @@ fn start_vowifi_line_strongswan(
         } else {
             line_supervisor::UnderlayView::disabled()
         };
+        // While the card is out it is checked here every 5 s, shared with the
+        // agent thread, so its return is noticed with no recovery due
+        // (specs/163 D10); then the view the tick's card gate works from.
+        let card_view = match &card_state {
+            Some(outage) => {
+                if let Some((_, Some(transition))) =
+                    card_outage::poll_during_outage(outage, &std::time::Instant::now, &card_check)
+                {
+                    println!("{}", card_outage::transition_line(idx, &transition));
+                }
+                let o = outage.lock().unwrap();
+                line_supervisor::CardView {
+                    pcsc_reader: true,
+                    outage: o.is_out(),
+                    attempt_due: o.tunnel_attempt_due(std::time::Instant::now()),
+                }
+            }
+            None => line_supervisor::CardView::none(),
+        };
+        // The card gate's own check, made when a recovery that needs the SIM
+        // is due with no outage yet; recorded after the tick. Rate-limited
+        // with the agent thread's checks, and never run under the lock.
+        let gate_verdict = std::cell::Cell::new(None);
+        let gate_check = || {
+            let claimed = card_state
+                .as_ref()
+                .is_some_and(|o| o.lock().unwrap().claim_check(std::time::Instant::now()));
+            if !claimed {
+                return card_outage::CardVerdict::Unknown;
+            }
+            let verdict = card_check();
+            gate_verdict.set(Some(verdict));
+            verdict
+        };
         // Closed before the tick, not after it: a teardown inside the tick can
         // take many seconds, and an agent that exits meanwhile must not be
         // respawned against the old P-CSCF (specs/087 R5). Released below
@@ -2214,7 +2271,23 @@ fn start_vowifi_line_strongswan(
             &|| line_in_call(runner.as_ref(), &line.pcscf_source_path),
             &|| line_pool_state(runner.as_ref(), &line.pcscf_source_path),
             &underlay_view,
+            &card_view,
+            &gate_check,
         );
+        if let Some(outage) = &card_state {
+            let report = card_outage::after_card_tick(
+                &outcome,
+                gate_verdict.get(),
+                &mut outage.lock().unwrap(),
+                std::time::Instant::now(),
+            );
+            if let Some(transition) = report.transition {
+                println!("{}", card_outage::transition_line(idx, &transition));
+            }
+            if let Some(next) = report.next_try_in {
+                println!("{}", card_outage::paced_initiation_line(idx, next));
+            }
+        }
         if underlay_enabled {
             if let Some(start) = underlay.end_tick(&outcome, mark, tick_started, tick_started_at) {
                 println!(
@@ -2245,6 +2318,7 @@ fn start_vowifi_line_strongswan(
             }
         }
         let uplink_now = underlay_enabled.then(|| underlay.state());
+        let card_hold_now = card_state.as_ref().map(|o| o.lock().unwrap().is_out());
         if underlay_enabled {
             write_uplink_file(
                 runner.as_ref(),
@@ -2258,6 +2332,7 @@ fn start_vowifi_line_strongswan(
             // Sent with the state they describe, so the gauge and the counters
             // move together.
             signal.uplink = uplink_now;
+            signal.card_hold = card_hold_now;
             send_tunnel(signal, std::mem::take(&mut uplink_events));
         }
         report_pcscf_sibling(idx, &current_pcscf, via_sibling_before, &tracking);
@@ -2278,6 +2353,7 @@ fn start_vowifi_line_strongswan(
             &rebuilds,
             last_loss_cause,
             uplink_now,
+            card_hold_now,
             &report_tunnel,
         );
         let after_held_initiation = matches!(
@@ -2321,10 +2397,22 @@ fn start_vowifi_line_strongswan(
             // The tick queued a liveness check and said so (specs/100); the
             // recovery it is for waits for the answer.
             line_supervisor::SteadyOutcome::Deferred { .. } => drop(guard),
+            // Held for the card, or paced: logged with the card's report
+            // above (specs/163 FR-013). A paced initiation owes the agent
+            // restart, as an uplink hold's does.
+            line_supervisor::SteadyOutcome::CardHeld { initiated, .. } => {
+                drop(guard);
+                if initiated {
+                    owed_by_card = true;
+                }
+            }
             line_supervisor::SteadyOutcome::Held {
                 cause, initiated, ..
             } => {
                 drop(guard);
+                if initiated {
+                    owed_by_card = false;
+                }
                 // What a hold held back is summarised once, on the line that
                 // ends it, not logged on every tick.
                 if initiated {
@@ -2344,8 +2432,14 @@ fn start_vowifi_line_strongswan(
                 if after_held_initiation {
                     println!(
                         "{}",
-                        held_initiation_established_line(idx, &current_pcscf, &new_pcscf)
+                        held_initiation_established_line(
+                            idx,
+                            &current_pcscf,
+                            &new_pcscf,
+                            owed_by_card
+                        )
                     );
+                    owed_by_card = false;
                 } else {
                     println!("[supervise] line {idx}: P-CSCF changed ({current_pcscf} -> {new_pcscf}); refreshing");
                 }
@@ -2496,6 +2590,7 @@ fn start_vowifi_line_strongswan(
                         &rebuilds,
                         last_loss_cause,
                         uplink_now,
+                        card_hold_now,
                         &report_tunnel,
                     );
                 } else if line_supervisor::recovery_restarts_agent(reason) {
@@ -2510,6 +2605,7 @@ fn start_vowifi_line_strongswan(
                     &rebuilds,
                     last_loss_cause,
                     uplink_now,
+                    card_hold_now,
                     &report_tunnel,
                 );
             }
@@ -2549,14 +2645,26 @@ fn observe_underlay(
 /// FR-010a) is up and the agent is restarted onto it. Says whether the
 /// selection moved, because when it did not this restart is the only thing
 /// that puts the agent on the new tunnel.
-fn held_initiation_established_line(idx: u32, previous: &str, selection: &str) -> String {
+fn held_initiation_established_line(
+    idx: u32,
+    previous: &str,
+    selection: &str,
+    for_the_card: bool,
+) -> String {
+    // The same restart is owed after an initiation paced for a card-reader
+    // SIM out of reach (specs/163), and the line says which hold made it.
+    let hold = if for_the_card {
+        "a SIM card hold"
+    } else {
+        "an uplink hold"
+    };
     let pcscf = if previous == selection {
         format!("P-CSCF {selection} unchanged")
     } else {
         format!("P-CSCF {previous} -> {selection}")
     };
     format!(
-        "[supervise] line {idx}: IKE_SA re-established after an uplink hold ({pcscf}); restarting the IMS agent on the new tunnel"
+        "[supervise] line {idx}: IKE_SA re-established after {hold} ({pcscf}); restarting the IMS agent on the new tunnel"
     )
 }
 
@@ -2936,6 +3044,9 @@ struct TunnelSignal {
     /// The underlay guard's verdict (specs/100); `None` with the guard off, so
     /// the field is never sent and ingest keeps whatever it had.
     uplink: Option<crate::control::protocol::UplinkState>,
+    /// Whether this card-reader line's SIM is out of reach (specs/163);
+    /// `None` on a line with no card reader, so the field is never sent.
+    card_hold: Option<bool>,
 }
 
 /// The event that counts one steady-state recovery of a line (specs/096),
@@ -3046,12 +3157,18 @@ fn line_pool_state(
 
 /// Reports the tunnel signal if, and only if, it differs from the last one
 /// sent; the reporter heartbeats the last state, so only changes need sending.
+///
+/// `card_hold` is read from the line's shared card outage once per tick, so
+/// an outage the agent thread began or ended reaches the daemon on the next
+/// tick through this one path, and the two threads cannot report it
+/// differently (specs/163 FR-014).
 fn sync_tunnel_signal(
     signal: &mut TunnelSignal,
     tracking: &line_supervisor::SteadyTracking,
     rebuilds: &line_supervisor::RebuildWindow,
     loss_cause: Option<crate::control::protocol::IkeSaLossCause>,
     uplink: Option<crate::control::protocol::UplinkState>,
+    card_hold: Option<bool>,
     report: &dyn Fn(TunnelSignal),
 ) {
     let now = TunnelSignal {
@@ -3059,6 +3176,7 @@ fn sync_tunnel_signal(
         flapping: rebuilds.is_flapping(),
         loss_cause,
         uplink,
+        card_hold,
     };
     if now != *signal {
         *signal = now;
@@ -3137,6 +3255,7 @@ fn clear_line_gm_state(runner: &dyn CommandRunner, idx: u32, netns: &str) -> (us
 /// keepalive sibling. Both supervision loops run on their own background
 /// threads and this function returns immediately, matching the bash original
 /// backgrounding both with `&`.
+#[allow(clippy::too_many_arguments)]
 fn start_line_tail(
     ctx: &LineStartup,
     idx: u32,
@@ -3145,6 +3264,7 @@ fn start_line_tail(
     usim_holder: &Arc<Mutex<Option<Arc<ChildHandle>>>>,
     initial_pcscf: String,
     rebuild_gate: Arc<RebuildGate>,
+    card_state: Option<Arc<Mutex<CardOutage>>>,
 ) {
     let runner = ctx.runner;
     let bin = ctx.bin;
@@ -3189,7 +3309,18 @@ fn start_line_tail(
         // 'static thread closure, so it captures the owned `Option` rather than
         // borrowing `line` (which does not outlive the spawn).
         let line_msisdn = line.configured_msisdn();
+        // Config validation guarantees a card-reader line names its card.
+        let card_imsi = line.config.imsi_override.clone().unwrap_or_default();
+        // Where this line's agent answers status queries, and its call count,
+        // for the restart after a card outage it lived through (SC-003).
+        let agent_status_addr = format!(
+            "{}:{}",
+            line.veth_local_addr,
+            crate::vowifi::AGENT_A_STATUS_PORT
+        );
+        let pcscf_source_path = line.pcscf_source_path.clone();
         std::thread::spawn(move || {
+            let card_check = || card_outage::card_check(runner.as_ref(), &bin, &card_imsi);
             let mut csim_fails = sim_recovery::IncidentCounters::default();
             // specs/022-discord-critical-alerts FR-004 (research.md R2):
             // `Action::GiveUpForThisIncident` already existed but was never
@@ -3276,42 +3407,85 @@ fn start_line_tail(
                 // invisible in the supervise log — only the "exited; restarting"
                 // side of the loop ever shows there. Gated on `had_restart` (so
                 // a clean first startup stays quiet) and latched by
-                // `recovery_logged` (so it prints once per spawn, not every
-                // poll); the file read stops once the line is seen.
-                let mut recovery_logged = false;
+                // `registered_seen` (so it prints once per spawn, not every
+                // poll); the file read stops once the line is seen. A
+                // card-reader line watches from the first spawn too: a
+                // registration ends a card outage (FR-005), whichever thread
+                // began it.
+                let mut registered_seen = false;
+                // Whether this run lived through a card outage that has just
+                // ended; then a run that is not registered is restarted rather
+                // than left to its own backoff (specs/163 SC-003).
+                let mut outage_watch = card_outage::OutageWatch::default();
                 while runner.is_alive(&handle) {
-                    if had_restart
-                        && !recovery_logged
+                    let card_out = card_state
+                        .as_ref()
+                        .is_some_and(|o| o.lock().unwrap().is_out());
+                    if card_state.is_some()
+                        && outage_watch.ended(card_out)
+                        && card_outage::restart_after_outage(
+                            &runner.agent_status(&agent_status_addr),
+                            line_in_call(runner.as_ref(), &pcscf_source_path),
+                        )
+                    {
+                        println!("{}", card_outage::restart_after_outage_line(idx));
+                        runner.signal(&handle, super::runner::Signal::Term);
+                    }
+                    if (had_restart || card_state.is_some())
+                        && !registered_seen
                         && runner
                             .read_file(&agent_log)
                             .unwrap_or_default()
                             .contains("registered, listening for inbound calls")
                     {
-                        println!(
-                            "[supervise] line {idx}: vowifi-ims-agent registered after restart loop"
-                        );
-                        recovery_logged = true;
+                        if had_restart {
+                            println!(
+                                "[supervise] line {idx}: vowifi-ims-agent registered after restart loop"
+                            );
+                        }
+                        if let Some(outage) = &card_state {
+                            let ended = outage
+                                .lock()
+                                .unwrap()
+                                .on_registered(std::time::Instant::now());
+                            if let Some(ended) = ended {
+                                println!("{}", card_outage::transition_line(idx, &ended));
+                            }
+                        }
+                        registered_seen = true;
                     }
                     runner.sleep(Duration::from_secs(1));
                 }
                 had_restart = true;
 
                 let log_content = runner.read_file(&agent_log).unwrap_or_default();
-                // A stall is checked first: a run that stalled may *also* have
-                // an older `AT+CSIM failed` earlier in its log, and the stall is
-                // the more specific and more recent explanation for this exit.
-                let outcome = if sim_recovery::has_at_stall(&log_content) {
-                    sim_recovery::AgentExitOutcome::AtStall
-                } else if sim_recovery::has_csim_failure(&log_content) {
-                    sim_recovery::AgentExitOutcome::CsimFailure
-                } else {
-                    sim_recovery::AgentExitOutcome::Other
-                };
+                let outcome = sim_recovery::classify_exit(&log_content, card_state.is_some());
                 let action = csim_fails.observe(outcome);
-                let restart_delay = csim_fails.restart_delay(action);
+                // A card that cannot be reached is paced by the line's shared
+                // outage, and waited out with checks so the agent restarts as
+                // soon as the card is back (FR-004, FR-006). `None` for
+                // every other exit, which keeps the plain wait.
+                let card_wait = match (&card_state, outcome) {
+                    (Some(outage), sim_recovery::AgentExitOutcome::CardUnreachable) => {
+                        let (began, delay) = {
+                            let mut o = outage.lock().unwrap();
+                            (o.on_out(std::time::Instant::now()), o.next_agent_delay())
+                        };
+                        if let Some(began) = began {
+                            println!("{}", card_outage::transition_line(idx, &began));
+                        }
+                        Some((outage, delay))
+                    }
+                    _ => None,
+                };
+                let restart_delay = match card_wait {
+                    Some((_, delay)) => delay,
+                    None => csim_fails.restart_delay(action),
+                };
                 let reason = match outcome {
                     sim_recovery::AgentExitOutcome::AtStall => " (stalled on the modem)",
                     sim_recovery::AgentExitOutcome::CsimFailure => " (AT+CSIM failure)",
+                    sim_recovery::AgentExitOutcome::CardUnreachable => " (SIM card out of reach)",
                     sim_recovery::AgentExitOutcome::Other => "",
                 };
                 println!(
@@ -3358,7 +3532,22 @@ fn start_line_tail(
                     }
                 }
 
-                runner.sleep(restart_delay);
+                match card_wait {
+                    Some((outage, delay)) => {
+                        let end = card_outage::wait_for_card_or(
+                            runner.as_ref(),
+                            outage,
+                            delay,
+                            &std::time::Instant::now,
+                            &card_check,
+                            &|| *shutting_down.read().unwrap(),
+                        );
+                        if let card_outage::WaitEnd::CardBack { ended: Some(ended) } = end {
+                            println!("{}", card_outage::transition_line(idx, &ended));
+                        }
+                    }
+                    None => runner.sleep(restart_delay),
+                }
             }
         });
     }
@@ -3594,6 +3783,8 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
         &usim_holder,
         pcscf.clone(),
         Arc::new(RebuildGate::default()),
+        // An SWu line is never a card-reader line (validated at start-up).
+        None,
     );
 
     let mut current_pcscf = pcscf;
@@ -3665,10 +3856,12 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
             }
             // Only the strongSwan engine has a half-open IKE_SA to wait on, or
             // a hold to initiate under.
+            // Nor a card-reader SIM to hold for: an SWu line never has one.
             line_supervisor::SteadyOutcome::WaitingForNegotiation
             | line_supervisor::SteadyOutcome::HeldInitiationEstablished { .. }
             | line_supervisor::SteadyOutcome::Deferred { .. }
-            | line_supervisor::SteadyOutcome::Held { .. } => drop(guard),
+            | line_supervisor::SteadyOutcome::Held { .. }
+            | line_supervisor::SteadyOutcome::CardHeld { .. } => drop(guard),
             line_supervisor::SteadyOutcome::Recovered { reason, .. } => {
                 println!("[supervise] line {idx}: recovered from {reason:?}");
                 if !tracking.pool_exhausted.is_empty() {
@@ -3701,12 +3894,16 @@ mod tests {
     #[test]
     fn the_restart_after_a_held_initiation_says_whether_the_selection_moved() {
         assert_eq!(
-            held_initiation_established_line(0, "10.0.0.11", "10.0.0.11"),
+            held_initiation_established_line(0, "10.0.0.11", "10.0.0.11", false),
             "[supervise] line 0: IKE_SA re-established after an uplink hold (P-CSCF 10.0.0.11 unchanged); restarting the IMS agent on the new tunnel"
         );
         assert_eq!(
-            held_initiation_established_line(1, "10.0.0.11", "10.0.0.12"),
+            held_initiation_established_line(1, "10.0.0.11", "10.0.0.12", false),
             "[supervise] line 1: IKE_SA re-established after an uplink hold (P-CSCF 10.0.0.11 -> 10.0.0.12); restarting the IMS agent on the new tunnel"
+        );
+        assert_eq!(
+            held_initiation_established_line(2, "10.0.0.11", "10.0.0.11", true),
+            "[supervise] line 2: IKE_SA re-established after a SIM card hold (P-CSCF 10.0.0.11 unchanged); restarting the IMS agent on the new tunnel"
         );
     }
 
@@ -5170,26 +5367,86 @@ mod tests {
                 flapping: false,
                 loss_cause: None,
                 uplink: None,
+                card_hold: None,
             };
             let rebuilds = line_supervisor::RebuildWindow::new(Duration::from_secs(300));
             let mut tracking = line_supervisor::SteadyTracking {
                 child_sa_usable: true,
                 ..Default::default()
             };
-            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, None, None, &report);
+            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, None, None, None, &report);
             assert!(sent.borrow().is_empty(), "nothing changed");
             // A new loss cause alone is a change worth reporting.
             let cause = Some(IkeSaLossCause::CarrierDelete);
-            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, cause, None, &report);
+            sync_tunnel_signal(
+                &mut signal,
+                &tracking,
+                &rebuilds,
+                cause,
+                None,
+                None,
+                &report,
+            );
             assert_eq!(sent.borrow().len(), 1);
             assert_eq!(sent.borrow()[0].loss_cause, cause);
             // ...and the same state again is not.
-            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, cause, None, &report);
+            sync_tunnel_signal(
+                &mut signal,
+                &tracking,
+                &rebuilds,
+                cause,
+                None,
+                None,
+                &report,
+            );
             assert_eq!(sent.borrow().len(), 1);
             tracking.child_sa_usable = false;
-            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, cause, None, &report);
+            sync_tunnel_signal(
+                &mut signal,
+                &tracking,
+                &rebuilds,
+                cause,
+                None,
+                None,
+                &report,
+            );
             assert_eq!(sent.borrow().len(), 2);
             assert!(!sent.borrow()[1].child_sa_up);
+        }
+
+        #[test]
+        fn a_card_hold_is_reported_on_change_and_never_for_a_modem_line() {
+            let sent = RefCell::new(Vec::new());
+            let report = |s: TunnelSignal| sent.borrow_mut().push(s);
+            let mut signal = TunnelSignal {
+                child_sa_up: true,
+                flapping: false,
+                loss_cause: None,
+                uplink: None,
+                card_hold: None,
+            };
+            let rebuilds = line_supervisor::RebuildWindow::new(Duration::from_secs(300));
+            let tracking = line_supervisor::SteadyTracking {
+                child_sa_usable: true,
+                ..Default::default()
+            };
+            // A modem line: never set, never sent.
+            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, None, None, None, &report);
+            assert!(sent.borrow().is_empty());
+            // A card-reader line: its state, then each change once.
+            for (hold, reports) in [(false, 1), (true, 2), (true, 2), (false, 3)] {
+                sync_tunnel_signal(
+                    &mut signal,
+                    &tracking,
+                    &rebuilds,
+                    None,
+                    None,
+                    Some(hold),
+                    &report,
+                );
+                assert_eq!(sent.borrow().len(), reports, "{hold}");
+                assert_eq!(sent.borrow().last().unwrap().card_hold, Some(hold));
+            }
         }
 
         #[test]
@@ -5202,6 +5459,7 @@ mod tests {
                 flapping: false,
                 loss_cause: None,
                 uplink: Some(UplinkState::Up),
+                card_hold: None,
             };
             let rebuilds = line_supervisor::RebuildWindow::new(Duration::from_secs(300));
             let tracking = line_supervisor::SteadyTracking {
@@ -5209,8 +5467,8 @@ mod tests {
                 ..Default::default()
             };
             let held = Some(UplinkState::NoRoute);
-            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, None, held, &report);
-            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, None, held, &report);
+            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, None, held, None, &report);
+            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, None, held, None, &report);
             assert_eq!(sent.borrow().len(), 1, "reported on change only");
             assert_eq!(sent.borrow()[0].uplink, held);
             sync_tunnel_signal(
@@ -5219,6 +5477,7 @@ mod tests {
                 &rebuilds,
                 None,
                 Some(UplinkState::Up),
+                None,
                 &report,
             );
             assert_eq!(sent.borrow().len(), 2);
@@ -5227,7 +5486,7 @@ mod tests {
                 uplink: None,
                 ..signal
             };
-            sync_tunnel_signal(&mut off, &tracking, &rebuilds, None, None, &report);
+            sync_tunnel_signal(&mut off, &tracking, &rebuilds, None, None, None, &report);
             assert_eq!(sent.borrow().len(), 2);
         }
     }

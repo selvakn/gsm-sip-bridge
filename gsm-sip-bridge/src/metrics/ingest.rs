@@ -122,6 +122,9 @@ struct AgentRecord {
     last_ike_sa_loss_cause: Option<IkeSaLossCause>,
     /// The supervisor's last-reported uplink state (specs/100), for alert text.
     last_uplink: Option<UplinkState>,
+    /// Whether the supervisor last reported this card-reader line's SIM out
+    /// of reach (specs/163), for alert text.
+    last_card_hold: Option<bool>,
     /// Whether the open tunnel streak was opened by flapping (backdated by the
     /// threshold so it alerts at once) rather than by an outage. Picks the alert
     /// wording.
@@ -289,6 +292,7 @@ fn apply_report_with(
     let mut tunnel_flapping = existing.is_some_and(|r| r.tunnel_flapping);
     let mut last_ike_sa_loss_cause = existing.and_then(|r| r.last_ike_sa_loss_cause);
     let mut last_uplink = existing.and_then(|r| r.last_uplink);
+    let mut last_card_hold = existing.and_then(|r| r.last_card_hold);
     let mut streak_opened_by_flapping = existing.is_some_and(|r| r.streak_opened_by_flapping);
     let mut gm_connection_alert_phase =
         existing.map_or(AlertPhase::Idle, |r| r.gm_connection_alert_phase);
@@ -342,6 +346,9 @@ fn apply_report_with(
                 metrics::VOWIFI_UPLINK_HELD
                     .with_label_values(&[module_id])
                     .set(if uplink == UplinkState::Up { 0.0 } else { 1.0 });
+            }
+            if let Some(hold) = report.state.card_hold {
+                last_card_hold = Some(hold);
             }
             if let Some(flapping) = report.state.tunnel_flapping {
                 tunnel_flapping = flapping;
@@ -576,6 +583,7 @@ fn apply_report_with(
             tunnel_flapping,
             last_ike_sa_loss_cause,
             last_uplink,
+            last_card_hold,
             streak_opened_by_flapping,
             gm_connection_unhealthy_since,
             gm_connection_alert_phase,
@@ -905,6 +913,7 @@ fn tunnel_failure_description(
     flapping: bool,
     cause: Option<IkeSaLossCause>,
     uplink: Option<UplinkState>,
+    card_hold: bool,
 ) -> String {
     let text = match (flapping, cause) {
         (false, None) => {
@@ -920,12 +929,19 @@ fn tunnel_failure_description(
             "{subject} line's tunnel rebuilt repeatedly (3+ times within {unhealthy_sec}s; last IKE_SA loss: {c})"
         ),
     };
-    match uplink {
+    let text = match uplink {
         Some(UplinkState::NoRoute) => format!("{text}; uplink down (no route), recovery on hold"),
         Some(UplinkState::NoResponse) => {
             format!("{text}; uplink down (no response), recovery on hold")
         }
         Some(UplinkState::Up) | None => text,
+    };
+    // A card-reader line's SIM out of reach (specs/163 FR-014): the supervisor
+    // is slowing its attempts, so the outage is the card's, not the carrier's.
+    if card_hold {
+        format!("{text}; SIM card out of reach, tunnel attempts slowed until it is back")
+    } else {
+        text
     }
 }
 
@@ -1129,9 +1145,9 @@ fn alert_description(
         // so both read as the VoWiFi line rather than naming whichever kind
         // happened to own the decision.
         (AlertCategory::TunnelFailure, CriticalEventKind::Failure) => {
-            // The IMS agent's record has no uplink, so a failure decided on it
-            // reads the supervisor's, the one that holds the line.
-            let (flapping, cause, uplink) = {
+            // The IMS agent's record has no uplink or card hold, so a failure
+            // decided on it reads the supervisor's, the one that holds the line.
+            let (flapping, cause, uplink, card_hold) = {
                 let own = records.get(key);
                 let supervisor = records.get(&(AgentKind::Supervisor, key.1.clone()));
                 (
@@ -1139,6 +1155,9 @@ fn alert_description(
                     own.and_then(|r| r.last_ike_sa_loss_cause),
                     own.and_then(|r| r.last_uplink)
                         .or_else(|| supervisor.and_then(|r| r.last_uplink)),
+                    own.and_then(|r| r.last_card_hold)
+                        .or_else(|| supervisor.and_then(|r| r.last_card_hold))
+                        .unwrap_or(false),
                 )
             };
             tunnel_failure_description(
@@ -1147,6 +1166,7 @@ fn alert_description(
                 flapping,
                 cause,
                 uplink,
+                card_hold,
             )
         }
         (AlertCategory::TunnelFailure, CriticalEventKind::Recovered) => {
@@ -2196,6 +2216,7 @@ mod tests {
                 tunnel_flapping: false,
                 last_ike_sa_loss_cause: None,
                 last_uplink: None,
+                last_card_hold: None,
                 streak_opened_by_flapping: false,
                 gm_connection_unhealthy_since: None,
                 gm_connection_alert_phase: AlertPhase::Idle,
@@ -2409,6 +2430,7 @@ mod tests {
                     tunnel_flapping: false,
                     last_ike_sa_loss_cause: None,
                     last_uplink: None,
+                    last_card_hold: None,
                     streak_opened_by_flapping: false,
                     gm_connection_unhealthy_since: None,
                     gm_connection_alert_phase: AlertPhase::Idle,
@@ -3111,18 +3133,18 @@ mod tests {
     fn tunnel_failure_text_per_cause_and_streak_kind() {
         use IkeSaLossCause::*;
         assert_eq!(
-            tunnel_failure_description("VoWiFi", 300, false, None, None),
+            tunnel_failure_description("VoWiFi", 300, false, None, None, false),
             "VoWiFi line's tunnel non-established for over 300s"
         );
         assert_eq!(
-            tunnel_failure_description("VoWiFi", 300, false, Some(DeadPeer), None),
+            tunnel_failure_description("VoWiFi", 300, false, Some(DeadPeer), None, false),
             "VoWiFi line's tunnel non-established for over 300s (last IKE_SA loss: dead-peer timeout)"
         );
         assert_eq!(
-            tunnel_failure_description("VoWiFi", 300, true, Some(CarrierDelete), None),
+            tunnel_failure_description("VoWiFi", 300, true, Some(CarrierDelete), None, false),
             "VoWiFi line's tunnel rebuilt repeatedly (3+ times within 300s; last IKE_SA loss: carrier DELETE)"
         );
-        let no_cause = tunnel_failure_description("VoWiFi", 300, true, None, None);
+        let no_cause = tunnel_failure_description("VoWiFi", 300, true, None, None, false);
         assert!(no_cause.contains("rebuilt repeatedly") && !no_cause.contains("last IKE_SA loss"));
     }
 
@@ -3131,7 +3153,7 @@ mod tests {
         use IkeSaLossCause::*;
         for flapping in [false, true] {
             for cause in [None, Some(DeadPeer), Some(CarrierDelete)] {
-                let plain = tunnel_failure_description("VoWiFi", 300, flapping, cause, None);
+                let plain = tunnel_failure_description("VoWiFi", 300, flapping, cause, None, false);
                 // Up or absent: byte for byte what it was.
                 assert_eq!(
                     tunnel_failure_description(
@@ -3139,7 +3161,8 @@ mod tests {
                         300,
                         flapping,
                         cause,
-                        Some(UplinkState::Up)
+                        Some(UplinkState::Up),
+                        false
                     ),
                     plain
                 );
@@ -3149,7 +3172,8 @@ mod tests {
                         300,
                         flapping,
                         cause,
-                        Some(UplinkState::NoRoute)
+                        Some(UplinkState::NoRoute),
+                        false
                     ),
                     format!("{plain}; uplink down (no route), recovery on hold")
                 );
@@ -3159,7 +3183,8 @@ mod tests {
                         300,
                         flapping,
                         cause,
-                        Some(UplinkState::NoResponse)
+                        Some(UplinkState::NoResponse),
+                        false
                     ),
                     format!("{plain}; uplink down (no response), recovery on hold")
                 );
@@ -3171,10 +3196,110 @@ mod tests {
                 300,
                 false,
                 Some(DeadPeer),
-                Some(UplinkState::NoRoute)
+                Some(UplinkState::NoRoute),
+                false
             ),
             "VoWiFi line's tunnel non-established for over 300s (last IKE_SA loss: dead-peer timeout); uplink down (no route), recovery on hold"
         );
+    }
+
+    const CARD_SUFFIX: &str = "; SIM card out of reach, tunnel attempts slowed until it is back";
+
+    #[test]
+    fn tunnel_failure_text_names_the_card_while_held() {
+        use IkeSaLossCause::*;
+        // The contract's three examples, byte for byte.
+        assert_eq!(
+            tunnel_failure_description("VoWiFi", 300, false, None, None, true),
+            "VoWiFi line's tunnel non-established for over 300s; SIM card out of reach, tunnel attempts slowed until it is back"
+        );
+        assert_eq!(
+            tunnel_failure_description("VoWiFi", 300, false, Some(DeadPeer), None, true),
+            "VoWiFi line's tunnel non-established for over 300s (last IKE_SA loss: dead-peer timeout); SIM card out of reach, tunnel attempts slowed until it is back"
+        );
+        assert_eq!(
+            tunnel_failure_description(
+                "VoWiFi",
+                300,
+                false,
+                None,
+                Some(UplinkState::NoRoute),
+                true
+            ),
+            "VoWiFi line's tunnel non-established for over 300s; uplink down (no route), recovery on hold; SIM card out of reach, tunnel attempts slowed until it is back"
+        );
+    }
+
+    #[test]
+    fn tunnel_failure_text_is_unchanged_without_a_card_hold() {
+        use IkeSaLossCause::*;
+        for flapping in [false, true] {
+            for cause in [None, Some(DeadPeer), Some(CarrierDelete)] {
+                for uplink in [
+                    None,
+                    Some(UplinkState::Up),
+                    Some(UplinkState::NoRoute),
+                    Some(UplinkState::NoResponse),
+                ] {
+                    let plain =
+                        tunnel_failure_description("VoWiFi", 300, flapping, cause, uplink, false);
+                    assert!(!plain.contains("SIM card"), "{plain}");
+                    assert_eq!(
+                        tunnel_failure_description("VoWiFi", 300, flapping, cause, uplink, true),
+                        format!("{plain}{CARD_SUFFIX}")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_supervisor_report_with_card_hold_reaches_the_folded_alert() {
+        let cfg = tunnel_cfg();
+        let m = "test-card-hold-folded-alert";
+        let ims_key = (AgentKind::Ims, m.to_string());
+        let describe = || {
+            alert_description(
+                &liveness().lock().unwrap(),
+                &cfg,
+                &ims_key,
+                AlertCategory::TunnelFailure,
+                CriticalEventKind::Failure,
+            )
+        };
+        ims_report(&cfg, m, 1, 1, false);
+        sup_state_report(
+            &cfg,
+            m,
+            1,
+            AgentState {
+                card_hold: Some(true),
+                ..flap_state(false, false)
+            },
+        );
+        assert!(describe().ends_with(CARD_SUFFIX), "{}", describe());
+        // A report that does not mention it leaves it alone.
+        sup_state_report(&cfg, m, 2, flap_state(false, false));
+        assert!(describe().ends_with(CARD_SUFFIX), "{}", describe());
+        sup_state_report(
+            &cfg,
+            m,
+            3,
+            AgentState {
+                card_hold: Some(false),
+                ..flap_state(false, false)
+            },
+        );
+        assert!(!describe().contains("SIM card"), "{}", describe());
+        // The recovery text never names it.
+        let recovered = alert_description(
+            &liveness().lock().unwrap(),
+            &cfg,
+            &ims_key,
+            AlertCategory::TunnelFailure,
+            CriticalEventKind::Recovered,
+        );
+        assert!(!recovered.contains("SIM card"), "{recovered}");
     }
 
     fn uplink_report(m: &str, seq: u64, uplink: Option<UplinkState>, events: Vec<ObservedEvent>) {
