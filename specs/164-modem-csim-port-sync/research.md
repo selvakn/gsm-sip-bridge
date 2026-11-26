@@ -169,6 +169,8 @@ Paths are relative to `gsm-sip-bridge/src`. Line numbers are as of `744348b` (ma
     - AUTHENTICATE and GET RESPONSE (2 × `AKA_RESPONSE_BUDGET.timeout`).
 
     That gives 30 + 5 + 10 + 100 + 40 + 64 + 20 = 269 s. 360 s still leaves 34%, so `Phase::Renewal` is unchanged.
+
+    **Revised in PR review (#238):** `register_session` answers up to `MAX_RESYNC_ATTEMPTS` (2) AUTS resyncs before the challenge that succeeds. That makes 3 AKA pairs and 4 REGISTER round trips, and the modem-lock wait (20 s) was never counted either. The new total is 20 + 35 + 10 + 100 + 120 + 128 + 20 = 433 s. For a 20% margin, `Phase::Renewal` goes from 360 to **540 s**, and the counts are now derived from `MAX_RESYNC_ATTEMPTS`. `Phase::Startup` runs the same registration after the PLMN derivation (6 AT commands, 30 s), so it goes from 420 to **600 s**, and a new test pins it against the renewal derivation.
   - `volte/sms.rs` derivations: `open_worst` becomes the retry sleeps plus one sync bound (6.8 s), because D4 makes at most one attempt reach the sync. That gives:
     - `port_worst` = 20 + 6.8 + 5 = 31.8 s, so `PER_MESSAGE_PORT_BUDGET` goes from 30 to **35 s**;
     - `SWEEP_PASS_BUDGET` must be ≥ 2 × 35, so it goes from 60 to **72 s**, which still leaves 25% under the 90 s watchdog;

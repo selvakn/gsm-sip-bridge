@@ -86,7 +86,7 @@ pub const DEFAULT_EXPIRES: u32 = 3600;
 /// password and an `auts` parameter; the server then issues a fresh
 /// challenge. Cap resync attempts so a persistently out-of-sync SIM (or a
 /// server that never accepts the resync) can't loop forever.
-const MAX_RESYNC_ATTEMPTS: u32 = 2;
+pub(crate) const MAX_RESYNC_ATTEMPTS: u32 = 2;
 
 /// `P-Access-Network-Info` value for the ePDG/VoWiFi access leg. This is the
 /// value the registration path hard-coded before the field was configurable,

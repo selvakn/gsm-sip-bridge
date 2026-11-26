@@ -199,12 +199,14 @@ impl Phase {
             // call; 15s is generous slack over either.
             Phase::Idle => Duration::from_secs(15),
             // Modem open + a full initial registration, which is renewal's work
-            // plus PLMN derivation.
-            Phase::Startup => Duration::from_secs(420),
+            // plus PLMN derivation. See
+            // `startup_budget_covers_a_registration_after_plmn_derivation`.
+            Phase::Startup => Duration::from_secs(600),
             // One OPTIONS round trip plus a reconnect attempt.
             Phase::GmProbe => Duration::from_secs(30),
-            // See `derived_renewal_worst_case`.
-            Phase::Renewal => Duration::from_secs(360),
+            // See `derived_renewal_worst_case`: 433 s since modem AKA got
+            // 20 s per APDU (#237), with every challenge of a resync counted.
+            Phase::Renewal => Duration::from_secs(540),
             // Control timeout, PBX ring, bridge setup.
             Phase::InboundCall => Duration::from_secs(180),
             // An RTP socket bind, an SDP/INVITE build and one SIP write. Only
@@ -666,6 +668,9 @@ mod tests {
     /// `budget()` stays a plain table a human can read, while the derivation
     /// remains machine-checked.
     fn derived_renewal_worst_case() -> Duration {
+        // The modem lock, which the SMS sweep holds during its own AT work
+        // (VoLTE lines). The phase is entered before this wait.
+        let modem_lock = crate::modules::modem_lock::MODEM_LOCK_TIMEOUT;
         // Opening the modem, when another holder has it, then the open's sync
         // (#237), bounded by the port's timeout.
         let modem_open =
@@ -677,14 +682,18 @@ mod tests {
         // AT command bounded by the AT layer's default timeout.
         let apdus = 16 + 2 + 2;
         let apdu_time = crate::modules::at_commander::DEFAULT_TIMEOUT * apdus;
-        // AUTHENTICATE and its GET RESPONSE wait the SIM's AKA budget (#237).
-        let aka = crate::modules::usim::AKA_RESPONSE_BUDGET.timeout * 2;
-        // Two REGISTER round trips (the challenge and the authenticated
-        // retry), each bounded by SIP Timer B.
-        let register = Duration::from_secs(32) * 2;
+        // `register_session` answers up to `MAX_RESYNC_ATTEMPTS` sequence
+        // mismatches with AUTS, then the challenge that succeeds, all on the
+        // card opened once. Each answer is AUTHENTICATE and its GET RESPONSE,
+        // under the SIM's AKA budget (#237).
+        let challenges = crate::ims::MAX_RESYNC_ATTEMPTS + 1;
+        let aka = crate::modules::usim::AKA_RESPONSE_BUDGET.timeout * 2 * challenges;
+        // The first REGISTER, then one per answered challenge, each bounded
+        // by SIP Timer B.
+        let register = Duration::from_secs(32) * (challenges + 1);
         // Installing the Gm SAs shells out to `ip xfrm` ~20 times.
         let sa_install = Duration::from_secs(20);
-        modem_open + identities + apdu_time + aka + register + sa_install
+        modem_lock + modem_open + identities + apdu_time + aka + register + sa_install
     }
 
     #[test]
@@ -704,6 +713,29 @@ mod tests {
         assert!(
             margin >= 0.20,
             "renewal budget {budget:?} leaves only {:.1}% margin over {worst:?}; want >=20%",
+            margin * 100.0
+        );
+    }
+
+    #[test]
+    fn startup_budget_covers_a_registration_after_plmn_derivation() {
+        // Startup derives the home PLMN over a freshly opened port, then
+        // runs the same full registration as a renewal. A renewal budget
+        // raised without startup (#237 review: 360 -> 540 s, against
+        // startup's 420 s) would let the watchdog kill a slow first
+        // registration.
+        let at = crate::modules::at_commander::DEFAULT_TIMEOUT;
+        // The open's sync, `AT+CIMI`, SELECT EF_AD and READ BINARY with its
+        // wrong-`Le` retry, then the `AT+COPS?` fallback.
+        let plmn = at * (1 + 1 + 3 + 1);
+        let worst = derived_renewal_worst_case() + plmn;
+        let budget = Phase::Startup
+            .budget()
+            .expect("startup is a working phase and must carry a budget");
+        let margin = budget.as_secs_f64() / worst.as_secs_f64() - 1.0;
+        assert!(
+            margin >= 0.20,
+            "startup budget {budget:?} leaves {:.1}% over {worst:?}; want >=20%",
             margin * 100.0
         );
     }
@@ -863,7 +895,7 @@ mod tests {
     fn the_deferral_window_is_the_ceiling_for_every_phase() {
         // The ceiling is time past the budget, not time since the phase was
         // entered. Measured from entry, `Renewal` would defer for only
-        // `DEFER_CEILING - 360s` and a phase whose budget reached the ceiling
+        // `DEFER_CEILING - 540s` and a phase whose budget reached the ceiling
         // would not defer at all — it would drop a live call on the first
         // confirmed sample, which is the opposite of what deferral is for.
         let now = Instant::now();

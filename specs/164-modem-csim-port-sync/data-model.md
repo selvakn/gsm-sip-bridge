@@ -71,7 +71,8 @@ All state is in memory, per process. Nothing is persisted or reported over IPC.
 | **`AKA_RESPONSE_BUDGET`** | `{ max_lines: MAX_RESPONSE_LINES (256), timeout: 20 s }` | AUTHENTICATE and its GET RESPONSE on a modem: agent AKA (via `transmit_aka_apdu`) and bridge relay (INS `0x88` and its `61XX` chase) |
 | `PER_MESSAGE_PORT_BUDGET` | 30 → **35 s** | one sweep message's port work |
 | `SWEEP_PASS_BUDGET` | 60 → **72 s** | one sweep pass (still ≥ 20% under `Phase::SmsSweep` = 90 s) |
-| `Phase::Renewal` | 360 s (unchanged) | derived worst case 214 → 269 s |
+| `Phase::Renewal` | 360 → **540 s** (PR review) | derived worst case 214 → 433 s: every challenge of a resync and the modem-lock wait now counted |
+| `Phase::Startup` | 420 → **600 s** (PR review) | renewal's derived worst case plus the PLMN derivation: 463 s |
 
 ## SIM timings (`ims::OpenTimings`, carried in `OpenedCard.opened`)
 

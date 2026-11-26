@@ -347,3 +347,15 @@ T016 usim.rs tests   T017 usim.rs RecordingTransport test   T018 usim_bridge.rs 
 - **The echo of a sync query is not counted as stale** (T003, D2). D2 says echoed command lines are "discarded like anything else", and T003 says "only the two replies count as ours". They are still discarded, but a line equal to the query just sent is not added to `discarded_bytes`. Echo is the power-on default and only the CS pool sends `ATE0`, so counting it would log the stale-bytes warning on every open of an echo-on modem, which contradicts the contract ("frequent `context=open` lines point at another holder"). Blank lines around the sync's own replies are not counted either, so a clean sync reports 0. Pinned by `sync_ignores_command_echo` (0 discarded with echo on).
 - **`start_worker` takes no `path`** (T011). The port label for the error detail is read from the session (`Session::label`), so the path parameter would be unused.
 - **§6 was verified once a SIM was put in the modem** (T030). Until then the rig's modem had no SIM, and this was recorded as a deviation. It is now verified live, together with the agent-restart reproduction, in `quickstart.md`, "With a SIM in the modem".
+
+## PR review fixes (#238)
+
+- **Reads bounded by their loop's deadline** (Greptile P2, `at_worker.rs`). Each loop checked its deadline, then made a read that could wait the port's whole timeout. A sync whose first reply came just before its bound held the port for up to twice the bound, after `start_worker` had stopped waiting.
+  - Fixed for the whole class: `send_command_within`, `read_line_raw` and `read_sync_reply` all read through `Session::fill_by(deadline)`.
+  - The port is now an `AtPort`, which can bound its next read: serial ports and `UnixStream` do, and mock streams keep their own timeout through `FixedTimeout`. The port's timeout is put back after a bounded read, because `serialport` uses the same timeout for writes.
+  - The sync no longer writes its second query once the deadline has passed.
+  - Pinned by four new tests and the restore test. Each fails with its part of the fix removed.
+- **Renewal worst case counts every resync** (Greptile P2, `watchdog.rs`).
+  - The AKA pairs (`MAX_RESYNC_ATTEMPTS + 1`) and REGISTER round trips (`+ 2`) are now derived. The modem-lock wait, never counted before, is added.
+  - Worst case 433 s, so `Phase::Renewal` goes from 360 to 540 s.
+  - Same class: `Phase::Startup` ("renewal's work plus PLMN derivation") was 420 s, under the new renewal worst case. It is now 600 s, pinned by `startup_budget_covers_a_registration_after_plmn_derivation`.
