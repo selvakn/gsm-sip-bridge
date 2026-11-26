@@ -31,6 +31,22 @@ pub enum BridgeError {
     /// they did the untyped error it replaces.
     #[error("IMS error: SIM card unreachable: {0}")]
     CardUnreachable(String),
+    /// A freshly opened modem AT port that did not complete its sync within
+    /// the port's timeout (#237): the modem does not answer, or answers
+    /// nothing the sync can prove is its own reply. Built only by
+    /// `AtCommander::start_worker` (open and reopen), so it never describes a
+    /// command that failed on a channel already in step.
+    ///
+    /// Recognise it with [`BridgeError::is_port_out_of_step`], never by its
+    /// text. The open-retry loops use it to stop retrying: they wait out
+    /// another holder of the port, not a modem that does not answer. The
+    /// text keeps `discovery error:` and contains `AT command timeout`, so
+    /// the `contains("timeout")` classifiers (`map_registration_error`,
+    /// `modules::worker`, `gsm_echo`) read it as the timeout it is, and it
+    /// does not contain `AT+CSIM failed`, so `sim_recovery` does not count it
+    /// as a SIM fault.
+    #[error("discovery error: AT command timeout: {0}")]
+    PortOutOfStep(String),
     /// An I/O failure that is not attributable to a more specific subsystem.
     ///
     /// This variant exists because `From<std::io::Error>` used to map *every*
@@ -62,6 +78,12 @@ impl BridgeError {
     /// (#233), rather than a failure the card or the network reported.
     pub fn is_card_unreachable(&self) -> bool {
         matches!(self, BridgeError::CardUnreachable(_))
+    }
+
+    /// Whether this is a modem port that failed its sync on open (#237),
+    /// rather than a port another holder has locked.
+    pub fn is_port_out_of_step(&self) -> bool {
+        matches!(self, BridgeError::PortOutOfStep(_))
     }
 }
 
@@ -107,6 +129,25 @@ mod tests {
         assert_eq!(e.to_string(), "IMS error: SIM card unreachable: x");
         assert!(e.is_card_unreachable());
         assert!(!BridgeError::Ims("SIM card unreachable: x".to_string()).is_card_unreachable());
+    }
+
+    /// FR-008: a port that failed its sync reads as a timeout to every
+    /// existing text classifier, and never as a SIM fault.
+    #[test]
+    fn port_out_of_step_reads_as_a_timeout_to_every_classifier() {
+        let e = BridgeError::PortOutOfStep("x".into());
+        assert_eq!(e.to_string(), "discovery error: AT command timeout: x");
+        assert!(e.is_port_out_of_step());
+        assert!(!BridgeError::Discovery("x".into()).is_port_out_of_step());
+        assert_eq!(
+            crate::ims::session::map_registration_error(&e),
+            crate::control::protocol::RegistrationStatus::Timeout
+        );
+        assert!(!crate::supervise::sim_recovery::has_csim_failure(
+            &e.to_string()
+        ));
+        // `modules/worker.rs` and `bin/gsm_echo.rs` test exactly this.
+        assert!(e.to_string().contains("timeout"));
     }
 
     /// A genuine config parse failure still reports as one.

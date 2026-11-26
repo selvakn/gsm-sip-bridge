@@ -99,9 +99,6 @@ pub struct AtCommander {
     path: Option<std::path::PathBuf>,
 }
 
-pub trait ReadWrite: Read + Write {}
-impl<T: Read + Write> ReadWrite for T {}
-
 #[derive(Debug, Clone)]
 pub enum AtResponse {
     Ok(Vec<String>),
@@ -237,27 +234,83 @@ impl AtCommander {
     /// bounding the caller is worth stranding the worker — but it means "the
     /// port is free again" is not something a surviving process can assume
     /// after a timeout. `AtCommander::ensure_usable` is what tries to find out.
+    ///
+    /// # It proves the channel is in step before returning (#237)
+    ///
+    /// A reply that another holder of the port abandoned (it timed out and
+    /// closed mid-command) is delivered to the *next* opener, even after the
+    /// open's flush, and would be read as our first command's answer. So the
+    /// new worker runs `Session::sync` before this returns, bounded by
+    /// `timeout`. A modem that cannot complete it fails here with
+    /// [`BridgeError::PortOutOfStep`], whose text still reads
+    /// `AT command timeout`, and the worker exits after its bounded sync,
+    /// releasing the port.
     pub fn open_with_timeout(path: &Path, timeout: Duration) -> BridgeResult<Self> {
-        let (tx, worker_rx) = std::sync::mpsc::channel();
         let session = Self::open_session(path, timeout)?;
+        let thread_name = format!(
+            "at-port-{}",
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unknown".into())
+        );
+        Ok(Self {
+            transport: Self::start_worker(session, timeout, thread_name)?,
+            path: Some(path.to_path_buf()),
+        })
+    }
+
+    /// A worker-backed commander over any stream, through the same worker
+    /// spawn and sync as [`AtCommander::open_with_timeout`]. The caller sets
+    /// the stream's own read timeout.
+    #[cfg(test)]
+    pub(crate) fn start_for_test<S: crate::modules::at_worker::AtPort + 'static>(
+        stream: S,
+        timeout: Duration,
+    ) -> BridgeResult<Self> {
+        let session =
+            crate::modules::at_worker::Session::new(Box::new(stream), timeout, "test-stream");
+        Ok(Self {
+            transport: Self::start_worker(session, timeout, "at-port-test".into())?,
+            path: None,
+        })
+    }
+
+    /// Hand `session` to a new worker thread and wait, bounded, for its sync.
+    /// Every real port session starts here: the open and the reopen.
+    ///
+    /// On failure our sender is dropped before returning. The worker finishes
+    /// its bounded sync, finds the channel closed and exits, dropping the
+    /// port and its `flock`. A worker wedged in `read(2)` during the sync is
+    /// stranded exactly as a wedged command is (see `modules::at_worker`).
+    fn start_worker(
+        session: crate::modules::at_worker::Session,
+        timeout: Duration,
+        thread_name: String,
+    ) -> BridgeResult<Transport> {
+        let label = session.label().to_string();
+        let (tx, worker_rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
-            .name(format!(
-                "at-port-{}",
-                path.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "unknown".into())
-            ))
+            .name(thread_name)
             .spawn(move || crate::modules::at_worker::run(session, worker_rx))
             .map_err(|e| {
                 BridgeError::Discovery(format!("could not start the AT port worker: {e}"))
             })?;
-        Ok(Self {
-            transport: Transport::Worker {
-                tx: Some(tx),
-                timeout,
-                state: ChannelState::Healthy,
-            },
-            path: Some(path.to_path_buf()),
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let synced = tx
+            .send(crate::modules::at_worker::Request::Sync { reply: reply_tx })
+            .is_ok()
+            && matches!(reply_rx.recv_timeout(timeout + WORKER_GRACE), Ok(Ok(())));
+        if !synced {
+            drop(tx);
+            return Err(BridgeError::PortOutOfStep(format!(
+                "{label} did not answer its sync within {} ms",
+                timeout.as_millis()
+            )));
+        }
+        Ok(Transport::Worker {
+            tx: Some(tx),
+            timeout,
+            state: ChannelState::Healthy,
         })
     }
 
@@ -274,14 +327,16 @@ impl AtCommander {
         Ok(crate::modules::at_worker::Session::new(
             Box::new(port),
             timeout,
+            path.display().to_string(),
         ))
     }
 
     pub fn from_stream<S: Read + Write + Send + 'static>(stream: S, timeout: Duration) -> Self {
         Self {
             transport: Transport::Direct(Box::new(crate::modules::at_worker::Session::new(
-                Box::new(stream),
+                Box::new(crate::modules::at_worker::FixedTimeout(stream)),
                 timeout,
+                "stream",
             ))),
             path: None,
         }
@@ -451,7 +506,8 @@ impl AtCommander {
 
     /// Bring a suspect channel back, or conclude it is dead (FR-036/FR-037).
     ///
-    /// Cheapest remedy first. A resync costs one bare `AT` and rescues the
+    /// Cheapest remedy first. A resync costs two read-only round trips (the
+    /// worker's `Session::sync`) and rescues the
     /// common case where the worker was merely slow -- no restart, no
     /// interruption. Only if the worker will not answer at all do we try a
     /// fresh open, which succeeds if the stuck worker has since finished and
@@ -564,23 +620,24 @@ impl AtCommander {
         let Some(session) = session else {
             return false;
         };
-        let (new_tx, worker_rx) = std::sync::mpsc::channel();
-        if std::thread::Builder::new()
-            .name("at-port-reopen".to_string())
-            .spawn(move || crate::modules::at_worker::run(session, worker_rx))
-            .is_err()
-        {
-            return false;
-        }
+        // The reopened port syncs like a fresh open: the abandoned worker's
+        // reply may still be on its way.
+        let transport = match Self::start_worker(session, timeout, "at-port-reopen".into()) {
+            Ok(transport) => transport,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "reopened the modem port, but it did not come back into step"
+                );
+                return false;
+            }
+        };
         tracing::warn!(
             path = %path.display(),
             "reopened the modem port after an abandoned AT operation; the previous worker              had released it"
         );
-        self.transport = Transport::Worker {
-            tx: Some(new_tx),
-            timeout,
-            state: ChannelState::Healthy,
-        };
+        self.transport = transport;
         true
     }
 
@@ -1334,5 +1391,81 @@ mod tests {
     fn test_query_network_type_edge_keyword() {
         let mut at = make_commander("+QNWINFO: \"EDGE\",\"46001\",\"GSM 900\",80\r\nOK\r\n");
         assert_eq!(at.query_network_type().unwrap(), NetworkType::TwoGEdge);
+    }
+
+    // ---- #237: every open proves the channel is in step ----
+
+    use crate::modules::at_worker::test_modem;
+    use std::os::unix::net::UnixStream;
+
+    fn socket_pair(read_timeout: Duration) -> (UnixStream, UnixStream) {
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        ours.set_read_timeout(Some(read_timeout))
+            .expect("read timeout");
+        (ours, theirs)
+    }
+
+    #[test]
+    fn a_fresh_open_discards_the_previous_holders_late_reply() {
+        // F2: the reply another holder abandoned is waiting when we open.
+        let (ours, mut theirs) = socket_pair(Duration::from_millis(500));
+        theirs
+            .write_all(b"\r\n+CSIM: 4,\"FFFF\"\r\n\r\nOK\r\n")
+            .expect("stale");
+        let _events = test_modem::spawn(
+            theirs,
+            test_modem::Script::default().reply(
+                "AT+CSQ",
+                Duration::ZERO,
+                "\r\n+CSQ: 21,99\r\n\r\nOK\r\n",
+            ),
+        );
+        let mut at = AtCommander::start_for_test(ours, Duration::from_secs(2)).expect("open");
+        assert_eq!(at.check_signal().expect("the first command"), (21, 99));
+    }
+
+    #[test]
+    fn a_fresh_open_on_a_silent_port_fails_typed_within_its_bound() {
+        let timeout = Duration::from_millis(300);
+        let (ours, _theirs) = socket_pair(timeout);
+        let started = Instant::now();
+        let Err(e) = AtCommander::start_for_test(ours, timeout) else {
+            panic!("a silent port must not open");
+        };
+        assert!(e.is_port_out_of_step(), "{e}");
+        assert!(e.to_string().contains("AT command timeout"), "{e}");
+        assert!(
+            started.elapsed() < timeout + WORKER_GRACE + Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn an_open_that_fails_its_sync_releases_the_worker() {
+        // The worker must exit and drop the port, or it holds the flock for
+        // the life of the process and every later open fails.
+        let timeout = Duration::from_millis(300);
+        let (ours, mut theirs) = socket_pair(timeout);
+        assert!(AtCommander::start_for_test(ours, timeout).is_err());
+        theirs
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("read timeout");
+        let deadline = Instant::now() + timeout + Duration::from_secs(1);
+        let mut buf = [0u8; 256];
+        loop {
+            match theirs.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => panic!("unexpected read error: {e}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the worker still holds the port after its sync failed"
+            );
+        }
     }
 }

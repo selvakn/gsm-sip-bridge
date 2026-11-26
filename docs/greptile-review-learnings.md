@@ -179,6 +179,12 @@ Greptile has *actually* found here, at least once, and usually more.
 - [ ] Device selection is bound to the **line's identity** (match on IMSI), not
       "the first reader that isn't vpcd" — otherwise line 1 authenticates with
       line 0's SIM.
+- [ ] A new reader of a modem AT port trusts nothing until
+      `at_worker::Session::sync` has run. A reply abandoned by another holder
+      (or by our own timeout) is delivered on the next open, or after a drain
+      has found the line quiet, and shifts every later reply by one. Never add
+      a second way to open a port that skips `AtCommander::start_worker`, and
+      never a drain-only recovery (#237, measured with `tmp/reopen-test/`).
 - [ ] Only one process holds a serial port at a time, *including during
       teardown*. Cleanup must wait for the child to actually release the modem
       before issuing its own AT traffic — polling for 5s and proceeding anyway is

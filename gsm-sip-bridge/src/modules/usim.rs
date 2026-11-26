@@ -9,10 +9,29 @@
 //! throughout. The USIM ADF's AID is read from EF_DIR rather than hardcoded,
 //! since it is card-specific.
 
-use super::at_commander::{AtCommander, AtResponse};
+use super::at_commander::{AtCommander, AtResponse, ResponseBudget};
+use super::at_worker::MAX_RESPONSE_LINES;
 use crate::error::{BridgeError, BridgeResult};
+use std::time::Duration;
 
 const SW_SUCCESS: &str = "9000";
+
+/// How long a modem SIM may take to answer AUTHENTICATE, and the GET RESPONSE
+/// that collects its result (#237).
+///
+/// Every other APDU keeps the port's 5 s. AKA is the one command a SIM is
+/// known to run slowly: in the incident the SIM's answer arrived after 5 s
+/// and before ~11 s, and the line's previous challenge took 4.2 s end to end.
+/// Giving up at 5 s threw away a correct answer, forced a full registration,
+/// and left the abandoned reply on the port for the next session. 20 s covers
+/// that with room; the registrar waits far longer for the authenticated
+/// REGISTER, and a refresh challenge runs on its own thread with a 600 s
+/// bound (`registration_auth::WORK_TIMEOUT`). Counted in the renewal
+/// watchdog's derivation (`ims::agent::watchdog`).
+pub(crate) const AKA_RESPONSE_BUDGET: ResponseBudget = ResponseBudget {
+    max_lines: MAX_RESPONSE_LINES,
+    timeout: Duration::from_secs(20),
+};
 
 /// A raw APDU carrier: send a hex-encoded command APDU, get back the
 /// hex-encoded response (data + SW1SW2). Two implementations exist — a
@@ -35,11 +54,26 @@ pub trait ApduTransport {
     fn authenticate_usim(&mut self, rand: &[u8; 16], autn: &[u8; 16]) -> BridgeResult<AkaResult> {
         authenticate(self, rand, autn)
     }
+
+    /// Sends one of the AKA APDUs: AUTHENTICATE, or the GET RESPONSE that
+    /// collects its result. [`authenticate`] sends both through here.
+    ///
+    /// The default is [`ApduTransport::transmit_apdu`]. A modem overrides it
+    /// to wait [`AKA_RESPONSE_BUDGET`] instead of the port's timeout, because
+    /// the SIM itself can take longer than that to compute the answer (#237).
+    /// A card reader keeps the default.
+    fn transmit_aka_apdu(&mut self, apdu_hex: &str) -> BridgeResult<String> {
+        self.transmit_apdu(apdu_hex)
+    }
 }
 
 impl ApduTransport for AtCommander {
     fn transmit_apdu(&mut self, apdu_hex: &str) -> BridgeResult<String> {
         csim(self, apdu_hex)
+    }
+
+    fn transmit_aka_apdu(&mut self, apdu_hex: &str) -> BridgeResult<String> {
+        csim_within(self, apdu_hex, Some(AKA_RESPONSE_BUDGET))
     }
 }
 
@@ -76,8 +110,23 @@ pub(crate) fn hex_decode(s: &str) -> BridgeResult<Vec<u8>> {
 /// Send one `AT+CSIM` command carrying a raw APDU (as an uppercase hex
 /// string, no separators) and return the raw hex response (data + SW1SW2).
 pub(crate) fn csim(at: &mut AtCommander, apdu_hex: &str) -> BridgeResult<String> {
+    csim_within(at, apdu_hex, None)
+}
+
+/// Like [`csim`], under `budget` instead of the port's own bounds (`None`).
+/// The error text is the same either way: `sim_recovery` and the bridge's
+/// SIM reset count `AT+CSIM failed`.
+pub(crate) fn csim_within(
+    at: &mut AtCommander,
+    apdu_hex: &str,
+    budget: Option<ResponseBudget>,
+) -> BridgeResult<String> {
     let cmd = format!(r#"AT+CSIM={},"{}""#, apdu_hex.len(), apdu_hex);
-    match at.send_command(&cmd)? {
+    let reply = match budget {
+        Some(budget) => at.send_command_within(&cmd, budget)?,
+        None => at.send_command(&cmd)?,
+    };
+    match reply {
         AtResponse::Ok(lines) => lines
             .iter()
             .find_map(|l| l.strip_prefix("+CSIM: "))
@@ -310,14 +359,14 @@ pub fn authenticate<T: ApduTransport + ?Sized>(
     autn: &[u8; 16],
 ) -> BridgeResult<AkaResult> {
     let apdu = format!("008800812210{}10{}", hex_encode(rand), hex_encode(autn));
-    let mut resp = at.transmit_apdu(&apdu)?;
+    let mut resp = at.transmit_aka_apdu(&apdu)?;
 
     if resp.len() >= 4 {
         let sw = &resp[resp.len() - 4..];
         if sw.starts_with("61") {
             let le = &sw[2..4];
             let follow_up = format!("00C00000{le}");
-            resp = at.transmit_apdu(&follow_up)?;
+            resp = at.transmit_aka_apdu(&follow_up)?;
         }
     }
 
@@ -728,5 +777,112 @@ mod tests {
             }
             AkaResult::SyncFailure { .. } => panic!("expected Success"),
         }
+    }
+
+    // ---- #237: a slow SIM's AKA answer through a real modem worker ----
+
+    use crate::modules::at_worker::test_modem;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    const PORT_TIMEOUT: Duration = Duration::from_millis(200);
+    const SLOW: Duration = Duration::from_secs(1);
+    const AUTHENTICATE: &str = "0088008122";
+    const GET_RESPONSE: &str = "00C0000035";
+
+    /// A worker-backed `AtCommander` whose port times out after 200 ms, over
+    /// a socket modem answering `script` (plus the open's sync).
+    fn slow_modem(script: test_modem::Script) -> AtCommander {
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        ours.set_read_timeout(Some(PORT_TIMEOUT))
+            .expect("read timeout");
+        let _events = test_modem::spawn(theirs, script);
+        AtCommander::start_for_test(ours, PORT_TIMEOUT).expect("open")
+    }
+
+    fn csim_reply(hex: &str) -> String {
+        format!("\r\n+CSIM: {},\"{hex}\"\r\n\r\nOK\r\n", hex.len())
+    }
+
+    fn success_hex() -> String {
+        format!(
+            "DB08{}10{}10{}9000",
+            "11".repeat(8),
+            "22".repeat(16),
+            "33".repeat(16)
+        )
+    }
+
+    #[test]
+    fn authenticate_waits_for_a_slow_sim_beyond_the_port_timeout() {
+        let mut at = slow_modem(test_modem::Script::default().reply(
+            AUTHENTICATE,
+            SLOW,
+            &csim_reply(&success_hex()),
+        ));
+        let result = authenticate(&mut at, &[0x11; 16], &[0x22; 16]).expect("authenticate");
+        assert!(matches!(result, AkaResult::Success { .. }));
+    }
+
+    #[test]
+    fn the_get_response_after_authenticate_gets_the_aka_budget_too() {
+        let mut at = slow_modem(
+            test_modem::Script::default()
+                .reply(AUTHENTICATE, Duration::ZERO, &csim_reply("6135"))
+                .reply(GET_RESPONSE, SLOW, &csim_reply(&success_hex())),
+        );
+        let result = authenticate(&mut at, &[0x11; 16], &[0x22; 16]).expect("authenticate");
+        assert!(matches!(result, AkaResult::Success { .. }));
+    }
+
+    #[test]
+    fn other_apdus_keep_the_port_timeout() {
+        let mut at = slow_modem(test_modem::Script::default().reply(
+            "00A4000C023F00",
+            SLOW,
+            &csim_reply("9000"),
+        ));
+        let aid = hex_decode(TEST_AID).unwrap();
+        let err = select_usim(&mut at, &aid).expect_err("a SELECT keeps the port's timeout");
+        assert!(err.to_string().contains("AT command timeout"), "{err}");
+    }
+
+    #[test]
+    fn an_explicit_csim_error_keeps_its_wording() {
+        // FR-008: `sim_recovery` and the bridge's SIM reset count this text.
+        let mut at = slow_modem(test_modem::Script::default().reply(
+            AUTHENTICATE,
+            Duration::ZERO,
+            "\r\nERROR\r\n",
+        ));
+        let err = authenticate(&mut at, &[0x11; 16], &[0x22; 16]).expect_err("ERROR");
+        assert!(err.to_string().contains("AT+CSIM failed"), "{err}");
+    }
+
+    #[test]
+    fn the_aka_budget_is_twenty_seconds() {
+        assert_eq!(AKA_RESPONSE_BUDGET.timeout, Duration::from_secs(20));
+        assert_eq!(
+            AKA_RESPONSE_BUDGET.max_lines,
+            crate::modules::at_worker::MAX_RESPONSE_LINES
+        );
+    }
+
+    /// FR-010: a transport that does not override the AKA hook (the
+    /// card reader) sends AUTHENTICATE and its GET RESPONSE through
+    /// `transmit_apdu`, exactly as before.
+    #[test]
+    fn a_transport_without_an_override_sends_aka_through_transmit_apdu() {
+        let success = success_hex();
+        let mut t = RecordingTransport::new(&["6135", &success]);
+        let result = authenticate(&mut t, &[0x11; 16], &[0x22; 16]).unwrap();
+        assert!(matches!(result, AkaResult::Success { .. }));
+        assert_eq!(
+            t.sent,
+            vec![
+                format!("008800812210{}10{}", "11".repeat(16), "22".repeat(16)),
+                "00C0000035".to_string(),
+            ]
+        );
     }
 }

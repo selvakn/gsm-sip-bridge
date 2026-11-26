@@ -86,7 +86,7 @@ pub const DEFAULT_EXPIRES: u32 = 3600;
 /// password and an `auts` parameter; the server then issues a fresh
 /// challenge. Cap resync attempts so a persistently out-of-sync SIM (or a
 /// server that never accepts the resync) can't loop forever.
-const MAX_RESYNC_ATTEMPTS: u32 = 2;
+pub(crate) const MAX_RESYNC_ATTEMPTS: u32 = 2;
 
 /// `P-Access-Network-Info` value for the ePDG/VoWiFi access leg. This is the
 /// value the registration path hard-coded before the field was configurable,
@@ -1038,41 +1038,52 @@ pub(crate) const MODEM_OPEN_MAX_WAIT: std::time::Duration = std::time::Duration:
 /// `failed to open serial /dev/ttyUSB0: Unable to acquire exclusive lock`,
 /// crash-looping until it happened to win a race.
 ///
-/// Generic over open and sleep so the policy is testable without a serial port
-/// or a real clock.
+/// Only an error `retryable` accepts is waited out. A port whose modem did not
+/// answer its sync (#237, [`BridgeError::PortOutOfStep`]) is not another
+/// holder, and retrying it would cost a full sync bound per attempt.
+///
+/// The wait is measured on the clock against a deadline, not as the sum of
+/// its sleeps: an attempt can itself take up to the open's sync bound.
+///
+/// Generic over open, the clock and sleep so the policy is testable without a
+/// serial port or a real clock.
 fn open_modem_waiting<T, E: std::fmt::Display>(
     port: &str,
     max_wait: std::time::Duration,
     interval: std::time::Duration,
     mut open: impl FnMut() -> Result<T, E>,
+    retryable: impl Fn(&E) -> bool,
+    mut now: impl FnMut() -> std::time::Instant,
     mut sleep: impl FnMut(std::time::Duration),
 ) -> Result<T, E> {
-    let mut waited = std::time::Duration::ZERO;
+    let started = now();
+    let deadline = started + max_wait;
+    let mut retried = false;
     loop {
         match open() {
             Ok(opened) => {
-                if !waited.is_zero() {
+                if retried {
                     tracing::info!(
                         port = %port,
-                        waited_secs = waited.as_secs(),
+                        waited_secs = (now() - started).as_secs(),
                         "modem serial acquired after waiting out a conflicting holder"
                     );
                 }
                 return Ok(opened);
             }
             Err(e) => {
-                if waited >= max_wait {
+                if !retryable(&e) || now() >= deadline {
                     return Err(e);
                 }
-                if waited.is_zero() {
+                if !retried {
                     tracing::warn!(
                         port = %port,
                         error = %e,
                         "modem serial busy (vowifi-usim-bridge is probably mid-EAP); waiting"
                     );
                 }
+                retried = true;
                 sleep(interval);
-                waited += interval;
             }
         }
     }
@@ -1087,6 +1098,42 @@ pub(crate) struct OpenedCard {
     pub(crate) card: Box<dyn ApduTransport>,
     pub(crate) imsi: String,
     pub(crate) imei: String,
+    /// How long opening the card took, for the AKA timing line.
+    pub(crate) opened: OpenTimings,
+}
+
+/// How long [`open_card`] took, logged with each AKA run's own time
+/// ([`log_aka_timings`], #237).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct OpenTimings {
+    /// Opening the port or reader (a modem's includes its sync) and reading
+    /// the identities.
+    pub(crate) open: std::time::Duration,
+    /// A modem's EF_DIR walk plus SELECT. `None` on a card-reader line, which
+    /// selects inside each AKA.
+    pub(crate) select: Option<std::time::Duration>,
+}
+
+/// One debug line per AKA run: how long the card took to open, to select the
+/// USIM, and to answer the challenge, and how it answered. The data for
+/// judging the AKA budget (`usim::AKA_RESPONSE_BUDGET`) on a real SIM.
+pub(crate) fn log_aka_timings(
+    opened: &OpenTimings,
+    aka: std::time::Duration,
+    outcome: &BridgeResult<AkaResult>,
+) {
+    let outcome = match outcome {
+        Ok(AkaResult::Success { .. }) => "success",
+        Ok(AkaResult::SyncFailure { .. }) => "sync-failure",
+        Err(_) => "error",
+    };
+    tracing::debug!(
+        open_ms = opened.open.as_millis() as u64,
+        select_ms = opened.select.map(|d| d.as_millis() as u64),
+        authenticate_ms = aka.as_millis() as u64,
+        outcome,
+        "SIM challenge timings"
+    );
 }
 
 /// Opens the line's SIM, whichever way it is reached. On a modem line it also
@@ -1094,6 +1141,7 @@ pub(crate) struct OpenedCard {
 /// [`OpenedCard`]). The initial registration and a background
 /// re-authentication both start here.
 pub(crate) fn open_card(cfg: &ImsRegisterConfig) -> BridgeResult<OpenedCard> {
+    let started = std::time::Instant::now();
     // A pcsc_reader line's SIM sits in a real PC/SC reader, not the modem at
     // `modem_port` (specs/023-omnikey-pcsc-vowifi). Only one `AtCommander` is
     // ever opened on `modem_port` per call — it must serve both the
@@ -1124,6 +1172,8 @@ pub(crate) fn open_card(cfg: &ImsRegisterConfig) -> BridgeResult<OpenedCard> {
             MODEM_OPEN_MAX_WAIT,
             MODEM_OPEN_RETRY_INTERVAL,
             || AtCommander::open(&cfg.modem_port),
+            |e: &BridgeError| !e.is_port_out_of_step(),
+            std::time::Instant::now,
             std::thread::sleep,
         )?;
         imsi = match &cfg.imsi {
@@ -1139,16 +1189,26 @@ pub(crate) fn open_card(cfg: &ImsRegisterConfig) -> BridgeResult<OpenedCard> {
     tracing::info!(imsi = %imsi, "read IMSI from SIM");
     tracing::info!(imei = %imei, "read IMEI from modem");
 
+    let open = started.elapsed();
+
     // A card-reader line found its USIM AID while identifying the card and
     // selects it inside each AKA's transaction; selecting it here, outside
     // one, would protect nothing.
+    let mut select = None;
     if !cfg.pcsc_reader {
+        let selecting = std::time::Instant::now();
         let aid = usim::discover_usim_aid(card.as_mut())?;
         usim::select_usim(card.as_mut(), &aid)?;
+        select = Some(selecting.elapsed());
         tracing::info!(aid = %aid.iter().map(|b| format!("{b:02X}")).collect::<String>(), "selected USIM application");
     }
 
-    Ok(OpenedCard { card, imsi, imei })
+    Ok(OpenedCard {
+        card,
+        imsi,
+        imei,
+        opened: OpenTimings { open, select },
+    })
 }
 
 /// Runs the SIM's AKA on a challenge: the nonce is RAND followed by AUTN,
@@ -1178,6 +1238,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
         mut card,
         imsi,
         imei,
+        opened,
     } = open_card(cfg)?;
 
     let realm = format!("ims.mnc{}.mcc{}.3gppnetwork.org", cfg.mnc, cfg.mcc);
@@ -1307,7 +1368,10 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
             );
         }
 
-        let aka = run_aka(card.as_mut(), &challenge)?;
+        let authenticating = std::time::Instant::now();
+        let aka = run_aka(card.as_mut(), &challenge);
+        log_aka_timings(&opened, authenticating.elapsed(), &aka);
+        let aka = aka?;
 
         cseq += 1;
         // RFC 2617 requires this to match the Request-URI of the message it's
@@ -2322,6 +2386,8 @@ mod tests {
                     Ok("commander")
                 }
             },
+            |_| true,
+            std::time::Instant::now,
             |d| slept.push(d),
         );
         assert_eq!(opened, Ok("commander"));
@@ -2334,6 +2400,7 @@ mod tests {
     #[test]
     fn a_permanently_unavailable_modem_serial_still_gives_up() {
         let mut attempts = 0;
+        let clock = FakeClock::default();
         let mut slept = Vec::new();
         let opened: Result<&str, &str> = open_modem_waiting(
             "/dev/ttyUSB9",
@@ -2343,7 +2410,12 @@ mod tests {
                 attempts += 1;
                 Err("No such file or directory")
             },
-            |d| slept.push(d),
+            |_| true,
+            || clock.now(),
+            |d| {
+                clock.advance(d);
+                slept.push(d);
+            },
         );
         assert_eq!(opened, Err("No such file or directory"));
         assert_eq!(slept.len(), 3, "waits the full budget, then reports");
@@ -2357,10 +2429,86 @@ mod tests {
             std::time::Duration::from_secs(30),
             std::time::Duration::from_secs(2),
             || Ok::<_, String>("commander"),
+            |_| true,
+            std::time::Instant::now,
             |d| slept.push(d),
         );
         assert_eq!(opened, Ok("commander"));
         assert!(slept.is_empty(), "a free port must not delay registration");
+    }
+
+    /// A clock that moves only when a test moves it.
+    struct FakeClock {
+        start: std::time::Instant,
+        elapsed: std::cell::Cell<std::time::Duration>,
+    }
+
+    impl Default for FakeClock {
+        fn default() -> Self {
+            Self {
+                start: std::time::Instant::now(),
+                elapsed: std::cell::Cell::new(std::time::Duration::ZERO),
+            }
+        }
+    }
+
+    impl FakeClock {
+        fn now(&self) -> std::time::Instant {
+            self.start + self.elapsed.get()
+        }
+        fn advance(&self, by: std::time::Duration) {
+            self.elapsed.set(self.elapsed.get() + by);
+        }
+    }
+
+    /// #237: a modem that does not answer its sync is not another holder.
+    /// Retrying it would cost a full sync bound per attempt.
+    #[test]
+    fn open_modem_waiting_does_not_retry_an_out_of_step_port() {
+        let mut attempts = 0;
+        let mut slept = Vec::new();
+        let opened: Result<&str, BridgeError> = open_modem_waiting(
+            "/dev/ttyUSB0",
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(2),
+            || {
+                attempts += 1;
+                Err(BridgeError::PortOutOfStep("x".into()))
+            },
+            |e: &BridgeError| !e.is_port_out_of_step(),
+            std::time::Instant::now,
+            |d| slept.push(d),
+        );
+        assert!(opened.is_err_and(|e| e.is_port_out_of_step()));
+        assert_eq!(attempts, 1);
+        assert!(slept.is_empty());
+    }
+
+    /// Each attempt takes time of its own once the open syncs, so the wait
+    /// is measured on the clock, not as the sum of its sleeps.
+    #[test]
+    fn open_modem_waiting_measures_its_wait_on_the_clock() {
+        let clock = FakeClock::default();
+        let mut attempts = 0;
+        let max_wait = std::time::Duration::from_millis(200);
+        let opened: Result<&str, &str> = open_modem_waiting(
+            "/dev/ttyUSB0",
+            max_wait,
+            std::time::Duration::from_millis(10),
+            || {
+                attempts += 1;
+                clock.advance(std::time::Duration::from_millis(50));
+                Err("Unable to acquire exclusive lock on serial port")
+            },
+            |_| true,
+            || clock.now(),
+            |d| clock.advance(d),
+        );
+        assert!(opened.is_err());
+        // 50, 110, 170, 230 ms: the fourth attempt ends past the deadline.
+        // Summing only the sleeps would have made 21 attempts.
+        assert_eq!(attempts, 4);
+        assert!(clock.elapsed.get() < max_wait + std::time::Duration::from_millis(60));
     }
 
     // ---- Security-Verify wiring (specs/082) --------------------------------
