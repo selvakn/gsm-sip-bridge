@@ -44,7 +44,64 @@ use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use super::at_commander::{AtResponse, ReadWrite};
+use super::at_commander::AtResponse;
+
+/// The port a [`Session`] drives.
+///
+/// [`AtPort::set_read_timeout`] bounds the next read, so that a read loop
+/// waits no longer than what is left of its own deadline. Without it a
+/// loop checked its deadline, then blocked for the port's whole timeout:
+/// a sync whose first reply came just before its deadline held the port for
+/// up to twice its bound, after its caller had given up (#237 review).
+pub(crate) trait AtPort: Read + Write + Send {
+    /// Bound the next read to `timeout`.
+    fn set_read_timeout(&mut self, timeout: Duration) -> std::io::Result<()>;
+}
+
+/// A real modem port. `serialport` keeps one timeout for reads and writes,
+/// so [`Session`] puts its own back after each bounded read.
+impl AtPort for Box<dyn serialport::SerialPort> {
+    fn set_read_timeout(&mut self, timeout: Duration) -> std::io::Result<()> {
+        self.set_timeout(timeout).map_err(std::io::Error::from)
+    }
+}
+
+/// The real socket pairs the tests stand in for a port with.
+impl AtPort for std::os::unix::net::UnixStream {
+    fn set_read_timeout(&mut self, timeout: Duration) -> std::io::Result<()> {
+        std::os::unix::net::UnixStream::set_read_timeout(self, Some(timeout))
+    }
+}
+
+/// A stream whose read timeout cannot be changed: every read waits the
+/// stream's own. For the scripted mock streams, which answer at once.
+pub(crate) struct FixedTimeout<S>(pub(crate) S);
+
+impl<S: Read> Read for FixedTimeout<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl<S: Write> Write for FixedTimeout<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl<S: Read + Write + Send> AtPort for FixedTimeout<S> {
+    fn set_read_timeout(&mut self, _timeout: Duration) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The shortest read [`Session::fill_by`] asks for. A zero timeout means
+/// "no timeout" to a socket and "do not wait" to `serialport`.
+const MIN_BOUNDED_READ: Duration = Duration::from_millis(1);
 
 /// Default cap on lines accumulated for one response. A modem emitting
 /// unsolicited output that never terminates must fail, not grow without limit
@@ -148,7 +205,7 @@ pub(crate) enum Request {
 
 /// A port plus the buffer that survives across commands.
 pub(crate) struct Session {
-    port: Box<dyn ReadWrite + Send>,
+    port: Box<dyn AtPort>,
     /// Bytes read but not yet consumed as a complete line.
     rx: Vec<u8>,
     /// Set when a command gave up waiting, or on any read error. The abandoned
@@ -167,11 +224,7 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    pub(crate) fn new(
-        port: Box<dyn ReadWrite + Send>,
-        timeout: Duration,
-        label: impl Into<String>,
-    ) -> Self {
+    pub(crate) fn new(port: Box<dyn AtPort>, timeout: Duration, label: impl Into<String>) -> Self {
         Self {
             port,
             rx: Vec::new(),
@@ -249,6 +302,26 @@ impl Session {
                 Err(BridgeError::Discovery(format!("AT read error: {e}")))
             }
         }
+    }
+
+    /// [`Session::fill`], waiting no longer than `deadline`.
+    ///
+    /// The read is bounded by the time left when that is shorter than the
+    /// port's own timeout, and the port's timeout is put back afterwards
+    /// (`serialport` uses the same one for writes). A port that refuses the
+    /// bound waits its own timeout, as before.
+    fn fill_by(&mut self, deadline: Instant) -> BridgeResult<bool> {
+        let left = deadline
+            .saturating_duration_since(Instant::now())
+            .max(MIN_BOUNDED_READ);
+        if left >= self.timeout || self.port.set_read_timeout(left).is_err() {
+            return self.fill();
+        }
+        let filled = self.fill();
+        if let Err(e) = self.port.set_read_timeout(self.timeout) {
+            tracing::debug!(port = %self.label, error = %e, "could not restore the port timeout");
+        }
+        filled
     }
 
     /// The bounds an ordinary command runs under: this port's configured read
@@ -333,7 +406,7 @@ impl Session {
                 // `sim_recovery`'s greps already key off it.
                 return Err(BridgeError::Discovery("AT command timeout".into()));
             }
-            self.fill()?;
+            self.fill_by(deadline)?;
         }
     }
 
@@ -367,7 +440,7 @@ impl Session {
                     "AT read timeout with a partial line buffered".into(),
                 ));
             }
-            self.fill()?;
+            self.fill_by(deadline)?;
         }
     }
 
@@ -399,6 +472,12 @@ impl Session {
         let mut discarded = self.rx.len();
         self.rx.clear();
         for (query, prefix) in [(SYNC_FIRST, "+CMEE:"), (SYNC_SECOND, "+CSCS:")] {
+            // A query written after the deadline would be abandoned at once,
+            // and its reply left for the next reader: what the sync removes.
+            if Instant::now() >= deadline {
+                self.desynced = true;
+                return Err(BridgeError::Discovery("AT command timeout".into()));
+            }
             if let Err(e) = self.port.write_all(format!("{query}\r\n").as_bytes()) {
                 self.desynced = true;
                 return Err(BridgeError::Discovery(format!("AT write failed: {e}")));
@@ -467,7 +546,7 @@ impl Session {
                 self.desynced = true;
                 return Err(BridgeError::Discovery("AT command timeout".into()));
             }
-            self.fill()?;
+            self.fill_by(deadline)?;
         }
     }
 }
@@ -1075,6 +1154,165 @@ mod tests {
             matches!((cmee_tx, cscs_rx), (Some(tx), Some(rx)) if tx < rx),
             "AT+CSCS? must arrive after the +CMEE reply was written: {events:?}"
         );
+    }
+
+    // ---- #237 review: no read waits past its loop's deadline ----
+
+    #[test]
+    fn sync_does_not_wait_a_whole_read_past_its_deadline() {
+        // `+CMEE:` comes 300 ms into a 400 ms bound and `AT+CSCS?` gets no
+        // answer. The second read gets the 100 ms that are left, not the
+        // port's whole 400 ms, which held the port to ~700 ms, after
+        // `start_worker` had stopped waiting.
+        let bound = Duration::from_millis(400);
+        let (mut s, modem) = port(bound);
+        let _modem = spawn_modem(
+            modem,
+            vec![
+                (Duration::from_millis(300), "\r\n+CMEE: 1\r\n\r\nOK\r\n"),
+                (Duration::ZERO, ""),
+            ],
+        );
+        let started = Instant::now();
+        let err = s
+            .sync(bound, SyncContext::Open)
+            .expect_err("the second query was never answered");
+        let took = started.elapsed();
+        assert!(err.to_string().contains("AT command timeout"), "{err}");
+        assert!(took >= bound, "gave up early: {took:?}");
+        assert!(took < bound + Duration::from_millis(150), "{took:?}");
+    }
+
+    #[test]
+    fn sync_does_not_send_its_second_query_after_the_deadline() {
+        // A port that cannot bound its reads: the first reply lands after
+        // the deadline. Writing `AT+CSCS?` then would abandon it at once and
+        // leave its reply for the next reader.
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        ours.set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("read timeout");
+        let mut s = Session::new(
+            Box::new(FixedTimeout(ours)),
+            Duration::from_millis(500),
+            "test",
+        );
+        let script = test_modem::Script {
+            sync_delay: Duration::from_millis(250),
+            ..Default::default()
+        };
+        let events = test_modem::spawn(theirs, script);
+        let err = s
+            .sync(Duration::from_millis(100), SyncContext::Open)
+            .expect_err("the deadline passed during the first reply");
+        assert!(err.to_string().contains("AT command timeout"), "{err}");
+        assert!(s.desynced, "a failed sync leaves the channel desynced");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            test_modem::received(&events),
+            vec!["AT+CMEE?".to_string()],
+            "no query may be written after the deadline"
+        );
+    }
+
+    #[test]
+    fn a_command_budget_shorter_than_the_port_timeout_bounds_the_read() {
+        let (mut s, modem) = port(Duration::from_secs(1));
+        let _modem = spawn_modem(modem, vec![(Duration::ZERO, "")]);
+        let budget = ResponseBudget {
+            max_lines: MAX_RESPONSE_LINES,
+            timeout: Duration::from_millis(200),
+        };
+        let started = Instant::now();
+        let err = s
+            .send_command_within("AT+CIMI", budget)
+            .expect_err("a silent modem cannot answer");
+        let took = started.elapsed();
+        assert!(err.to_string().contains("AT command timeout"), "{err}");
+        assert!(took >= budget.timeout, "gave up early: {took:?}");
+        assert!(
+            took < budget.timeout + Duration::from_millis(250),
+            "{took:?}"
+        );
+        assert!(s.desynced);
+    }
+
+    #[test]
+    fn a_partial_line_does_not_stretch_a_raw_read_past_its_deadline() {
+        // Half a line 300 ms in, then nothing. The next read gets what is
+        // left of the 600 ms, not another 600 ms.
+        let timeout = Duration::from_millis(600);
+        let (mut s, mut modem) = port(timeout);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            modem.write_all(b"+CSQ: 2").expect("partial line");
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        let started = Instant::now();
+        let err = s
+            .read_line_raw()
+            .expect_err("a partial line at the deadline is abandoned");
+        let took = started.elapsed();
+        assert!(err.to_string().contains("partial line"), "{err}");
+        assert!(took >= timeout, "gave up early: {took:?}");
+        assert!(took < timeout + Duration::from_millis(150), "{took:?}");
+        drop(writer);
+    }
+
+    /// A socket that records every read timeout set on it.
+    struct RecordingPort {
+        inner: UnixStream,
+        set: std::sync::Arc<std::sync::Mutex<Vec<Duration>>>,
+    }
+
+    impl Read for RecordingPort {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl Write for RecordingPort {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl AtPort for RecordingPort {
+        fn set_read_timeout(&mut self, timeout: Duration) -> std::io::Result<()> {
+            self.set.lock().unwrap().push(timeout);
+            AtPort::set_read_timeout(&mut self.inner, timeout)
+        }
+    }
+
+    #[test]
+    fn a_bounded_read_puts_the_port_timeout_back() {
+        // `serialport` uses one timeout for reads and writes: left at the
+        // bound, the next command's write would get only a few milliseconds.
+        let timeout = Duration::from_millis(500);
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        ours.set_read_timeout(Some(timeout)).expect("read timeout");
+        let set = std::sync::Arc::default();
+        let port = RecordingPort {
+            inner: ours,
+            set: std::sync::Arc::clone(&set),
+        };
+        let mut s = Session::new(Box::new(port), timeout, "test");
+        let _modem = spawn_modem(theirs, vec![(Duration::ZERO, "")]);
+        let budget = ResponseBudget {
+            max_lines: MAX_RESPONSE_LINES,
+            timeout: Duration::from_millis(100),
+        };
+        s.send_command_within("AT+CIMI", budget)
+            .expect_err("a silent modem cannot answer");
+        let set = set.lock().unwrap().clone();
+        assert!(
+            set.first().is_some_and(|first| *first <= budget.timeout),
+            "the read was not bounded: {set:?}"
+        );
+        assert_eq!(set.last(), Some(&timeout), "{set:?}");
     }
 
     // ---- #237: the stale-bytes warning (FR-012) ----

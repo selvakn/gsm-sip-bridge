@@ -99,9 +99,6 @@ pub struct AtCommander {
     path: Option<std::path::PathBuf>,
 }
 
-pub trait ReadWrite: Read + Write {}
-impl<T: Read + Write> ReadWrite for T {}
-
 #[derive(Debug, Clone)]
 pub enum AtResponse {
     Ok(Vec<String>),
@@ -266,7 +263,7 @@ impl AtCommander {
     /// spawn and sync as [`AtCommander::open_with_timeout`]. The caller sets
     /// the stream's own read timeout.
     #[cfg(test)]
-    pub(crate) fn start_for_test<S: Read + Write + Send + 'static>(
+    pub(crate) fn start_for_test<S: crate::modules::at_worker::AtPort + 'static>(
         stream: S,
         timeout: Duration,
     ) -> BridgeResult<Self> {
@@ -337,7 +334,7 @@ impl AtCommander {
     pub fn from_stream<S: Read + Write + Send + 'static>(stream: S, timeout: Duration) -> Self {
         Self {
             transport: Transport::Direct(Box::new(crate::modules::at_worker::Session::new(
-                Box::new(stream),
+                Box::new(crate::modules::at_worker::FixedTimeout(stream)),
                 timeout,
                 "stream",
             ))),
