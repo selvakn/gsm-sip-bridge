@@ -27,6 +27,7 @@
 //! Container *health* checking lives in [`crate::commands::healthcheck`],
 //! which is what `HEALTHCHECK` invokes.
 
+pub mod agent_exit;
 pub mod card_outage;
 pub mod daemon_supervisor;
 pub mod engines;

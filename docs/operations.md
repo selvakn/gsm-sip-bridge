@@ -113,17 +113,32 @@ sqlite3 /var/lib/gsm-sip-bridge/store.db ".backup /backup/store-$(date +%Y%m%d).
 
 ### A line went unreachable and something restarted it
 
-Look for this line in the agent's log (`/tmp/ims-agent-<line>.out`, also in
-`docker logs`):
+The supervisor's log (`journalctl -u gsm-sip-bridge`, `docker logs`) shows the
+restart and the watchdog's report on the next line:
 
 ```
-watchdog: the dispatch loop has made no progress
+[supervise] line 0: vowifi-ims-agent exited (stalled on the modem); restarting in 5s
+[supervise] line 0: watchdog report (run kept in /tmp/ims-agent-0.stall.out): … ERROR gsm_sip_bridge::ims::agent::watchdog: watchdog: the dispatch loop has made no progress activity="sms-sweep" phase="sms-sweep" stalled_secs=95 budget_secs=90 last_at_command=AT+CMGR=3 last_at_command_age_secs=95
 ```
 
-It carries `activity`, `phase`, `stalled_secs`, `budget_secs` and — most
+The report carries `activity`, `phase`, `stalled_secs`, `budget_secs` and — most
 usefully — `last_at_command`, the modem command the line was waiting on when it
 stopped moving. The agent exits `70` and the supervisor restarts that line
 within ~5s; a restarted line has been observed re-registering in ~150s.
+
+The agent's own log (`/tmp/ims-agent-<line>.out`) is emptied each time the agent
+starts, so it holds only the current run. The supervisor keeps two copies of
+runs that have ended (#239):
+
+- `/tmp/ims-agent-<line>.prev.out`: the last run that ended, whatever ended it;
+- `/tmp/ims-agent-<line>.stall.out`: the last run the watchdog stopped. Quick
+  failed starts after a stall (a modem still booting, say) replace the
+  `.prev.out` copy but not this one.
+
+Each copy holds at most the last 4 MiB of the run's log, starting at a line
+boundary. When a run ends with an error, the supervisor also prints it as
+`[supervise] line <line>: the agent's last error: …`. The supervisor masks
+subscriber identifiers in the lines it prints, but not in the copies.
 
 This exists because of a 2026-08-16 incident in which a line was unreachable for
 2h45m while every health signal reported it healthy. A modem had stopped
