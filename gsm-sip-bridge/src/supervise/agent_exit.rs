@@ -97,8 +97,12 @@ fn kept_part(log: &str) -> std::borrow::Cow<'_, str> {
     if log.len() <= MAX_KEPT_BYTES {
         return log.into();
     }
+    // `from` is a byte offset and may fall inside a multi-byte character, so
+    // the string is never sliced there: the newline is found in the bytes. A
+    // `\n` byte is never part of a longer UTF-8 sequence, so the byte after it
+    // starts a character.
     let from = log.len() - MAX_KEPT_BYTES;
-    let start = match log[from..].find('\n') {
+    let start = match log.as_bytes()[from..].iter().position(|&b| b == b'\n') {
         Some(newline) => from + newline + 1,
         // One line longer than the cap: keep its end from a character start.
         None => (from..log.len())
@@ -341,6 +345,35 @@ mod tests {
         let kept = kept_part(&log);
         let body = kept.strip_prefix(CUT_NOTE).expect("a cut log says so");
         assert!(body.len() <= MAX_KEPT_BYTES);
+        assert!(log.ends_with(body));
+    }
+
+    /// A log just over the cap whose cut-off falls inside a character: `€` is
+    /// three bytes and the cap is not a multiple of three. (A log of two-byte
+    /// `й` never does, because the cap is even.)
+    fn a_log_cut_inside_a_character(tail: &str) -> String {
+        let log = "€".repeat(MAX_KEPT_BYTES / 3 + 4) + tail;
+        assert!(
+            !log.is_char_boundary(log.len() - MAX_KEPT_BYTES),
+            "the test must cut inside a character"
+        );
+        log
+    }
+
+    #[test]
+    fn a_cut_inside_a_character_keeps_the_next_whole_line() {
+        let log = a_log_cut_inside_a_character("\nthe last line\n");
+        let kept = kept_part(&log);
+        assert_eq!(kept, format!("{CUT_NOTE}the last line\n"));
+    }
+
+    #[test]
+    fn a_cut_inside_a_character_of_one_long_line_keeps_its_end() {
+        let log = a_log_cut_inside_a_character("");
+        let kept = kept_part(&log);
+        let body = kept.strip_prefix(CUT_NOTE).expect("a cut log says so");
+        assert!(body.len() <= MAX_KEPT_BYTES);
+        assert!(body.starts_with('€'));
         assert!(log.ends_with(body));
     }
 
