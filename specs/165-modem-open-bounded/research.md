@@ -78,7 +78,7 @@ The tests already recompute these from the constants; they get the open's bound 
 
 ### D1. Run the device open on a thread of its own, and wait for it with a bound
 
-`open_session` spawns a short-lived thread (`at-open-<port>`) that runs `serialport::new(..).timeout(timeout).open()` and sends the result back on a channel. The caller waits with `recv_timeout(open_bound)`. A result in time is handled exactly as today (FR-009). No result in time is FR-003's failure; the thread is left to finish on its own.
+`open_session` spawns a short-lived thread (`at-open-<port>`) that runs `serialport::new(..).timeout(timeout).open()` and hands the result back through a slot under a mutex (D4). The caller waits on the slot's condition variable for at most `open_bound`. A result in time is handled exactly as today (FR-009). No result in time is FR-003's failure; the thread is left to finish on its own.
 
 - **Rationale**: the same pattern the AT worker already uses for a read that may never return (specs/039): bound the caller, strand the thread. It needs no knowledge of which syscall blocks.
 - **Alternatives**:
@@ -106,12 +106,13 @@ On timeout: `BridgeError::PortOpenStalled(format!("{} did not open within {} ms"
 A process-wide `Mutex<Vec<OpenAttempt>>` lists the outstanding opens, each with its port path and id. An entry is added **only** when a caller's wait times out, and removed by that open's thread when it finishes. A new open checks the map first and fails at once if its port is there (FR-005).
 
 - **Rationale**: two threads of one process opening the same port at the same time is normal (the sweep and a refresh challenge; they use different locks). Today the loser fails with the port's exclusive lock and its loop waits it out. Marking every open in progress would turn that into a non-retryable failure and break the challenge path.
-- **The race**: the caller's timeout and the thread's completion can cross. Both sides take the map's mutex and use a per-open `finished` flag that the thread sets under it. The caller, on timeout, inserts the entry only if `finished` is still false; if the thread has finished, the caller takes the result with `try_recv` and handles it as a result in time. The thread, on finishing, sets `finished` and removes the entry only if it carries its own id. No stale entry can remain, and a later open's entry is never removed by an earlier thread.
+- **The race**: the caller's timeout and the thread's completion can cross. Both take one per-open mutex, `OpenSlot::handoff`: the caller's wait returns holding it, and the thread delivers under it. If the result is there, the caller takes it; if not, the caller marks the slot `Abandoned` and adds the entry before releasing it, so the thread, which can only look after that, finds the open abandoned, closes the port itself and then removes its own entry. No stale entry can remain, and a later open's entry is never removed by an earlier thread.
+- **Revised after review**: the first version used a channel and a `finished` flag under the map's mutex. A port the thread sent after the caller's wait had run out, but before the caller's decision, stayed in the channel and was dropped on the caller's thread when it returned, so a close that hangs on a silent device would have held the caller again, and the thread could remove the entry before that close was done. Test: `a_port_delivered_as_its_caller_gives_up_is_closed_by_the_open_thread`, which makes the open return at the deadline through a test hook (`open_session_deciding`).
 - **Opens already under way when the port hangs** passed the check before any entry existed, so each of them may time out and add its own entry. That is the only way a port gets a second entry. Their number is the number of concurrent opens of the port at that moment, and it does not grow afterwards, which is the leak FR-005 is about. Making the check and the spawn exclusive per port would serialize every healthy open behind a lock for no gain.
 
 ### D5. A late result is closed before the entry is removed
 
-The thread sends its result; if the caller is gone, `send` hands the result back, and the thread drops it (closing the port and its `flock`) before it takes the map's mutex and removes the entry (FR-004, FR-006). A result sent just before the caller gave up sits in the channel and is dropped with the receiver; the caller, under the mutex, sees `finished` and takes it instead (D4), so that case never leaves a port open.
+The thread delivers under `handoff`. If the caller has abandoned the open, the thread releases `handoff`, drops the result on its own thread (closing the port and its `flock`), and only then removes its entry (FR-004, FR-006). A port is never closed on the caller's thread (D4).
 
 ### D6. `try_reopen` stops on `PortOutOfStep`
 

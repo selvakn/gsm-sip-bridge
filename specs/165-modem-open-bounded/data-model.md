@@ -17,8 +17,9 @@ Shared between the caller and the open's thread:
 | Field | Written by | Read by | Meaning |
 |---|---|---|---|
 | `id: u64` | caller, at start | both | identifies this attempt in the map |
-| `finished: bool` (under the map's mutex) | the thread, when the open returns | the caller, on timeout | whether the result has been sent |
-| result channel (`mpsc`, one value) | the thread | the caller | the opened port, or the open's error |
+| `OpenSlot::handoff: Mutex<Handoff>` | both, only under its mutex | both | `Waiting`, `Delivered(result)`, `Abandoned`, `Gone` (the opener panicked) or `Taken` |
+
+The caller's timeout decision and the thread's delivery are made under the same `handoff` mutex (revised after review: a channel plus a `finished` flag let a port delivered between the caller's timeout and its decision be dropped on the caller's thread).
 
 ## States and transitions
 
@@ -30,17 +31,21 @@ Shared between the caller and the open's thread:
         result in time ◄────────┤
         (Ok → Session → start_worker/sync as today; Err → "failed to open serial …" as today)   (FR-009)
                                 │
-                     timeout ───┤ caller takes the map's mutex
-                                ├─ finished already → try_recv → handled as "result in time"
-                                └─ not finished     → insert path → id; FAIL "<port> did not open within N ms"   (FR-003)
+                     timeout ───┤ the wait returns holding `handoff`
+                                ├─ Delivered → handled as "result in time"
+                                ├─ Gone      → FAIL "the open of <port> ended without a result"
+                                └─ Waiting   → handoff = Abandoned; insert path → id (both under `handoff`);
+                                               FAIL "<port> did not open within N ms"   (FR-003)
 
-thread, when the open returns:
-    send(result); if the caller is gone, drop the result (closes the port, releases flock)   (FR-004)
-    take the map's mutex; finished = true; if map[path] == id, remove it                      (FR-006)
+thread, when the open returns (or its opener panics):
+    take `handoff`
+    ├─ Waiting   → handoff = Delivered(result) (Gone on a panic); wake the caller
+    └─ Abandoned → release `handoff`; drop the result on this thread (closes the port,
+                   releases flock)   (FR-004); then remove its own map entry   (FR-006)
 ```
 
 Invariants:
 
-- An entry exists only while its thread has not finished (D4's race is closed by `finished` and the mutex).
-- A port reaches a caller only through a result received in time; any other result is dropped by the thread or with the channel.
+- An entry exists only while its thread has not finished: the caller adds it under `handoff` before the thread can see `Abandoned`, and the thread removes it only after closing what it got.
+- A port reaches a caller only while that caller is still waiting; any other port is closed on the open's thread, never on the caller's.
 - A thread removes only its own entry, so a later attempt's entry is never cleared by an earlier thread.

@@ -84,9 +84,9 @@ Real `grep` output from `a2ef631`, paths relative to `gsm-sip-bridge/src`. Every
 | Object | Created by | Owned / held by | Released on success | On timeout (caller gave up) | On shutdown |
 |---|---|---|---|---|---|
 | `at-open-<port>` thread | `open_session_with` | itself (detached) | exits after sending | keeps running until the device open returns, then closes what it got and exits | dies with the process |
-| Result channel | `open_session_with` | caller holds `Receiver`, thread holds `Sender` | caller receives the port | caller drops `Receiver` on return; a late `send` fails and the thread drops the port. A value sent just before the timeout is taken by the caller under the mutex (D4) | n/a |
+| Handoff slot (`OpenSlot`) | `open_session_with` | caller and thread, each an `Arc` | caller takes `Delivered` under the slot's mutex | caller marks `Abandoned` and adds the map entry under the same mutex; the thread then closes what the open returns on its own thread, and only then removes the entry (D4, D5) | n/a |
 | The opened port (fd, `TIOCEXCL`, `flock`) | the thread | caller's `Session` → worker, as today | as today (worker drops it) | dropped by the thread **before** it removes its map entry (D5) | process exit |
-| Map entry | caller, on timeout, under the mutex, only if the open has not finished | the map | n/a | removed by the open's thread, matching its id | process exit |
+| Map entry | caller, on timeout, under the handoff mutex, only if the open is still waiting | the map | n/a | removed by the open's thread, matching its id, after it closed what it got | process exit |
 | `ModemLock` guard held across the open by the SMS sweep and the renewal | existing callers | caller's stack frame | as today | the caller now returns within the bound and drops it. Before, a hung open held it indefinitely | as today |
 
 ### Where else does this logic run?

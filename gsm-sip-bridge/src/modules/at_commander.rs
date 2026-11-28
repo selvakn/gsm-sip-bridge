@@ -107,16 +107,12 @@ fn reopen_retrying<T>(
     None
 }
 
-/// One open of a port, as both its caller and its thread know it.
-#[derive(Clone)]
+/// An open of a port whose caller gave up on it (#239).
 struct OpenAttempt {
     path: std::path::PathBuf,
     /// Tells this attempt's record apart from a later attempt's on the same
     /// port, so a finishing thread removes only its own.
     id: u64,
-    /// Set by the thread, under [`OUTSTANDING_OPENS`], once its result is in
-    /// the channel or has been dropped.
-    finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Opens whose caller gave up on them and that have not returned (#239).
@@ -131,17 +127,79 @@ fn outstanding_opens() -> std::sync::MutexGuard<'static, Vec<OpenAttempt>> {
     OUTSTANDING_OPENS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Marks an open finished when its thread ends, however it ends (a panicking
-/// opener included), and removes its record if its caller had left one.
-struct OpenFinished(OpenAttempt);
+type OpenResult = Result<Box<dyn crate::modules::at_worker::AtPort>, String>;
 
-impl Drop for OpenFinished {
+/// Who has an open's result. The caller's timeout decision and the thread's
+/// delivery both happen under [`OpenSlot::handoff`], so a port either reaches a
+/// caller that is still waiting, or stays with the open's thread, which closes
+/// it there. It is never dropped on the caller's thread, where a close that
+/// hangs on a silent device would hold the caller again (#239 review).
+enum Handoff {
+    /// The open has not returned, and its caller is still waiting.
+    Waiting,
+    /// The open returned in time; the caller takes it.
+    Delivered(OpenResult),
+    /// The caller gave up. Whatever the open returns is the thread's to close.
+    Abandoned,
+    /// The thread ended without a result: its opener panicked.
+    Gone,
+    /// The caller has taken what was delivered.
+    Taken,
+}
+
+struct OpenSlot {
+    handoff: Mutex<Handoff>,
+    changed: std::sync::Condvar,
+}
+
+impl OpenSlot {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Handoff> {
+        self.handoff.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The open thread's side of the handoff. Dropped without delivering (a
+/// panicking opener), it still settles the slot and the record.
+struct OpenDelivery {
+    slot: std::sync::Arc<OpenSlot>,
+    id: u64,
+    delivered: bool,
+}
+
+impl OpenDelivery {
+    fn deliver(mut self, result: OpenResult) {
+        self.delivered = true;
+        let mut handoff = self.slot.lock();
+        if matches!(*handoff, Handoff::Waiting) {
+            *handoff = Handoff::Delivered(result);
+            self.slot.changed.notify_one();
+            return;
+        }
+        // The caller gave up: close the port here, and only then let the next
+        // open of it through.
+        drop(handoff);
+        drop(result);
+        self.forget();
+    }
+
+    fn forget(&self) {
+        outstanding_opens().retain(|o| o.id != self.id);
+    }
+}
+
+impl Drop for OpenDelivery {
     fn drop(&mut self) {
-        let mut opens = outstanding_opens();
-        self.0
-            .finished
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        opens.retain(|o| o.id != self.0.id);
+        if self.delivered {
+            return;
+        }
+        let mut handoff = self.slot.lock();
+        if matches!(*handoff, Handoff::Waiting) {
+            *handoff = Handoff::Gone;
+            self.slot.changed.notify_one();
+            return;
+        }
+        drop(handoff);
+        self.forget();
     }
 }
 
@@ -454,9 +512,20 @@ impl AtCommander {
     fn open_session_with(
         path: &Path,
         timeout: Duration,
-        opener: impl FnOnce() -> Result<Box<dyn crate::modules::at_worker::AtPort>, String>
-            + Send
-            + 'static,
+        opener: impl FnOnce() -> OpenResult + Send + 'static,
+    ) -> BridgeResult<crate::modules::at_worker::Session> {
+        Self::open_session_deciding(path, timeout, opener, || {})
+    }
+
+    /// [`Self::open_session_with`], with `at_deadline` run when the wait has
+    /// run out and the open has not returned, while the caller holds the
+    /// handoff and before it gives up. Production passes nothing; a test uses it
+    /// to make the open return at that moment.
+    fn open_session_deciding(
+        path: &Path,
+        timeout: Duration,
+        opener: impl FnOnce() -> OpenResult + Send + 'static,
+        at_deadline: impl FnOnce(),
     ) -> BridgeResult<crate::modules::at_worker::Session> {
         let label = path.display().to_string();
         if outstanding_opens().iter().any(|o| o.path == path) {
@@ -464,13 +533,16 @@ impl AtCommander {
                 "an earlier open of {label} has not returned"
             )));
         }
-        let attempt = OpenAttempt {
-            path: path.to_path_buf(),
-            id: NEXT_OPEN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            finished: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        let id = NEXT_OPEN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let slot = std::sync::Arc::new(OpenSlot {
+            handoff: Mutex::new(Handoff::Waiting),
+            changed: std::sync::Condvar::new(),
+        });
+        let delivery = OpenDelivery {
+            slot: slot.clone(),
+            id,
+            delivered: false,
         };
-        let (tx, rx) = std::sync::mpsc::channel();
-        let on_finish = OpenFinished(attempt.clone());
         std::thread::Builder::new()
             .name(format!(
                 "at-open-{}",
@@ -478,47 +550,42 @@ impl AtCommander {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "unknown".into())
             ))
-            .spawn(move || {
-                let result = opener();
-                // A caller that has left hands the port back here; dropping
-                // it closes the device before `on_finish` lets the next open
-                // of this port through.
-                if let Err(std::sync::mpsc::SendError(late)) = tx.send(result) {
-                    drop(late);
-                }
-                drop(on_finish);
-            })
+            .spawn(move || delivery.deliver(opener()))
             .map_err(|e| {
                 BridgeError::Discovery(format!("could not start the open of {label}: {e}"))
             })?;
 
         let bound = open_bound(timeout);
-        let result = match rx.recv_timeout(bound) {
-            Ok(result) => result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let mut opens = outstanding_opens();
-                // Decided under the same lock the thread takes when it
-                // finishes, so the two cannot cross: either it has finished
-                // and its result is in the channel, or it is recorded and will
-                // remove the record itself.
-                if !attempt.finished.load(std::sync::atomic::Ordering::SeqCst) {
-                    opens.push(attempt);
-                    return Err(BridgeError::PortOpenStalled(format!(
-                        "{label} did not open within {} ms",
-                        bound.as_millis()
-                    )));
-                }
-                drop(opens);
-                rx.try_recv().map_err(|_| {
-                    BridgeError::Discovery(format!("the open of {label} ended without a result"))
-                })?
+        let (mut handoff, _) = slot
+            .changed
+            .wait_timeout_while(slot.lock(), bound, |h| matches!(h, Handoff::Waiting))
+            .unwrap_or_else(|e| e.into_inner());
+        if matches!(*handoff, Handoff::Waiting) {
+            at_deadline();
+        }
+        let result = match std::mem::replace(&mut *handoff, Handoff::Taken) {
+            Handoff::Delivered(result) => result,
+            Handoff::Waiting => {
+                // Still under the handoff: the thread cannot deliver in
+                // between, will find the open abandoned and close the port
+                // itself, and the record is in place before it can look.
+                *handoff = Handoff::Abandoned;
+                outstanding_opens().push(OpenAttempt {
+                    path: path.to_path_buf(),
+                    id,
+                });
+                return Err(BridgeError::PortOpenStalled(format!(
+                    "{label} did not open within {} ms",
+                    bound.as_millis()
+                )));
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Handoff::Gone | Handoff::Abandoned | Handoff::Taken => {
                 return Err(BridgeError::Discovery(format!(
                     "the open of {label} ended without a result"
                 )))
             }
         };
+        drop(handoff);
         let port = result
             .map_err(|e| BridgeError::Discovery(format!("failed to open serial {label}: {e}")))?;
         Ok(crate::modules::at_worker::Session::new(
@@ -1786,6 +1853,79 @@ mod tests {
         assert!(is_outstanding(&path));
         release.send(()).expect("release the open");
         read_until_eof(&mut theirs, Duration::from_secs(3));
+        wait_until("the late open's record is gone", || !is_outstanding(&path));
+    }
+
+    /// A port that reports, when it is dropped, which thread closed it and
+    /// whether its open was still recorded as outstanding at that moment.
+    struct WatchedPort {
+        inner: UnixStream,
+        path: std::path::PathBuf,
+        closed: std::sync::mpsc::Sender<(Option<String>, bool)>,
+    }
+
+    impl Read for WatchedPort {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl Write for WatchedPort {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl AtPort for WatchedPort {
+        fn set_read_timeout(&mut self, timeout: Duration) -> std::io::Result<()> {
+            UnixStream::set_read_timeout(&self.inner, Some(timeout))
+        }
+    }
+
+    impl Drop for WatchedPort {
+        fn drop(&mut self) {
+            let _ = self.closed.send((
+                std::thread::current().name().map(str::to_owned),
+                is_outstanding(&self.path),
+            ));
+        }
+    }
+
+    #[test]
+    fn a_port_delivered_as_its_caller_gives_up_is_closed_by_the_open_thread() {
+        // The order from review: the open returns its port after the caller's
+        // wait has run out but before the caller has decided. The port must not
+        // be closed on the caller's thread, where a close that hangs on a
+        // silent device would hold the caller again, and the record must stay
+        // until that close is done.
+        let path = test_port("delivers-at-deadline");
+        let (ours, _theirs) = socket_pair(Duration::from_millis(500));
+        let (closed_tx, closed) = std::sync::mpsc::channel();
+        let port = WatchedPort {
+            inner: ours,
+            path: path.clone(),
+            closed: closed_tx,
+        };
+        let (release, opener) = held_open(Ok(Box::new(port)));
+        let result = AtCommander::open_session_deciding(
+            &path,
+            Duration::from_millis(100),
+            opener,
+            move || {
+                release.send(()).expect("release the open");
+                // Let the open return and reach the handoff this caller holds.
+                std::thread::sleep(Duration::from_millis(200));
+            },
+        );
+        assert!(result.is_err_and(|e| e.is_port_open_stalled()));
+        let (thread, recorded) = closed
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the late port is closed");
+        assert_eq!(thread.as_deref(), Some("at-open-delivers-at-deadline"));
+        assert!(recorded, "the record must outlive the close");
         wait_until("the late open's record is gone", || !is_outstanding(&path));
     }
 
