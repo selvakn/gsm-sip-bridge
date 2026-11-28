@@ -55,6 +55,96 @@ const RADIO_CYCLE_DELAY: Duration = Duration::from_secs(4);
 /// returning.
 const WORKER_GRACE: Duration = Duration::from_secs(2);
 
+/// How long a caller waits for the device open of a port with this timeout
+/// (#239): the same `timeout + WORKER_GRACE` the open's sync waits, so a failed
+/// open costs no more than a failed sync. It covers the kernel's 5 s timeout
+/// on the USB control transfer that raises DTR on open, so a device that is
+/// slow but answering still opens.
+fn open_bound(timeout: Duration) -> Duration {
+    timeout + WORKER_GRACE
+}
+
+/// [`open_bound`] at [`DEFAULT_TIMEOUT`], for the budget derivations that count
+/// a port open (`volte::sms`, `ims::agent::watchdog`).
+#[cfg(test)]
+pub(crate) const DEFAULT_OPEN_BOUND: Duration =
+    Duration::from_secs(DEFAULT_TIMEOUT.as_secs() + WORKER_GRACE.as_secs());
+
+/// `try_reopen`'s open loop. The old worker has to be scheduled, notice the
+/// closed channel, and drop its port before we can open it, so a busy port is
+/// tried again for a bounded window rather than once. A port that did not open
+/// or sync in time ([`BridgeError::is_port_out_of_step`]) is not: the modem is not
+/// answering, and a retry would cost another full bound (#239).
+fn reopen_retrying<T>(
+    path: &Path,
+    mut open: impl FnMut() -> BridgeResult<T>,
+    mut sleep: impl FnMut(Duration),
+) -> Option<T> {
+    const REOPEN_ATTEMPTS: usize = 20;
+    const REOPEN_RETRY_DELAY: Duration = Duration::from_millis(100);
+    for attempt in 0..REOPEN_ATTEMPTS {
+        match open() {
+            Ok(session) => return Some(session),
+            Err(e) if e.is_port_out_of_step() => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "could not reopen the modem port; it is not answering"
+                );
+                return None;
+            }
+            // Expected while the abandoned worker still holds the flock.
+            Err(_) if attempt + 1 < REOPEN_ATTEMPTS => sleep(REOPEN_RETRY_DELAY),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "could not reopen the modem port; the previous worker is still holding it"
+                );
+            }
+        }
+    }
+    None
+}
+
+/// One open of a port, as both its caller and its thread know it.
+#[derive(Clone)]
+struct OpenAttempt {
+    path: std::path::PathBuf,
+    /// Tells this attempt's record apart from a later attempt's on the same
+    /// port, so a finishing thread removes only its own.
+    id: u64,
+    /// Set by the thread, under [`OUTSTANDING_OPENS`], once its result is in
+    /// the channel or has been dropped.
+    finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Opens whose caller gave up on them and that have not returned (#239).
+/// While a port is here, opening it again fails at once, so no new open of it
+/// starts. A port has more than one entry only when several opens of it were
+/// already under way when it hung; that number does not grow.
+static OUTSTANDING_OPENS: Mutex<Vec<OpenAttempt>> = Mutex::new(Vec::new());
+
+static NEXT_OPEN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn outstanding_opens() -> std::sync::MutexGuard<'static, Vec<OpenAttempt>> {
+    OUTSTANDING_OPENS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Marks an open finished when its thread ends, however it ends (a panicking
+/// opener included), and removes its record if its caller had left one.
+struct OpenFinished(OpenAttempt);
+
+impl Drop for OpenFinished {
+    fn drop(&mut self) {
+        let mut opens = outstanding_opens();
+        self.0
+            .finished
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        opens.retain(|o| o.id != self.0.id);
+    }
+}
+
 /// How the commands issued through this handle actually reach a modem.
 enum Transport {
     /// A real serial port, owned by a worker thread
@@ -245,6 +335,16 @@ impl AtCommander {
     /// [`BridgeError::PortOutOfStep`], whose text still reads
     /// `AT command timeout`, and the worker exits after its bounded sync,
     /// releasing the port.
+    ///
+    /// # The device open is bounded too (#239)
+    ///
+    /// The open itself runs on a thread of its own and is waited for at most
+    /// `timeout + WORKER_GRACE`, so a modem that is attached but not answering
+    /// cannot hold the caller: it fails with [`BridgeError::PortOpenStalled`]
+    /// (`<port> did not open within N ms`), and while that open has not
+    /// returned, every further open of the port in this process fails the same
+    /// way at once (`an earlier open of <port> has not returned`). See
+    /// `open_session_with`.
     pub fn open_with_timeout(path: &Path, timeout: Duration) -> BridgeResult<Self> {
         let session = Self::open_session(path, timeout)?;
         let thread_name = format!(
@@ -318,16 +418,111 @@ impl AtCommander {
         path: &Path,
         timeout: Duration,
     ) -> BridgeResult<crate::modules::at_worker::Session> {
-        let port = serialport::new(path.to_string_lossy(), BAUD_RATE)
-            .timeout(timeout)
-            .open()
+        let device = path.to_string_lossy().into_owned();
+        Self::open_session_with(path, timeout, move || {
+            serialport::new(device, BAUD_RATE)
+                .timeout(timeout)
+                .open()
+                .map(|port| Box::new(port) as Box<dyn crate::modules::at_worker::AtPort>)
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Opens `path` through `opener` on a thread of its own, and waits for it
+    /// at most [`open_bound`]`(timeout)` (#239).
+    ///
+    /// The device open is the one step of a session that used to run on the
+    /// caller's thread with no bound. On a modem that is still attached but no
+    /// longer answering (a stalled USB/IP link, a wedged hub), `open(2)` does
+    /// not return. Raising DTR on open is a USB control transfer; it times out
+    /// and the kernel cannot cancel it on the silent link (`usb_wwan_dtr_rts`
+    /// → `usb_control_msg` → `usb_kill_urb`). An open behind a close stuck the
+    /// same way waits for the tty's lock instead (`tty_lock_interruptible`).
+    /// Both kernel stacks were taken live on 2026-11-28. The caller waited with
+    /// it: the SMS sweep sat in it until the watchdog stopped the agent and the
+    /// line registered in full. Now the caller gets the port in time, or
+    /// [`BridgeError::PortOpenStalled`], which every open-retry loop already
+    /// declines to retry.
+    ///
+    /// The thread is stranded as a wedged AT worker is. If its open completes
+    /// after the caller left, it closes the port itself, releasing its `flock`.
+    /// Until it returns, the port is recorded as having an outstanding open,
+    /// and every further open of it in this process fails at once instead of
+    /// stranding another thread. Only an open its caller gave up on is
+    /// recorded: two opens of one port that each finish in time contend as
+    /// they always have, through the port's exclusive lock.
+    fn open_session_with(
+        path: &Path,
+        timeout: Duration,
+        opener: impl FnOnce() -> Result<Box<dyn crate::modules::at_worker::AtPort>, String>
+            + Send
+            + 'static,
+    ) -> BridgeResult<crate::modules::at_worker::Session> {
+        let label = path.display().to_string();
+        if outstanding_opens().iter().any(|o| o.path == path) {
+            return Err(BridgeError::PortOpenStalled(format!(
+                "an earlier open of {label} has not returned"
+            )));
+        }
+        let attempt = OpenAttempt {
+            path: path.to_path_buf(),
+            id: NEXT_OPEN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            finished: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let on_finish = OpenFinished(attempt.clone());
+        std::thread::Builder::new()
+            .name(format!(
+                "at-open-{}",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "unknown".into())
+            ))
+            .spawn(move || {
+                let result = opener();
+                // A caller that has left hands the port back here; dropping
+                // it closes the device before `on_finish` lets the next open
+                // of this port through.
+                if let Err(std::sync::mpsc::SendError(late)) = tx.send(result) {
+                    drop(late);
+                }
+                drop(on_finish);
+            })
             .map_err(|e| {
-                BridgeError::Discovery(format!("failed to open serial {}: {e}", path.display()))
+                BridgeError::Discovery(format!("could not start the open of {label}: {e}"))
             })?;
+
+        let bound = open_bound(timeout);
+        let result = match rx.recv_timeout(bound) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let mut opens = outstanding_opens();
+                // Decided under the same lock the thread takes when it
+                // finishes, so the two cannot cross: either it has finished
+                // and its result is in the channel, or it is recorded and will
+                // remove the record itself.
+                if !attempt.finished.load(std::sync::atomic::Ordering::SeqCst) {
+                    opens.push(attempt);
+                    return Err(BridgeError::PortOpenStalled(format!(
+                        "{label} did not open within {} ms",
+                        bound.as_millis()
+                    )));
+                }
+                drop(opens);
+                rx.try_recv().map_err(|_| {
+                    BridgeError::Discovery(format!("the open of {label} ended without a result"))
+                })?
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(BridgeError::Discovery(format!(
+                    "the open of {label} ended without a result"
+                )))
+            }
+        };
+        let port = result
+            .map_err(|e| BridgeError::Discovery(format!("failed to open serial {label}: {e}")))?;
         Ok(crate::modules::at_worker::Session::new(
-            Box::new(port),
-            timeout,
-            path.display().to_string(),
+            port, timeout, label,
         ))
     }
 
@@ -592,32 +787,11 @@ impl AtCommander {
         // Release our end of the channel and let the old worker unwind.
         drop(tx.take());
 
-        // The old worker has to be scheduled, notice the closed channel, and
-        // drop its port before we can open it. Give it a bounded window rather
-        // than one immediate attempt that would almost always lose that race.
-        const REOPEN_ATTEMPTS: usize = 20;
-        const REOPEN_RETRY_DELAY: Duration = Duration::from_millis(100);
-        let mut session = None;
-        for attempt in 0..REOPEN_ATTEMPTS {
-            match Self::open_session(&path, timeout) {
-                Ok(s) => {
-                    session = Some(s);
-                    break;
-                }
-                // Expected while the abandoned worker still holds the flock.
-                Err(_) if attempt + 1 < REOPEN_ATTEMPTS => {
-                    std::thread::sleep(REOPEN_RETRY_DELAY);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "could not reopen the modem port; the previous worker is still holding it"
-                    );
-                }
-            }
-        }
-        let Some(session) = session else {
+        let Some(session) = reopen_retrying(
+            &path,
+            || Self::open_session(&path, timeout),
+            std::thread::sleep,
+        ) else {
             return false;
         };
         // The reopened port syncs like a fresh open: the abandoned worker's
@@ -1467,5 +1641,334 @@ mod tests {
                 "the worker still holds the port after its sync failed"
             );
         }
+    }
+
+    // ---- #239: the device open is bounded ----
+
+    use crate::modules::at_worker::AtPort;
+
+    type Opened = Result<Box<dyn AtPort>, String>;
+
+    /// A port path of this test's own: the record of outstanding opens is
+    /// process-wide, and tests run in parallel.
+    fn test_port(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("/nonexistent/at-open-test/{name}"))
+    }
+
+    fn is_outstanding(path: &Path) -> bool {
+        outstanding_opens().iter().any(|o| o.path == path)
+    }
+
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting until {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// An opener that blocks until the returned sender sends or is dropped,
+    /// then returns `result`. It stands in for a USB serial device whose
+    /// `open(2)` never returns (a DTR control transfer the kernel cannot
+    /// cancel), which CI cannot produce; the thread, the channel, the bound and
+    /// the record are real.
+    fn held_open(
+        result: Opened,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        impl FnOnce() -> Opened + Send + 'static,
+    ) {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        (release, move || {
+            let _ = held.recv();
+            result
+        })
+    }
+
+    fn read_until_eof(sock: &mut UnixStream, within: Duration) {
+        UnixStream::set_read_timeout(sock, Some(Duration::from_millis(50))).expect("read timeout");
+        let deadline = Instant::now() + within;
+        let mut buf = [0u8; 64];
+        loop {
+            match sock.read(&mut buf) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => panic!("unexpected read error: {e}"),
+            }
+            assert!(Instant::now() < deadline, "the port was never closed");
+        }
+    }
+
+    #[test]
+    fn the_default_open_bound_is_the_bound_at_the_default_timeout() {
+        assert_eq!(DEFAULT_OPEN_BOUND, open_bound(DEFAULT_TIMEOUT));
+    }
+
+    #[test]
+    fn an_open_that_never_returns_fails_within_its_bound() {
+        let path = test_port("never-returns");
+        let timeout = Duration::from_millis(100);
+        let (_held, opener) = held_open(Err("never reached".into()));
+        let started = Instant::now();
+        let Err(e) = AtCommander::open_session_with(&path, timeout, opener) else {
+            panic!("an open that never returns must not succeed");
+        };
+        let took = started.elapsed();
+        assert!(e.is_port_out_of_step(), "{e}");
+        assert!(e.is_port_open_stalled(), "{e}");
+        let text = e.to_string();
+        assert!(text.contains("AT command timeout"), "{text}");
+        assert!(
+            text.contains(&format!("{} did not open within 2100 ms", path.display())),
+            "{text}"
+        );
+        assert!(
+            took >= open_bound(timeout) && took < open_bound(timeout) + Duration::from_millis(500),
+            "{took:?}"
+        );
+        assert!(is_outstanding(&path));
+    }
+
+    #[test]
+    fn an_open_in_time_is_handed_over_as_today() {
+        let path = test_port("in-time");
+        let timeout = Duration::from_secs(2);
+        let (ours, theirs) = socket_pair(Duration::from_millis(500));
+        let _events = test_modem::spawn(
+            theirs,
+            test_modem::Script::default().reply(
+                "AT+CSQ",
+                Duration::ZERO,
+                "\r\n+CSQ: 21,99\r\n\r\nOK\r\n",
+            ),
+        );
+        let session = AtCommander::open_session_with(&path, timeout, move || {
+            Ok(Box::new(ours) as Box<dyn AtPort>)
+        })
+        .unwrap_or_else(|e| panic!("open: {e}"));
+        let mut at = AtCommander {
+            transport: AtCommander::start_worker(session, timeout, "at-port-test".into())
+                .unwrap_or_else(|e| panic!("sync: {e}")),
+            path: None,
+        };
+        assert_eq!(at.check_signal().expect("the first command"), (21, 99));
+        assert!(!is_outstanding(&path));
+    }
+
+    #[test]
+    fn an_open_error_keeps_its_text() {
+        let path = test_port("missing");
+        let Err(e) = AtCommander::open_session_with(&path, Duration::from_millis(100), || {
+            Err("No such file or directory".into())
+        }) else {
+            panic!("a failed open must fail");
+        };
+        assert!(!e.is_port_out_of_step(), "{e}");
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "discovery error: failed to open serial {}: No such file or directory",
+                path.display()
+            )
+        );
+        assert!(!is_outstanding(&path));
+    }
+
+    #[test]
+    fn a_port_that_opens_after_its_caller_left_is_closed() {
+        let path = test_port("opens-late");
+        let (ours, mut theirs) = socket_pair(Duration::from_millis(500));
+        let (release, opener) = held_open(Ok(Box::new(ours)));
+        assert!(AtCommander::open_session_with(&path, Duration::from_millis(100), opener).is_err());
+        assert!(is_outstanding(&path));
+        release.send(()).expect("release the open");
+        read_until_eof(&mut theirs, Duration::from_secs(3));
+        wait_until("the late open's record is gone", || !is_outstanding(&path));
+    }
+
+    #[test]
+    fn a_panicking_open_leaves_no_record_behind() {
+        let path = test_port("panics");
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        assert!(
+            AtCommander::open_session_with(&path, Duration::from_millis(100), move || {
+                let _ = held.recv();
+                panic!("the opener failed in an unexpected way");
+            })
+            .is_err()
+        );
+        assert!(is_outstanding(&path));
+        release.send(()).expect("release the open");
+        wait_until("the panicked open's record is gone", || {
+            !is_outstanding(&path)
+        });
+    }
+
+    #[test]
+    fn a_second_open_while_one_is_outstanding_fails_at_once() {
+        let path = test_port("second-open");
+        let (_held, opener) = held_open(Err("never reached".into()));
+        assert!(AtCommander::open_session_with(&path, Duration::from_millis(100), opener).is_err());
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = called.clone();
+        let started = Instant::now();
+        let Err(e) = AtCommander::open_session_with(&path, Duration::from_millis(100), move || {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err("opened".into())
+        }) else {
+            panic!("an open behind an outstanding one must fail");
+        };
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(e.is_port_out_of_step(), "{e}");
+        assert!(e.is_port_open_stalled(), "{e}");
+        assert!(
+            e.to_string().contains(&format!(
+                "an earlier open of {} has not returned",
+                path.display()
+            )),
+            "{e}"
+        );
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "no second open may be started"
+        );
+    }
+
+    #[test]
+    fn an_outstanding_open_does_not_block_another_port() {
+        let stuck = test_port("stuck-port");
+        let (_held, opener) = held_open(Err("never reached".into()));
+        assert!(
+            AtCommander::open_session_with(&stuck, Duration::from_millis(100), opener).is_err()
+        );
+        let (ours, _theirs) = socket_pair(Duration::from_millis(500));
+        assert!(AtCommander::open_session_with(
+            &test_port("other-port"),
+            Duration::from_millis(100),
+            move || Ok(Box::new(ours) as Box<dyn AtPort>),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn once_the_outstanding_open_returns_opens_work_again() {
+        let path = test_port("returns");
+        let (release, opener) = held_open(Err("Input/output error".into()));
+        assert!(AtCommander::open_session_with(&path, Duration::from_millis(100), opener).is_err());
+        release.send(()).expect("release the open");
+        wait_until("the outstanding open's record is gone", || {
+            !is_outstanding(&path)
+        });
+        let (ours, _theirs) = socket_pair(Duration::from_millis(500));
+        assert!(
+            AtCommander::open_session_with(&path, Duration::from_millis(100), move || {
+                Ok(Box::new(ours) as Box<dyn AtPort>)
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn opens_already_in_flight_when_a_port_hangs_are_the_only_ones_left_behind() {
+        // The SMS sweep and a refresh challenge may both be opening the port
+        // when it hangs: each gives up and leaves its own open behind, and
+        // after that no new open of the port starts.
+        let path = test_port("hangs-mid-open");
+        let (mut held, mut handles) = (Vec::new(), Vec::new());
+        for _ in 0..2 {
+            let (release, opener) = held_open(Err("never reached".into()));
+            held.push(release);
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                AtCommander::open_session_with(&path, Duration::from_millis(100), opener)
+                    .err()
+                    .expect("a hung open fails")
+            }));
+        }
+        for handle in handles {
+            assert!(handle.join().expect("opener thread").is_port_open_stalled());
+        }
+        let entries = || {
+            outstanding_opens()
+                .iter()
+                .filter(|o| o.path == path)
+                .count()
+        };
+        assert_eq!(entries(), 2);
+        assert!(
+            AtCommander::open_session_with(&path, Duration::from_millis(100), || {
+                Err("opened".into())
+            })
+            .is_err_and(|e| e.is_port_open_stalled())
+        );
+        assert_eq!(entries(), 2, "a refused open must not add an entry");
+        drop(held);
+        wait_until("both opens have returned", || entries() == 0);
+    }
+
+    #[test]
+    fn opens_that_finish_in_time_are_not_recorded() {
+        // Two opens of one port at once (the SMS sweep and a refresh challenge)
+        // contend through the port's exclusive lock, as before: neither is
+        // turned into an outstanding open.
+        let path = test_port("concurrent");
+        let open = |path: std::path::PathBuf| {
+            std::thread::spawn(move || {
+                AtCommander::open_session_with(&path, Duration::from_millis(500), || {
+                    std::thread::sleep(Duration::from_millis(50));
+                    Err("Unable to acquire exclusive lock on serial port".into())
+                })
+                .err()
+                .expect("the scripted open fails")
+            })
+        };
+        let (a, b) = (open(path.clone()), open(path.clone()));
+        for e in [a.join().expect("first"), b.join().expect("second")] {
+            assert!(!e.is_port_out_of_step(), "{e}");
+        }
+        assert!(!is_outstanding(&path));
+    }
+
+    #[test]
+    fn reopen_does_not_retry_a_port_that_is_not_answering() {
+        let (mut opens, mut sleeps) = (0, 0);
+        let reopened: Option<()> = reopen_retrying(
+            Path::new("/dev/ttyUSB0"),
+            || {
+                opens += 1;
+                Err(BridgeError::PortOutOfStep("did not open".into()))
+            },
+            |_| sleeps += 1,
+        );
+        assert!(reopened.is_none());
+        assert_eq!((opens, sleeps), (1, 0));
+    }
+
+    #[test]
+    fn reopen_still_waits_out_a_busy_port() {
+        let (mut opens, mut sleeps) = (0, 0);
+        let reopened = reopen_retrying(
+            Path::new("/dev/ttyUSB0"),
+            || {
+                opens += 1;
+                if opens < 3 {
+                    Err(BridgeError::Discovery(
+                        "Unable to acquire exclusive lock".into(),
+                    ))
+                } else {
+                    Ok(7)
+                }
+            },
+            |_| sleeps += 1,
+        );
+        assert_eq!(reopened, Some(7));
+        assert_eq!((opens, sleeps), (3, 2));
     }
 }

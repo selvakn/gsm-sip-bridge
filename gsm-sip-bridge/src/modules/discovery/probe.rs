@@ -143,21 +143,30 @@ fn select_at_capable_port(
 /// unit-tested.
 fn probe_one_candidate(device_path: &Path, timeout: Duration) -> ProbeOutcome {
     let probe_path = device_path.to_path_buf();
-    match run_bounded(timeout, move || {
-        match AtCommander::open_with_timeout(&probe_path, PROBE_TIMEOUT) {
-            Ok(mut at) => probe_is_at_capable(&mut at),
-            Err(e) => {
-                tracing::debug!(
-                    port = %probe_path.display(),
-                    error = %e,
-                    "could not open candidate serial port during AT probe"
-                );
-                false
-            }
+    probe_outcome(run_bounded(timeout, move || {
+        let opened = AtCommander::open_with_timeout(&probe_path, PROBE_TIMEOUT);
+        if let Err(e) = &opened {
+            tracing::debug!(
+                port = %probe_path.display(),
+                error = %e,
+                "could not open candidate serial port during AT probe"
+            );
         }
-    }) {
-        Some(true) => ProbeOutcome::AtCapable,
-        Some(false) => ProbeOutcome::NotAtCapable,
+        opened.map(|mut at| probe_is_at_capable(&mut at))
+    }))
+}
+
+/// What one bounded probe amounts to. `None` is a probe that `run_bounded`
+/// abandoned. An open that did not return within its own bound, now or in an
+/// earlier probe whose open is still outstanding (#239), is a timeout too: it
+/// is the same hung port that used to hold the whole probe until `run_bounded`
+/// gave up, and it must keep counting toward the port's quarantine
+/// (specs/030). Any other open failure is a port that responded.
+fn probe_outcome(probed: Option<crate::error::BridgeResult<bool>>) -> ProbeOutcome {
+    match probed {
+        Some(Ok(true)) => ProbeOutcome::AtCapable,
+        Some(Err(e)) if e.is_port_open_stalled() => ProbeOutcome::TimedOut,
+        Some(Ok(false) | Err(_)) => ProbeOutcome::NotAtCapable,
         None => ProbeOutcome::TimedOut,
     }
 }
@@ -423,5 +432,29 @@ mod tests {
     fn probe_is_at_capable_false_on_cme_error() {
         let mut at = make_commander("+CME ERROR: 100\r\n");
         assert!(!probe_is_at_capable(&mut at));
+    }
+
+    #[test]
+    fn a_stalled_open_counts_as_a_probe_timeout() {
+        // #239: the open now gives up before `run_bounded` does, so a hung
+        // port must still read as a timeout, or it would reset its own
+        // quarantine streak on every rescan.
+        use crate::error::BridgeError;
+        assert_eq!(
+            probe_outcome(Some(Err(BridgeError::PortOpenStalled("x".into())))),
+            ProbeOutcome::TimedOut
+        );
+        assert_eq!(probe_outcome(None), ProbeOutcome::TimedOut);
+        assert_eq!(
+            probe_outcome(Some(Err(BridgeError::PortOutOfStep("x".into())))),
+            ProbeOutcome::NotAtCapable,
+            "a port that opened but did not answer its sync responded"
+        );
+        assert_eq!(
+            probe_outcome(Some(Err(BridgeError::Discovery("no such file".into())))),
+            ProbeOutcome::NotAtCapable
+        );
+        assert_eq!(probe_outcome(Some(Ok(true))), ProbeOutcome::AtCapable);
+        assert_eq!(probe_outcome(Some(Ok(false))), ProbeOutcome::NotAtCapable);
     }
 }

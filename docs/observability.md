@@ -241,6 +241,22 @@ that is out of reach when the bridge starts is handled by the start-up MCC/MNC r
 
 Modem-backed lines are unchanged.
 
+## Modem port opens that do not return
+
+A modem that hangs while staying attached (a stalled USB/IP link, a wedged hub) no longer stops a modem line's
+IMS agent through its SMS sweep (#239). Every open of a modem AT port is bounded at the port's timeout plus 2 s
+(7 s by default). The agent's log (`/tmp/ims-agent-N.out`) then shows the sweep's existing warning with one of
+two errors:
+
+| Error in `modem SMS sweep failed …` | Meaning |
+|---|---|
+| `AT command timeout: <port> did not open within <N> ms` | This pass's open ran out of time; its thread is left to finish |
+| `AT command timeout: an earlier open of <port> has not returned` | That open is still outstanding, so no other open of the port was started |
+
+Any other program that opens the port (a refresh challenge, `vowifi-usim-bridge`, the start-up reads) reports
+the same two errors through its own failure messages. The watchdog's SMS sweep budget is 100 s. See
+[operations.md](operations.md#a-line-went-unreachable-and-something-restarted-it) for where such an open waits.
+
 ## Reg-event subscription logs
 
 The reg-event `SUBSCRIBE` is tracked as a transaction and a dialog (specs/090),

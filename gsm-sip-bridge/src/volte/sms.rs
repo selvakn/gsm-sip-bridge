@@ -936,14 +936,14 @@ fn open_with_retry_using(
 /// `MODEM_SWEEP_INTERVAL` away. Pinned against the watchdog budget by
 /// [`tests::a_sweep_pass_cannot_outrun_its_watchdog_budget`], and to two
 /// [`PER_MESSAGE_PORT_BUDGET`]s (the listing plus one message) by
-/// [`tests::the_per_step_budgets_cover_their_worst_legitimate_case`]: 72 s
-/// since the open's sync raised the per-message budget (#237).
-const SWEEP_PASS_BUDGET: Duration = Duration::from_secs(72);
+/// [`tests::the_per_step_budgets_cover_their_worst_legitimate_case`]: 80 s
+/// since the open itself got a bound (#239) on top of its sync (#237).
+const SWEEP_PASS_BUDGET: Duration = Duration::from_secs(80);
 
 /// Worst case for one message's port work (read, or delete): waiting for the
-/// modem, opening it (the retry sleeps plus one sync, #237), then one AT round
-/// trip: 20 + 1.8 + 5 + 5 = 31.8 s.
-const PER_MESSAGE_PORT_BUDGET: Duration = Duration::from_secs(35);
+/// modem, opening it (the retry sleeps, one bounded device open, #239, and one
+/// sync, #237), then one AT round trip: 20 + 1.8 + 7 + 5 + 5 = 38.8 s.
+const PER_MESSAGE_PORT_BUDGET: Duration = Duration::from_secs(40);
 
 /// Worst case for relaying one message: a cross-route settle followed by one
 /// relay attempt. No AT port involved.
@@ -1276,10 +1276,12 @@ mod tests {
     #[test]
     fn a_signal_poll_fits_the_watchdogs_sweep_budget() {
         // Lock wait, one open, then two AT round trips -- all on one hold.
-        // The retry sleeps, plus one sync: only one attempt can reach the
-        // sync, because an out-of-step port is not retried (#237).
-        let open_worst =
-            OPEN_RETRY_BASE_DELAY * (1 + 2 + 3) + crate::modules::at_commander::DEFAULT_TIMEOUT;
+        // The retry sleeps, plus one bounded device open and one sync: only
+        // one attempt can reach either, because an out-of-step port (a sync or
+        // an open that ran out of time) is not retried (#237, #239).
+        let open_worst = OPEN_RETRY_BASE_DELAY * (1 + 2 + 3)
+            + crate::modules::at_commander::DEFAULT_OPEN_BOUND
+            + crate::modules::at_commander::DEFAULT_TIMEOUT;
         let worst = crate::modules::modem_lock::MODEM_LOCK_TIMEOUT
             + open_worst
             + crate::modules::at_commander::DEFAULT_TIMEOUT * 2;
@@ -1325,10 +1327,12 @@ mod tests {
         // made every listing abort at 256 lines). Derived from the real
         // constants so raising any of them fails the build instead of arming a
         // false restart on a healthy line.
-        // The retry sleeps, plus one sync: only one attempt can reach the
-        // sync, because an out-of-step port is not retried (#237).
-        let open_worst =
-            OPEN_RETRY_BASE_DELAY * (1 + 2 + 3) + crate::modules::at_commander::DEFAULT_TIMEOUT;
+        // The retry sleeps, plus one bounded device open and one sync: only
+        // one attempt can reach either, because an out-of-step port (a sync or
+        // an open that ran out of time) is not retried (#237, #239).
+        let open_worst = OPEN_RETRY_BASE_DELAY * (1 + 2 + 3)
+            + crate::modules::at_commander::DEFAULT_OPEN_BOUND
+            + crate::modules::at_commander::DEFAULT_TIMEOUT;
         // Excludes `at_commander::WORKER_GRACE` on each round trip, as the
         // sibling derivations here do; the margin asserted below covers it many
         // times over.
@@ -1356,10 +1360,12 @@ mod tests {
     fn the_per_step_budgets_cover_their_worst_legitimate_case() {
         // Recomputed from the real constants, so raising any of them fails the
         // build rather than quietly letting a pass overrun again.
-        // The retry sleeps, plus one sync: only one attempt can reach the
-        // sync, because an out-of-step port is not retried (#237).
-        let open_worst =
-            OPEN_RETRY_BASE_DELAY * (1 + 2 + 3) + crate::modules::at_commander::DEFAULT_TIMEOUT;
+        // The retry sleeps, plus one bounded device open and one sync: only
+        // one attempt can reach either, because an out-of-step port (a sync or
+        // an open that ran out of time) is not retried (#237, #239).
+        let open_worst = OPEN_RETRY_BASE_DELAY * (1 + 2 + 3)
+            + crate::modules::at_commander::DEFAULT_OPEN_BOUND
+            + crate::modules::at_commander::DEFAULT_TIMEOUT;
         let port_worst = crate::modules::modem_lock::MODEM_LOCK_TIMEOUT
             + open_worst
             + crate::modules::at_commander::DEFAULT_TIMEOUT;
