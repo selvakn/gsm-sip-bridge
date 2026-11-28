@@ -1099,7 +1099,7 @@ fn resolve_mcc_mnc(
 /// requested IMSI and every IMSI it saw, and reader names can carry ICCID-like
 /// serials; none of that belongs in the journal. A PLMN (`250 020`) and
 /// ordinary numbers are far shorter, so they pass through.
-fn mask_subscriber_ids(text: &str) -> String {
+pub(super) fn mask_subscriber_ids(text: &str) -> String {
     const MIN_RUN: usize = 10;
     const KEEP: usize = 5;
     let mut out = String::with_capacity(text.len());
@@ -3492,6 +3492,12 @@ fn start_line_tail(
                     "[supervise] line {idx}: vowifi-ims-agent exited{reason}; restarting in {}s",
                     restart_delay.as_secs()
                 );
+                // Before the next start empties the agent's log (#239).
+                for line in
+                    super::agent_exit::keep_exited_run(runner.as_ref(), idx, &log_content, outcome)
+                {
+                    println!("{line}");
+                }
                 if action == sim_recovery::Action::ResetSim {
                     let holder = usim_holder.lock().unwrap().clone();
                     let reset_log = PathBuf::from(format!("/tmp/sim-reset-{idx}.log"));

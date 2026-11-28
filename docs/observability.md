@@ -241,6 +241,27 @@ that is out of reach when the bridge starts is handled by the start-up MCC/MNC r
 
 Modem-backed lines are unchanged.
 
+## IMS agent exits
+
+The IMS agent writes its own log to `/tmp/ims-agent-N.out`, which is emptied each time the agent starts.
+Each time an agent exits, the supervisor saves what the run left behind (#239):
+
+| What | Where |
+|---|---|
+| Why it exited, and the restart delay | `[supervise] line N: vowifi-ims-agent exited[ (stalled on the modem) \| (AT+CSIM failure) \| (SIM card out of reach)]; restarting in Ns` |
+| The stall watchdog's report, when the watchdog stopped it | `[supervise] line N: watchdog report (run kept in /tmp/ims-agent-N.stall.out): … watchdog: the dispatch loop has made no progress activity=… phase=… stalled_secs=… budget_secs=… last_at_command=… last_at_command_age_secs=…` |
+| The agent's closing error, when the run ended with one | `[supervise] line N: the agent's last error: …` |
+| The run's log, whatever ended it | `/tmp/ims-agent-N.prev.out`, replaced at the next exit |
+| The run's log, when the watchdog stopped it | `/tmp/ims-agent-N.stall.out`, replaced only at the next stall |
+| A copy that could not be written | `[supervise] line N: could not keep the agent's log in <path>: <error>` |
+
+The `[supervise]` lines go to the supervisor's stdout (`journalctl -u gsm-sip-bridge`, `docker logs`), so they
+survive restarts. Quoted text is cut at 400 characters, and subscriber identifiers in it are masked. A copy
+holds at most the last 4 MiB of the run's log, from a line start, after a line saying the start was not kept.
+The copies are not masked: like the agent's own log, they carry IMSIs and numbers. A run that ended without
+an `error: …` line, killed by a signal, say, gets only the copy. See [operations.md](operations.md#a-line-went-unreachable-and-something-restarted-it) for reading a
+stall.
+
 ## Reg-event subscription logs
 
 The reg-event `SUBSCRIBE` is tracked as a transaction and a dialog (specs/090),
