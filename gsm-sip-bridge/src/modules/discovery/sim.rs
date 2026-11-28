@@ -55,6 +55,19 @@ pub enum SimRecovery {
 enum SimProbe {
     Opened(SimStatus, AtCommander),
     OpenFailed(String),
+    /// The open did not return within its own bound, or an earlier one is
+    /// still outstanding (#239). Treated as the probe timing out, as a hung
+    /// open used to be once `run_bounded` gave up on it.
+    OpenStalled,
+}
+
+/// The [`SimProbe`] for an open that failed.
+fn sim_probe_of_open_error(e: &crate::error::BridgeError) -> SimProbe {
+    if e.is_port_open_stalled() {
+        SimProbe::OpenStalled
+    } else {
+        SimProbe::OpenFailed(e.to_string())
+    }
 }
 
 /// Opens `port` fresh and reads its SIM status — real hardware I/O, not
@@ -91,12 +104,12 @@ pub(super) fn probe_sim_status_at(
                 let status = probe_sim_status(&mut at);
                 SimProbe::Opened(status, at)
             }
-            Err(e) => SimProbe::OpenFailed(e.to_string()),
+            Err(e) => sim_probe_of_open_error(&e),
         }
     });
 
     let (status, mut at) = match opened {
-        None => {
+        None | Some(SimProbe::OpenStalled) => {
             let newly_quarantined = policy.record_sim_timeout(iface_path);
             tracing::warn!(
                 port = %device_path.display(),
@@ -299,5 +312,19 @@ mod tests {
             1,
         );
         assert!(matches!(status, SimStatus::Unreadable(_)));
+    }
+
+    #[test]
+    fn a_stalled_open_is_a_sim_probe_timeout() {
+        // #239: see `probe::a_stalled_open_counts_as_a_probe_timeout`.
+        use crate::error::BridgeError;
+        assert!(matches!(
+            sim_probe_of_open_error(&BridgeError::PortOpenStalled("x".into())),
+            SimProbe::OpenStalled
+        ));
+        assert!(matches!(
+            sim_probe_of_open_error(&BridgeError::PortOutOfStep("x".into())),
+            SimProbe::OpenFailed(_)
+        ));
     }
 }

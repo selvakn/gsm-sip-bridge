@@ -204,8 +204,9 @@ impl Phase {
             Phase::Startup => Duration::from_secs(600),
             // One OPTIONS round trip plus a reconnect attempt.
             Phase::GmProbe => Duration::from_secs(30),
-            // See `derived_renewal_worst_case`: 433 s since modem AKA got
-            // 20 s per APDU (#237), with every challenge of a resync counted.
+            // See `derived_renewal_worst_case`: 440 s since modem AKA got
+            // 20 s per APDU (#237), with every challenge of a resync counted,
+            // and the device open its own bound (#239).
             Phase::Renewal => Duration::from_secs(540),
             // Control timeout, PBX ring, bridge setup.
             Phase::InboundCall => Duration::from_secs(180),
@@ -217,7 +218,9 @@ impl Phase {
             Phase::Origination => Duration::from_secs(60),
             // A sweep re-opens the port per message; this bounds one pass.
             // Only the pass itself -- the wait between passes is `Dormant`.
-            Phase::SmsSweep => Duration::from_secs(90),
+            // 100 s since each open counts its own bound (#239); see
+            // `volte::sms`'s budget tests.
+            Phase::SmsSweep => Duration::from_secs(100),
         })
     }
 }
@@ -671,10 +674,13 @@ mod tests {
         // The modem lock, which the SMS sweep holds during its own AT work
         // (VoLTE lines). The phase is entered before this wait.
         let modem_lock = crate::modules::modem_lock::MODEM_LOCK_TIMEOUT;
-        // Opening the modem, when another holder has it, then the open's sync
-        // (#237), bounded by the port's timeout.
-        let modem_open =
-            crate::ims::MODEM_OPEN_MAX_WAIT + crate::modules::at_commander::DEFAULT_TIMEOUT;
+        // Opening the modem, when another holder has it: the last attempt may
+        // start just before the wait runs out and take its whole bounded device
+        // open (#239), then the open's sync (#237), bounded by the port's
+        // timeout.
+        let modem_open = crate::ims::MODEM_OPEN_MAX_WAIT
+            + crate::modules::at_commander::DEFAULT_OPEN_BOUND
+            + crate::modules::at_commander::DEFAULT_TIMEOUT;
         // `AT+CIMI` and `AT+CGSN`, when the line has no configured identities.
         let identities = crate::modules::at_commander::DEFAULT_TIMEOUT * 2;
         // The EF_DIR walk selects the MF and EF_DIR, then reads up to 16
@@ -725,9 +731,10 @@ mod tests {
         // startup's 420 s) would let the watchdog kill a slow first
         // registration.
         let at = crate::modules::at_commander::DEFAULT_TIMEOUT;
-        // The open's sync, `AT+CIMI`, SELECT EF_AD and READ BINARY with its
-        // wrong-`Le` retry, then the `AT+COPS?` fallback.
-        let plmn = at * (1 + 1 + 3 + 1);
+        // The bounded device open (#239), the open's sync, `AT+CIMI`, SELECT
+        // EF_AD and READ BINARY with its wrong-`Le` retry, then the `AT+COPS?`
+        // fallback.
+        let plmn = crate::modules::at_commander::DEFAULT_OPEN_BOUND + at * (1 + 1 + 3 + 1);
         let worst = derived_renewal_worst_case() + plmn;
         let budget = Phase::Startup
             .budget()

@@ -185,6 +185,14 @@ Greptile has *actually* found here, at least once, and usually more.
       has found the line quiet, and shifts every later reply by one. Never add
       a second way to open a port that skips `AtCommander::start_worker`, and
       never a drain-only recovery (#237, measured with `tmp/reopen-test/`).
+- [ ] The device open is a blocking call too. On a modem that is attached but
+      silent (a stalled USB/IP link), `open(2)` itself does not return: raising
+      DTR on open is a USB control transfer the kernel cannot cancel on the
+      silent link (`usb_wwan_dtr_rts` → `usb_kill_urb`), and an open behind a
+      close stuck the same way waits on the tty lock. Every open goes through
+      `AtCommander::open_session`, which bounds it on a thread of its own and
+      starts no new open of a port behind one it gave up on; never call
+      `serialport::new(..).open()` anywhere else (#239).
 - [ ] Only one process holds a serial port at a time, *including during
       teardown*. Cleanup must wait for the child to actually release the modem
       before issuing its own AT traffic — polling for 5s and proceeding anyway is

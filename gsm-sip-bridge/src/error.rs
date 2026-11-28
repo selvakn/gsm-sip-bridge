@@ -47,6 +47,24 @@ pub enum BridgeError {
     /// as a SIM fault.
     #[error("discovery error: AT command timeout: {0}")]
     PortOutOfStep(String),
+    /// A modem AT port whose device open did not return within its bound, or
+    /// that still has such an open outstanding in this process (#239): the
+    /// device is attached but its `open(2)` does not return: the USB control
+    /// transfer that raises DTR on open cannot be cancelled on the silent
+    /// device, or the open waits for the tty's lock held by a close stuck the
+    /// same way. Built only by
+    /// `AtCommander::open_session_with`.
+    ///
+    /// The same failure as [`BridgeError::PortOutOfStep`] for every caller:
+    /// [`BridgeError::is_port_out_of_step`] is true for it, so the open-retry
+    /// loops do not retry it, and its text is the same, so the text
+    /// classifiers read it as a timeout. It is a variant of its own only for
+    /// discovery, whose probes have always counted a hung open as a probe
+    /// timeout toward the port's quarantine (specs/030), and a port that opens
+    /// but does not answer as not AT-capable; recognise it with
+    /// [`BridgeError::is_port_open_stalled`].
+    #[error("discovery error: AT command timeout: {0}")]
+    PortOpenStalled(String),
     /// An I/O failure that is not attributable to a more specific subsystem.
     ///
     /// This variant exists because `From<std::io::Error>` used to map *every*
@@ -80,10 +98,21 @@ impl BridgeError {
         matches!(self, BridgeError::CardUnreachable(_))
     }
 
-    /// Whether this is a modem port that failed its sync on open (#237),
-    /// rather than a port another holder has locked.
+    /// Whether this is a modem port that did not come into step in time:
+    /// its sync on open failed (#237), or its device open did not return
+    /// (#239). Either way the modem is not answering, rather than locked by
+    /// another holder, so an open-retry loop must not retry it.
     pub fn is_port_out_of_step(&self) -> bool {
-        matches!(self, BridgeError::PortOutOfStep(_))
+        matches!(
+            self,
+            BridgeError::PortOutOfStep(_) | BridgeError::PortOpenStalled(_)
+        )
+    }
+
+    /// Whether this is a modem port whose device open did not return in time
+    /// (#239), as opposed to one that opened but failed its sync.
+    pub fn is_port_open_stalled(&self) -> bool {
+        matches!(self, BridgeError::PortOpenStalled(_))
     }
 }
 
@@ -129,6 +158,19 @@ mod tests {
         assert_eq!(e.to_string(), "IMS error: SIM card unreachable: x");
         assert!(e.is_card_unreachable());
         assert!(!BridgeError::Ims("SIM card unreachable: x".to_string()).is_card_unreachable());
+    }
+
+    /// #239: a port whose open stalled is out of step for every caller, reads
+    /// the same to every text classifier, and only discovery tells it apart.
+    #[test]
+    fn a_stalled_open_is_out_of_step_and_reads_the_same() {
+        let stalled = BridgeError::PortOpenStalled("x".into());
+        let unsynced = BridgeError::PortOutOfStep("x".into());
+        assert!(stalled.is_port_out_of_step());
+        assert_eq!(stalled.to_string(), unsynced.to_string());
+        assert!(stalled.is_port_open_stalled());
+        assert!(!unsynced.is_port_open_stalled());
+        assert!(!BridgeError::Discovery("x".into()).is_port_open_stalled());
     }
 
     /// FR-008: a port that failed its sync reads as a timeout to every

@@ -125,6 +125,33 @@ usefully — `last_at_command`, the modem command the line was waiting on when i
 stopped moving. The agent exits `70` and the supervisor restarts that line
 within ~5s; a restarted line has been observed re-registering in ~150s.
 
+**A modem that hangs but stays attached** (a USB/IP link that stalls, a wedged
+hub) no longer gets this far on its own (#239). Opening its port is bounded, so
+the SMS sweep logs one warning and carries on, and the line keeps its
+registration as long as nothing needs the SIM:
+
+```
+WARN modem SMS sweep failed; will retry next interval error=discovery error: AT command timeout: /dev/ttyUSB0 did not open within 7000 ms
+WARN modem SMS sweep failed; will retry next interval error=discovery error: AT command timeout: an earlier open of /dev/ttyUSB0 has not returned
+```
+
+The first appears once, when an open runs out of time. The second repeats every
+pass for as long as that open has not returned, and no further open of the port
+is started in that process meanwhile. When the modem answers again or leaves the
+bus, the open returns, and the next pass works or reports `No such file or
+directory`. A refresh challenge or a full registration during the hang fails the
+same way and falls back as it would with the modem unplugged. The blocked open
+runs on a thread named `at-open-<port>`. On a stalled USB/IP link its kernel
+stack shows `open(2)` not returning, in one of two places: in `usb_wwan_dtr_rts`
+→ `usb_control_msg` → `usb_kill_urb` (raising DTR on open is a USB control
+transfer the kernel cannot cancel on the silent link), or in
+`tty_lock_interruptible`, behind a close stuck the same way. To see where every
+thread of the agent waits, read all their stacks while the hang lasts:
+
+```bash
+sudo sh -c 'for P in $(pgrep -f "vowifi-ims-agent --line 0"); do for t in /proc/$P/task/*; do echo "== $(cat $t/comm)"; cat $t/stack; done; done'
+```
+
 This exists because of a 2026-08-16 incident in which a line was unreachable for
 2h45m while every health signal reported it healthy. A modem had stopped
 answering, and a re-registration blocked forever in `read(2)` on the serial port
